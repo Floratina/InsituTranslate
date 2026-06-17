@@ -1,0 +1,92 @@
+# AGENTS.md - InsituTranslate Project Rules
+
+This document serves as the system rules and constraints for all AI coding agents working on this project. Always read and adhere to these guidelines before executing commands, modifying files, or generating code.
+
+---
+
+## 📖 Project Overview & Mission
+This project is a local desktop multi-format document translation tool built with Tauri (Rust) and React (TypeScript). 
+
+**Core Workflow:**
+The tool operates by copying the input file and translating the text in-place. It directly replaces the source language text inside the duplicated file with the target language text, strictly preserving the original formatting, document layout, and syntax structure.
+
+### Supported File Formats & Specific Behaviors:
+- **PDF:** Must be converted to Markdown first (via MinerU command-line/API integration) before translation, then reconstructed.
+- **Markdown (`.md`):** Translate text while preserving markdown syntax (headers, lists, bold, etc.).
+- **EPUB (`.epub`):** Unpack, translate internal HTML/XHTML content in-place, and repack.
+- **HTML (`.html` / `.htm`):** Translate visible text node content while fully preserving HTML tags and attributes.
+- **TXT (`.txt`):** Direct text translation.
+- **DOCX (`.docx`):** Translate paragraph and table runs while preserving Word XML styling.
+- **XLSX (`.xlsx`):** Translate cell strings while preserving sheets, formulas, and column layouts.
+- **SRT (`.srt`):** Subtitle translation. MUST strictly preserve the subtitle index and timing lines (e.g., `00:01:20,000 --> 00:01:23,000`).
+- **ASS (`.ass`):** Advanced subtitle translation. MUST preserve style headers, timing blocks, and event properties.
+- **LRC (`.lrc`):** Lyric translation. MUST strictly preserve the time tags (e.g., `[00:12.34]`).
+
+---
+
+## Project Setup & Commands
+- **Preferred Package Manager:** `pnpm`
+- **Frontend Stack:** React (Vite), TypeScript, Tailwind CSS, shadcn/ui, motion (formerly Framer Motion)
+- **Backend Stack:** Tauri (v2), Rust
+- **Database:** SQLite (via `tauri-plugin-sql` or Rust native)
+- **Install dependencies:** `pnpm install`
+- **Start development server:** `pnpm tauri dev`
+- **Build release package:** `pnpm tauri build`
+
+### Animation Library Specifications:
+- **Library Choice:** Use **`motion`** (formerly `framer-motion`).
+- **Installation:** `pnpm add motion` (NEVER install the deprecated `framer-motion` package).
+- **React Import Path:** Always import motion components and hooks from **`motion/react`** (e.g., `import { motion } from "motion/react"`).
+
+---
+
+## Security Constraints (Strict)
+1. **No Frontend API Exposure:**
+   - NEVER write or execute direct HTTP requests (`fetch`, `axios`) to external translation APIs, MinerU, or other third-party translation services in the React frontend.
+   - All network requests requiring API keys must be encapsulated and executed securely in the **Rust Backend**.
+2. **Secrets Prevention:**
+   - NEVER store, hardcode, or reference sensitive credentials, API keys, or JWT tokens in the frontend state or TypeScript files.
+   - Frontend must only pass user inputs and local file paths to the Rust backend via Tauri IPC (`invoke`).
+
+---
+
+## Architecture & Component Strategy
+1. **Anti-Monolithic Files & Modularity (No App.tsx Cramming):**
+   - NEVER write or cram main UI layouts, views, or complex business logic directly inside `App.tsx`. Keep `App.tsx` strictly clean, dedicated only to high-level global layouts, routing, or global state providers.
+   - Once a view, sidebar, or setting panel stabilizes, immediately extract its logic, UI sub-structures, and local components into separate files inside `src/components/` or `src/views/`.
+
+2. **Decoupled & Reusable Motion Components:**
+   - All UI components must be highly decoupled, self-contained, and reusable. 
+   - When creating components that require animations (using `motion/react`), **always encapsulate the motion variants, transitions, and animation states inside the component file itself**. 
+   - Do not externalize animation configurations in a way that breaks component self-containment. A developer (or agent) should be able to import the component anywhere as a single, decoupled, animated Lego brick.
+
+3. **Component Priority:**
+   - Always prioritize using existing `shadcn/ui` components (e.g., `Button`, `Input`, `Progress`, `ScrollArea`, `Card`).
+   - Avoid writing custom Tailwind divs for standard UI controls when a shadcn/ui equivalent is available.
+
+---
+
+## UI & Design Specifications
+1. **Layout Density:**
+   - Implement a **compact and high-density layout**. Minimize unnecessary white space or excessively large gaps.
+   - Keep paddings (e.g., `p-2` or `p-3`), margins, and component spacing (`gap-2` or `gap-3`) small and tight, optimized for a developer control panel.
+2. **Global Border Radius:**
+   - Force a strict border radius of **6px** (`rounded-[6px]`) across all components, cards, inputs, and buttons.
+3. **Icons System:**
+   - Use **`lucide-react`** icon packs, which is the default icon set of shadcn/ui. If the project lacks this icon pack, install it. 
+4. **Animation & Transition Timing Guidelines (Strict):**
+   - For desktop responsiveness, animations MUST be snappy and crisp. NEVER write transitions exceeding **300ms**.
+   - **Tiers of Animation Duration:**
+     - *Micro-interactions (Hovers, active press, toggle switches):* **100ms to 150ms** (`duration: 0.20` to `0.25`).
+     - *Standard overlays (Dropdowns, select menus, tooltips):* **150ms to 200ms** (`duration: 0.20` to `0.25`).
+     - *Layout shifts (Accordion folding, sidebar collapse, dialog modals):* **200ms to 300ms** (`duration: 0.25` to `0.30`).
+   - **Easing & Springs:**
+     - Avoid static linear transitions. Always prioritize smooth Ease-Out curves.
+     - Preferred custom bezier easing: `ease: [.03,.59,.19,1]` (Ultra-smooth deceleration).
+     - Preferred spring physics configuration for panel expansions/drag gestures: `{ type: "spring", stiffness: 300, damping: 30 }`.
+
+---
+
+## TypeScript Guidelines
+- Declare explicit TypeScript interfaces and types for all props and state variables.
+- Strictly avoid using `any` to ensure the codebase remains maintainable for future modular refactoring.

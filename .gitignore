@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.vite/
+target/
+src-tauri/target/
+src-tauri/gen/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+0_repo_references/

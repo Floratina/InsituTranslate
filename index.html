@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>InsituTranslate</title>
+    <script>
+      (() => {
+        const defaults = { colorMode: "system", themeId: "sky", fontFamily: "system" };
+        try {
+          const stored = JSON.parse(localStorage.getItem("insitu-appearance-v1") || "null");
+          const value = stored && typeof stored === "object" ? { ...defaults, ...stored } : defaults;
+          const dark = value.colorMode === "dark" ||
+            (value.colorMode === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+          document.documentElement.dataset.theme = value.themeId;
+          if (value.fontFamily !== "system") {
+            const family = String(value.fontFamily).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+            document.documentElement.style.setProperty(
+              "--app-font-family",
+              `"${family}", Inter, "Segoe UI", sans-serif`,
+            );
+          }
+        } catch {
+          document.documentElement.dataset.theme = "sky";
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

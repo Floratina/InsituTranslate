@@ -1,0 +1,1999 @@
+use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::{Client, Method};
+use serde_json::{json, Value};
+
+use crate::domain::{
+    ProviderProtocol, ProviderRuntimeConfig, RemoteModel, ThinkingConfig, ThinkingEffort,
+    ThinkingMode, ThinkingSummary, UnifiedChatRequest, UnifiedChatResponse, UnifiedContent,
+    UnifiedMessage, UnifiedToolChoice, UnifiedUsage,
+};
+use crate::features::{is_feature_supported, FeatureId};
+use std::fmt;
+
+pub trait ProviderAdapter {
+    async fn list_models(&self) -> Result<Vec<RemoteModel>, String>;
+    fn build_chat_request(&self, request: &UnifiedChatRequest) -> Result<(String, Value), String>;
+    async fn send_chat(&self, request: &UnifiedChatRequest) -> Result<UnifiedChatResponse, String>;
+    async fn stream_chat(
+        &self,
+        request: &UnifiedChatRequest,
+    ) -> Result<Vec<UnifiedChatResponse>, String>;
+}
+
+#[derive(Clone)]
+pub struct RuntimeAdapter {
+    client: Client,
+    config: ProviderRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitTelemetry {
+    pub request_limit: Option<u64>,
+    pub request_remaining: Option<u64>,
+    pub request_reset_ms: Option<u64>,
+    pub token_limit: Option<u64>,
+    pub token_remaining: Option<u64>,
+    pub token_reset_ms: Option<u64>,
+    pub retry_after_ms: Option<u64>,
+    pub source: Option<String>,
+}
+
+impl RateLimitTelemetry {
+    pub fn has_quota_headers(&self) -> bool {
+        self.request_remaining.is_some()
+            || self.request_limit.is_some()
+            || self.token_remaining.is_some()
+            || self.token_limit.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderChatMeta {
+    pub response: UnifiedChatResponse,
+    pub status: u16,
+    pub rate_limits: RateLimitTelemetry,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderChatError {
+    pub status: Option<u16>,
+    pub message: String,
+    pub rate_limits: RateLimitTelemetry,
+}
+
+impl ProviderChatError {
+    pub fn is_rate_limited(&self) -> bool {
+        self.status == Some(429)
+    }
+}
+
+impl fmt::Display for ProviderChatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+struct JsonResponseMeta {
+    raw: Value,
+    status: u16,
+    rate_limits: RateLimitTelemetry,
+}
+
+impl RuntimeAdapter {
+    pub fn new(client: Client, config: ProviderRuntimeConfig) -> Self {
+        Self { client, config }
+    }
+
+    fn headers(&self) -> Result<HeaderMap, String> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(credential) = self
+            .config
+            .credential
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            let name = HeaderName::from_bytes(self.config.auth_header.as_bytes())
+                .map_err(|error| format!("Invalid authentication header: {error}"))?;
+            let value = if self.config.auth_type == "bearer" && name == AUTHORIZATION {
+                format!("Bearer {credential}")
+            } else {
+                credential.to_string()
+            };
+            headers.insert(
+                name,
+                HeaderValue::from_str(&value)
+                    .map_err(|error| format!("Invalid authentication value: {error}"))?,
+            );
+        }
+        for (name, value) in &self.config.custom_headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| format!("Invalid custom header {name}: {error}"))?;
+            headers.insert(
+                header_name,
+                HeaderValue::from_str(value)
+                    .map_err(|error| format!("Invalid custom header value for {name}: {error}"))?,
+            );
+        }
+        if self.config.protocol == ProviderProtocol::Anthropic
+            && !headers.contains_key("anthropic-version")
+        {
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        }
+        Ok(headers)
+    }
+
+    fn endpoint(&self, suffix: &str) -> String {
+        append_endpoint_suffix(&self.config.base_url, suffix)
+    }
+
+    fn openai_endpoint(&self, suffix: &str) -> String {
+        let base = endpoint_base_url(&self.config.base_url).trim_end_matches('/');
+        if self.config.use_raw_base_url || is_versioned_base_url(base) {
+            append_endpoint_suffix(base, suffix)
+        } else {
+            append_endpoint_suffix(&format!("{base}/v1"), suffix)
+        }
+    }
+
+    async fn request_json(
+        &self,
+        method: Method,
+        url: String,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
+        self.request_json_with_meta(method, url, body)
+            .await
+            .map(|meta| meta.raw)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn request_json_with_meta(
+        &self,
+        method: Method,
+        url: String,
+        body: Option<Value>,
+    ) -> Result<JsonResponseMeta, ProviderChatError> {
+        let mut request = self
+            .client
+            .request(method, url)
+            .headers(self.headers().map_err(|error| ProviderChatError {
+                status: None,
+                message: error,
+                rate_limits: RateLimitTelemetry::default(),
+            })?);
+        if let Some(value) = body {
+            request = request.json(&value);
+        }
+        let response = request.send().await.map_err(|error| ProviderChatError {
+            status: None,
+            message: error.to_string(),
+            rate_limits: RateLimitTelemetry::default(),
+        })?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let rate_limits = rate_limits_from_headers(&headers);
+        let text = response.text().await.map_err(|error| ProviderChatError {
+            status: Some(status.as_u16()),
+            message: error.to_string(),
+            rate_limits: rate_limits.clone(),
+        })?;
+        if !status.is_success() {
+            return Err(ProviderChatError {
+                status: Some(status.as_u16()),
+                message: format!("HTTP {}: {}", status.as_u16(), truncate(&text, 500)),
+                rate_limits,
+            });
+        }
+        let raw = serde_json::from_str(&text).map_err(|error| ProviderChatError {
+            status: Some(status.as_u16()),
+            message: format!("Invalid JSON response: {error}"),
+            rate_limits: rate_limits.clone(),
+        })?;
+        Ok(JsonResponseMeta {
+            raw,
+            status: status.as_u16(),
+            rate_limits,
+        })
+    }
+
+    async fn list_models_value(&self) -> Result<Value, String> {
+        match self.config.protocol {
+            ProviderProtocol::OpenaiChat | ProviderProtocol::OpenaiResponses => {
+                self.request_json(Method::GET, self.openai_endpoint("models"), None)
+                    .await
+            }
+            ProviderProtocol::Anthropic => {
+                let suffix = if self.config.use_raw_base_url {
+                    "models"
+                } else {
+                    "v1/models"
+                };
+                self.request_json(Method::GET, self.endpoint(suffix), None)
+                    .await
+            }
+            ProviderProtocol::Gemini => {
+                let suffix = if self.config.use_raw_base_url {
+                    "models"
+                } else {
+                    "v1beta/models"
+                };
+                self.request_json(Method::GET, self.endpoint(suffix), None)
+                    .await
+            }
+            ProviderProtocol::Ollama => {
+                let base = endpoint_base_url(&self.config.base_url).trim_end_matches('/');
+                let url = if self.config.use_raw_base_url {
+                    append_endpoint_suffix(base, "tags")
+                } else if base.ends_with("/api") {
+                    format!("{base}/tags")
+                } else {
+                    format!("{base}/api/tags")
+                };
+                self.request_json(Method::GET, url, None).await
+            }
+        }
+    }
+}
+
+impl ProviderAdapter for RuntimeAdapter {
+    async fn list_models(&self) -> Result<Vec<RemoteModel>, String> {
+        let value = self.list_models_value().await?;
+        let items = match self.config.protocol {
+            ProviderProtocol::OpenaiChat
+            | ProviderProtocol::OpenaiResponses
+            | ProviderProtocol::Anthropic => value
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            ProviderProtocol::Gemini => value
+                .get("models")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            ProviderProtocol::Ollama => value
+                .get("models")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let mut models = Vec::new();
+        for item in items {
+            let request_name = item
+                .get("id")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if request_name.is_empty() {
+                continue;
+            }
+            let alias = item
+                .get("display_name")
+                .or_else(|| item.get("displayName"))
+                .and_then(Value::as_str)
+                .unwrap_or(&request_name)
+                .to_string();
+            models.push(RemoteModel {
+                request_name,
+                alias,
+                added: false,
+            });
+        }
+        models.sort_by(|a, b| a.request_name.cmp(&b.request_name));
+        Ok(models)
+    }
+
+    fn build_chat_request(&self, request: &UnifiedChatRequest) -> Result<(String, Value), String> {
+        Ok(match self.config.protocol {
+            ProviderProtocol::OpenaiChat => (
+                self.openai_endpoint("chat/completions"),
+                build_openai_chat_body(&self.config.base_url, request),
+            ),
+            ProviderProtocol::OpenaiResponses => (
+                self.openai_endpoint("responses"),
+                build_openai_responses_body(&self.config.base_url, request),
+            ),
+            ProviderProtocol::Anthropic => {
+                let suffix = if self.config.use_raw_base_url {
+                    "messages"
+                } else {
+                    "v1/messages"
+                };
+                (self.endpoint(suffix), build_anthropic_body(request))
+            }
+            ProviderProtocol::Gemini => (
+                self.endpoint(&format!(
+                    "{}models/{}:{}",
+                    if self.config.use_raw_base_url {
+                        ""
+                    } else {
+                        "v1beta/"
+                    },
+                    request.model.trim_start_matches("models/"),
+                    if request.stream {
+                        "streamGenerateContent?alt=sse"
+                    } else {
+                        "generateContent"
+                    }
+                )),
+                build_gemini_body(request),
+            ),
+            ProviderProtocol::Ollama => {
+                let base = endpoint_base_url(&self.config.base_url).trim_end_matches('/');
+                (
+                    if self.config.use_raw_base_url {
+                        append_endpoint_suffix(base, "chat")
+                    } else if base.ends_with("/api") {
+                        format!("{base}/chat")
+                    } else {
+                        format!("{base}/api/chat")
+                    },
+                    build_ollama_body(request),
+                )
+            }
+        })
+    }
+
+    async fn send_chat(&self, request: &UnifiedChatRequest) -> Result<UnifiedChatResponse, String> {
+        self.send_chat_with_meta(request)
+            .await
+            .map(|meta| meta.response)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn stream_chat(
+        &self,
+        request: &UnifiedChatRequest,
+    ) -> Result<Vec<UnifiedChatResponse>, String> {
+        let (url, body) = self.build_chat_request(request)?;
+        let response = self
+            .client
+            .post(url)
+            .headers(self.headers()?)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.map_err(|error| error.to_string())?;
+            return Err(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                truncate(&text, 500)
+            ));
+        }
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut output = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buffer.push_str(&String::from_utf8_lossy(
+                &chunk.map_err(|error| error.to_string())?,
+            ));
+            while let Some(index) = buffer.find('\n') {
+                let line = buffer[..index].trim().to_string();
+                buffer.drain(..=index);
+                let data = line.strip_prefix("data:").map(str::trim).unwrap_or(&line);
+                if data.is_empty() || data == "[DONE]" || data.starts_with(':') {
+                    continue;
+                }
+                if let Ok(raw) = serde_json::from_str::<Value>(data) {
+                    if let Ok(part) = normalize_response(self.config.protocol, raw) {
+                        output.push(part);
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
+impl RuntimeAdapter {
+    pub async fn send_chat_with_meta(
+        &self,
+        request: &UnifiedChatRequest,
+    ) -> Result<ProviderChatMeta, ProviderChatError> {
+        let (url, body) = self
+            .build_chat_request(request)
+            .map_err(|error| ProviderChatError {
+                status: None,
+                message: error,
+                rate_limits: RateLimitTelemetry::default(),
+            })?;
+        let meta = self
+            .request_json_with_meta(Method::POST, url, Some(body))
+            .await?;
+        let finish_reason = finish_reason_from_raw(self.config.protocol, &meta.raw);
+        let response = normalize_response(self.config.protocol, meta.raw).map_err(|error| {
+            ProviderChatError {
+                status: Some(meta.status),
+                message: error,
+                rate_limits: meta.rate_limits.clone(),
+            }
+        })?;
+        Ok(ProviderChatMeta {
+            response,
+            status: meta.status,
+            rate_limits: meta.rate_limits,
+            finish_reason,
+        })
+    }
+}
+
+fn rate_limits_from_headers(headers: &HeaderMap) -> RateLimitTelemetry {
+    let request_limit = header_u64(
+        headers,
+        &[
+            "x-ratelimit-limit-requests",
+            "anthropic-ratelimit-requests-limit",
+        ],
+    );
+    let request_remaining = header_u64(
+        headers,
+        &[
+            "x-ratelimit-remaining-requests",
+            "anthropic-ratelimit-requests-remaining",
+        ],
+    );
+    let token_limit = header_u64(
+        headers,
+        &[
+            "x-ratelimit-limit-tokens",
+            "anthropic-ratelimit-tokens-limit",
+        ],
+    );
+    let token_remaining = header_u64(
+        headers,
+        &[
+            "x-ratelimit-remaining-tokens",
+            "anthropic-ratelimit-tokens-remaining",
+        ],
+    );
+    let request_reset_ms = header_duration_ms(
+        headers,
+        &[
+            "x-ratelimit-reset-requests",
+            "anthropic-ratelimit-requests-reset",
+        ],
+    );
+    let token_reset_ms = header_duration_ms(
+        headers,
+        &[
+            "x-ratelimit-reset-tokens",
+            "anthropic-ratelimit-tokens-reset",
+        ],
+    );
+    let retry_after_ms = header_duration_ms(headers, &["retry-after"]);
+    let source = if headers.get("anthropic-ratelimit-requests-limit").is_some()
+        || headers.get("anthropic-ratelimit-tokens-limit").is_some()
+    {
+        Some("anthropic".to_string())
+    } else if headers.get("x-ratelimit-limit-requests").is_some()
+        || headers.get("x-ratelimit-limit-tokens").is_some()
+    {
+        Some("openai-compatible".to_string())
+    } else {
+        None
+    };
+
+    RateLimitTelemetry {
+        request_limit,
+        request_remaining,
+        request_reset_ms,
+        token_limit,
+        token_remaining,
+        token_reset_ms,
+        retry_after_ms,
+        source,
+    }
+}
+
+fn header_text(headers: &HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn header_u64(headers: &HeaderMap, names: &[&str]) -> Option<u64> {
+    header_text(headers, names).and_then(|value| {
+        value
+            .split(',')
+            .next()
+            .unwrap_or(&value)
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+fn header_duration_ms(headers: &HeaderMap, names: &[&str]) -> Option<u64> {
+    header_text(headers, names).and_then(|value| parse_duration_ms(&value))
+}
+
+fn parse_duration_ms(value: &str) -> Option<u64> {
+    let trimmed = value.trim().trim_matches('"').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(number) = trimmed.strip_suffix("ms") {
+        return number
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| value.ceil() as u64);
+    }
+    if let Some(number) = trimmed.strip_suffix('s') {
+        return number
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 1000.0).ceil() as u64);
+    }
+    if let Some(number) = trimmed.strip_suffix('m') {
+        return number
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 60_000.0).ceil() as u64);
+    }
+    if let Some(number) = trimmed.strip_suffix('h') {
+        return number
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 3_600_000.0).ceil() as u64);
+    }
+    trimmed
+        .parse::<f64>()
+        .ok()
+        .map(|value| (value * 1000.0).ceil() as u64)
+}
+
+fn append_endpoint_suffix(base_url: &str, suffix: &str) -> String {
+    let base = endpoint_base_url(base_url).trim_end_matches('/');
+    let suffix = suffix.trim_start_matches('/');
+    let suffix_path = suffix.split('?').next().unwrap_or(suffix);
+    if base.ends_with(suffix) || (!suffix_path.is_empty() && base.ends_with(suffix_path)) {
+        base.to_string()
+    } else {
+        format!("{base}/{suffix}")
+    }
+}
+
+fn endpoint_base_url(base_url: &str) -> &str {
+    base_url.split('#').next().unwrap_or(base_url).trim()
+}
+
+fn is_versioned_base_url(base_url: &str) -> bool {
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back().map(str::to_string))
+        })
+        .is_some_and(|last| {
+            let bytes = last.as_bytes();
+            bytes.len() >= 2 && bytes[0] == b'v' && bytes[1..].iter().all(u8::is_ascii_digit)
+        })
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+fn content_text(parts: &[UnifiedContent]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            UnifiedContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn openai_messages(
+    messages: &[UnifiedMessage],
+    cache_control: bool,
+    base_url: &str,
+    model: &str,
+) -> Vec<Value> {
+    let mut output = Vec::new();
+    for message in messages {
+        let mut text_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut reasoning_texts = Vec::new();
+        let mut reasoning_details = Vec::new();
+        for content in &message.content {
+            match content {
+                UnifiedContent::Text { text } => {
+                    text_parts.push(json!({"type": "text", "text": text}))
+                }
+                UnifiedContent::Image { media_type, data } => text_parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{media_type};base64,{data}")}
+                })),
+                UnifiedContent::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => tool_calls.push(json!({
+                    "id": id, "type": "function",
+                    "function": {"name": name, "arguments": arguments.to_string()}
+                })),
+                UnifiedContent::ToolResult {
+                    call_id, content, ..
+                } => {
+                    output
+                        .push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
+                }
+                UnifiedContent::Thinking {
+                    text,
+                    signature,
+                    encrypted_data,
+                } => {
+                    if message.role == "assistant" {
+                        if is_feature_supported(FeatureId::OpenAiReasoningDetails, base_url, model)
+                        {
+                            if let Some(data) = encrypted_data {
+                                reasoning_details.push(json!({
+                                    "type": "reasoning.encrypted",
+                                    "data": data
+                                }));
+                            } else if !text.is_empty() {
+                                let mut detail = json!({
+                                    "type": "reasoning.text",
+                                    "text": text
+                                });
+                                if let Some(signature) =
+                                    signature.as_deref().filter(|value| !value.is_empty())
+                                {
+                                    detail["signature"] = json!(signature);
+                                }
+                                reasoning_details.push(detail);
+                            }
+                        } else if !text.is_empty() {
+                            reasoning_texts.push(text.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if !text_parts.is_empty()
+            || !tool_calls.is_empty()
+            || !reasoning_texts.is_empty()
+            || !reasoning_details.is_empty()
+        {
+            let mut item = json!({
+                "role": message.role,
+                "content": if text_parts.is_empty() {
+                    Value::String(String::new())
+                } else if text_parts.len() == 1 {
+                    Value::String(text_parts[0].get("text").and_then(Value::as_str).unwrap_or_default().to_string())
+                } else {
+                    Value::Array(text_parts)
+                }
+            });
+            if !tool_calls.is_empty() {
+                item["tool_calls"] = Value::Array(tool_calls);
+            }
+            if !reasoning_details.is_empty() {
+                item["reasoning_details"] = Value::Array(reasoning_details);
+            } else if !reasoning_texts.is_empty() {
+                let reasoning = reasoning_texts.join("");
+                if is_feature_supported(FeatureId::OpenAiReasoningField, base_url, model) {
+                    item["reasoning"] = json!(reasoning);
+                } else if is_feature_supported(FeatureId::OpenAiReasoningContent, base_url, model) {
+                    item["reasoning_content"] = json!(reasoning);
+                } else {
+                    match item.get_mut("content") {
+                        Some(Value::String(text)) => text.push_str(&reasoning),
+                        Some(Value::Array(parts)) => {
+                            parts.push(json!({"type": "text", "text": reasoning}));
+                        }
+                        _ => item["content"] = json!(reasoning),
+                    }
+                }
+            }
+            output.push(item);
+        }
+    }
+    if cache_control {
+        apply_openai_cache_control(&mut output);
+    }
+    output
+}
+
+fn apply_openai_cache_control(messages: &mut [Value]) {
+    for role in ["system", "user"] {
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some(role))
+        {
+            if let Some(content) = message.get_mut("content") {
+                match content {
+                    Value::String(text) => {
+                        *content = Value::Array(vec![json!({
+                            "type": "text", "text": text.clone(), "cache_control": {"type": "ephemeral"}
+                        })]);
+                    }
+                    Value::Array(parts) => {
+                        if let Some(part) = parts
+                            .iter_mut()
+                            .rev()
+                            .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                        {
+                            part["cache_control"] = json!({"type": "ephemeral"});
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+pub fn build_openai_chat_body(base_url: &str, request: &UnifiedChatRequest) -> Value {
+    let cache_control =
+        is_feature_supported(FeatureId::OpenAiCacheControl, base_url, &request.model);
+    let mut body = json!({
+        "model": request.model,
+        "messages": openai_messages(
+            &request.messages,
+            cache_control,
+            base_url,
+            &request.model
+        ),
+        "stream": request.stream
+    });
+    if request.stream {
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    if let Some(tokens) = request.max_output_tokens {
+        if is_feature_supported(
+            FeatureId::OpenAiOnlyMaxCompletionTokens,
+            base_url,
+            &request.model,
+        ) {
+            body["max_completion_tokens"] = json!(tokens);
+        } else if is_feature_supported(FeatureId::OpenAiOnlyMaxTokens, base_url, &request.model) {
+            body["max_tokens"] = json!(tokens);
+        } else {
+            body["max_tokens"] = json!(tokens);
+            body["max_completion_tokens"] = json!(tokens);
+        }
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    let mut tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|tool| json!({
+            "type": "function",
+            "function": {"name": tool.name, "description": tool.description, "parameters": tool.input_schema}
+        }))
+        .collect();
+    if cache_control {
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+        body["tool_choice"] = match request.tool_choice {
+            UnifiedToolChoice::Required => json!("required"),
+            UnifiedToolChoice::None => json!("none"),
+            UnifiedToolChoice::Auto => json!("auto"),
+        };
+    }
+    if let Some(thinking) = &request.thinking {
+        merge_object(
+            &mut body,
+            build_openai_reasoning_params(
+                base_url,
+                &request.model,
+                thinking,
+                request.max_output_tokens,
+            ),
+        );
+    }
+    if is_feature_supported(FeatureId::OpenAiClearThinking, base_url, &request.model) {
+        body["clear_thinking"] = json!(false);
+    }
+    if is_feature_supported(FeatureId::OpenAiReasoningSplit, base_url, &request.model) {
+        body["reasoning_split"] = json!(true);
+    }
+    body
+}
+
+pub fn build_openai_reasoning_params(
+    base_url: &str,
+    model: &str,
+    thinking: &ThinkingConfig,
+    max_output_tokens: Option<u32>,
+) -> Value {
+    let disabled = thinking.mode == ThinkingMode::Disabled
+        || thinking.effort == Some(ThinkingEffort::None)
+        || thinking.budget_tokens == Some(0);
+    let mut out = json!({});
+    if is_feature_supported(FeatureId::OpenAiReasoningObject, base_url, model) {
+        out["reasoning"] = if disabled {
+            json!({"enabled": false})
+        } else if let Some(tokens) = thinking.budget_tokens {
+            json!({"max_tokens": max_output_tokens.map(|max| tokens.min(max.saturating_sub(1))).unwrap_or(tokens)})
+        } else if let Some(effort) = thinking.effort {
+            json!({"effort": openai_effort(effort)})
+        } else {
+            json!({"enabled": true})
+        };
+    } else if is_feature_supported(FeatureId::OpenAiThinkingObject, base_url, model) {
+        out["thinking"] = json!({"type": if disabled { "disabled" } else { "enabled" }});
+        if is_feature_supported(FeatureId::OpenAiDeepSeekReasoningEffort, base_url, model)
+            && !disabled
+        {
+            if let Some(effort) = thinking.effort {
+                out["reasoning_effort"] = json!(if matches!(
+                    effort,
+                    ThinkingEffort::Max | ThinkingEffort::Xhigh
+                ) {
+                    "max"
+                } else {
+                    "high"
+                });
+            }
+        } else if is_feature_supported(FeatureId::OpenAiReasoningEffort, base_url, model) {
+            out["reasoning_effort"] = json!(thinking.effort.map(openai_effort).unwrap_or("medium"));
+        }
+    } else if is_feature_supported(FeatureId::OpenAiDisableReasoning, base_url, model) {
+        out["disable_reasoning"] = json!(disabled);
+    } else if is_feature_supported(FeatureId::OpenAiEnableThinking, base_url, model) {
+        out["enable_thinking"] = json!(!disabled);
+        if !disabled && is_feature_supported(FeatureId::OpenAiThinkingBudget, base_url, model) {
+            if let Some(tokens) = thinking.budget_tokens {
+                out["thinking_budget"] = json!(tokens);
+            }
+        }
+    } else {
+        out["reasoning_effort"] = json!(if disabled {
+            "none"
+        } else {
+            thinking.effort.map(openai_effort).unwrap_or("medium")
+        });
+    }
+    if is_feature_supported(FeatureId::OpenAiThinkingStrategy, base_url, model) && !disabled {
+        if let Some(summary) = thinking.summary {
+            match summary {
+                ThinkingSummary::Concise => out["thinking_strategy"] = json!("short_think"),
+                ThinkingSummary::Detailed => out["thinking_strategy"] = json!("chain_of_draft"),
+                ThinkingSummary::None | ThinkingSummary::Auto => {}
+            }
+        }
+    }
+    out
+}
+
+fn openai_effort(effort: ThinkingEffort) -> &'static str {
+    match effort {
+        ThinkingEffort::None => "none",
+        ThinkingEffort::Minimal => "minimal",
+        ThinkingEffort::Low => "low",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::Xhigh | ThinkingEffort::Max => "xhigh",
+    }
+}
+
+fn merge_object(target: &mut Value, source: Value) {
+    if let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn push_responses_message(output: &mut Vec<Value>, role: &str, content: &mut Vec<Value>) {
+    if content.is_empty() {
+        return;
+    }
+    output.push(json!({
+        "role": role,
+        "content": std::mem::take(content)
+    }));
+}
+
+fn openai_responses_input(messages: &[UnifiedMessage]) -> Vec<Value> {
+    let mut output = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        let role = match message.role.as_str() {
+            "assistant" => "assistant",
+            "system" => "system",
+            _ => "user",
+        };
+        let mut content = Vec::new();
+        for (part_index, part) in message.content.iter().enumerate() {
+            match part {
+                UnifiedContent::Text { text } => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    content.push(json!({
+                        "type": if role == "assistant" { "output_text" } else { "input_text" },
+                        "text": text
+                    }));
+                }
+                UnifiedContent::Image { media_type, data } => {
+                    content.push(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{media_type};base64,{data}")
+                    }));
+                }
+                UnifiedContent::Thinking {
+                    text,
+                    signature,
+                    encrypted_data,
+                } => {
+                    push_responses_message(&mut output, role, &mut content);
+                    let id = signature
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("reasoning_{message_index}_{part_index}"));
+                    if let Some(data) = encrypted_data {
+                        output.push(json!({
+                            "type": "reasoning",
+                            "id": id,
+                            "summary": [],
+                            "encrypted_content": data
+                        }));
+                    } else if !text.is_empty() {
+                        output.push(json!({
+                            "type": "reasoning",
+                            "id": id,
+                            "summary": [],
+                            "content": [{"type": "reasoning_text", "text": text}]
+                        }));
+                    }
+                }
+                UnifiedContent::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    push_responses_message(&mut output, role, &mut content);
+                    output.push(json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": arguments.to_string()
+                    }));
+                }
+                UnifiedContent::ToolResult {
+                    call_id,
+                    content: tool_content,
+                    ..
+                } => {
+                    push_responses_message(&mut output, role, &mut content);
+                    output.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": tool_content
+                    }));
+                }
+            }
+        }
+        push_responses_message(&mut output, role, &mut content);
+    }
+    output
+}
+
+pub fn build_openai_responses_body(base_url: &str, request: &UnifiedChatRequest) -> Value {
+    let mut body = json!({
+        "model": request.model,
+        "input": openai_responses_input(&request.messages),
+        "stream": request.stream
+    });
+    if let Some(tokens) = request.max_output_tokens {
+        body["max_output_tokens"] = json!(tokens);
+    }
+    if let Some(thinking) = &request.thinking {
+        let disabled = thinking.mode == ThinkingMode::Disabled
+            || thinking.effort == Some(ThinkingEffort::None);
+        body["reasoning"] = json!({
+            "effort": if disabled { "none" } else { thinking.effort.map(openai_effort).unwrap_or("medium") },
+            "summary": thinking.summary.map(|summary| match summary {
+                ThinkingSummary::None => "none",
+                ThinkingSummary::Auto => "auto",
+                ThinkingSummary::Concise => "concise",
+                ThinkingSummary::Detailed => "detailed",
+            }).unwrap_or("auto")
+        });
+        if is_feature_supported(FeatureId::OpenAiThinkingObject, base_url, &request.model) {
+            body["thinking"] = json!({"type": if disabled { "disabled" } else { "enabled" }});
+        }
+    }
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(request.tools.iter().map(|tool| json!({
+            "type": "function", "name": tool.name, "description": tool.description, "parameters": tool.input_schema
+        })).collect());
+        body["tool_choice"] = json!(match request.tool_choice {
+            UnifiedToolChoice::Required => "required",
+            UnifiedToolChoice::None => "none",
+            UnifiedToolChoice::Auto => "auto",
+        });
+    }
+    body
+}
+
+fn anthropic_content(message: &UnifiedMessage) -> Vec<Value> {
+    message
+        .content
+        .iter()
+        .map(|part| match part {
+            UnifiedContent::Text { text } => json!({"type": "text", "text": text}),
+            UnifiedContent::Image { media_type, data } => json!({
+                "type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}
+            }),
+            UnifiedContent::Thinking { text, signature, encrypted_data } => {
+                if let Some(data) = encrypted_data {
+                    json!({"type": "redacted_thinking", "data": data})
+                } else {
+                    json!({"type": "thinking", "thinking": text, "signature": signature.clone().unwrap_or_default()})
+                }
+            }
+            UnifiedContent::ToolCall { id, name, arguments } => {
+                json!({"type": "tool_use", "id": id, "name": name, "input": arguments})
+            }
+            UnifiedContent::ToolResult { call_id, content, is_error } => {
+                json!({"type": "tool_result", "tool_use_id": call_id, "content": content, "is_error": is_error})
+            }
+        })
+        .collect()
+}
+
+pub fn ensure_anthropic_alternating_roles(messages: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut output: Vec<Value> = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if output
+            .last()
+            .and_then(|item| item.get("role"))
+            .and_then(Value::as_str)
+            == Some(role)
+        {
+            let incoming = message
+                .get("content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(parts) = output
+                .last_mut()
+                .and_then(|item| item.get_mut("content"))
+                .and_then(Value::as_array_mut)
+            {
+                parts.extend(incoming);
+            }
+        } else {
+            output.push(message);
+        }
+    }
+    if output
+        .first()
+        .and_then(|item| item.get("role"))
+        .and_then(Value::as_str)
+        != Some("user")
+    {
+        return Err("The first Anthropic message must have the user role".into());
+    }
+    Ok(output)
+}
+
+pub fn build_anthropic_body(request: &UnifiedChatRequest) -> Value {
+    let mut system = Vec::new();
+    let mut messages = Vec::new();
+    for message in &request.messages {
+        if message.role == "system" {
+            system.extend(anthropic_content(message));
+        } else {
+            messages.push(json!({"role": message.role, "content": anthropic_content(message)}));
+        }
+    }
+    if let Some(last) = system.last_mut() {
+        last["cache_control"] = json!({"type": "ephemeral"});
+    }
+    if let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        if let Some(last) = last_user
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .and_then(|parts| parts.last_mut())
+        {
+            if last.get("type").and_then(Value::as_str) != Some("thinking") {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+    }
+    let messages = ensure_anthropic_alternating_roles(messages).unwrap_or_default();
+    let thinking_enabled = request.thinking.as_ref().is_some_and(|thinking| {
+        thinking.mode != ThinkingMode::Disabled && thinking.effort != Some(ThinkingEffort::None)
+    });
+    let mut body = json!({
+        "model": request.model,
+        "messages": messages,
+        "max_tokens": request.max_output_tokens.unwrap_or(4096),
+        "stream": request.stream
+    });
+    if !system.is_empty() {
+        body["system"] = Value::Array(system);
+    }
+    if let Some(thinking) = &request.thinking {
+        body["thinking"] = if thinking_enabled {
+            let max = request.max_output_tokens.unwrap_or(4096);
+            let budget = thinking
+                .budget_tokens
+                .unwrap_or(1024)
+                .max(1024)
+                .min(max.saturating_sub(1));
+            json!({"type": "enabled", "budget_tokens": budget})
+        } else {
+            json!({"type": "disabled"})
+        };
+    }
+    if !request.tools.is_empty() {
+        let mut tools: Vec<Value> = request.tools.iter().map(|tool| json!({
+            "name": tool.name, "description": tool.description, "input_schema": tool.input_schema
+        })).collect();
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
+        body["tools"] = Value::Array(tools);
+        body["tool_choice"] = if thinking_enabled {
+            json!({"type": "auto"})
+        } else {
+            match request.tool_choice {
+                UnifiedToolChoice::Required if request.tools.len() == 1 => {
+                    json!({"type": "tool", "name": request.tools[0].name})
+                }
+                UnifiedToolChoice::Required => json!({"type": "any"}),
+                UnifiedToolChoice::None => json!({"type": "none"}),
+                UnifiedToolChoice::Auto => json!({"type": "auto"}),
+            }
+        };
+    }
+    body
+}
+
+pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
+    let mut system_parts = Vec::new();
+    let mut contents = Vec::new();
+    for message in &request.messages {
+        let parts: Vec<Value> = message
+            .content
+            .iter()
+            .map(|part| match part {
+                UnifiedContent::Text { text } => json!({"text": text}),
+                UnifiedContent::Image { media_type, data } => json!({"inlineData": {"mimeType": media_type, "data": data}}),
+                UnifiedContent::ToolCall { id, name, arguments } => json!({"functionCall": {"id": id, "name": name, "args": arguments}}),
+                UnifiedContent::ToolResult { call_id, content, .. } => json!({"functionResponse": {"id": call_id, "name": call_id, "response": {"content": content}}}),
+                UnifiedContent::Thinking { text, .. } => json!({"text": text, "thought": true}),
+            })
+            .collect();
+        if message.role == "system" {
+            system_parts.extend(parts);
+        } else if !parts.is_empty() {
+            contents.push(json!({"role": if message.role == "assistant" { "model" } else { "user" }, "parts": parts}));
+        }
+    }
+    let mut generation = json!({});
+    if let Some(tokens) = request.max_output_tokens {
+        generation["maxOutputTokens"] = json!(tokens);
+    }
+    if let Some(temperature) = request.temperature {
+        generation["temperature"] = json!(temperature);
+    }
+    if let Some(thinking) = &request.thinking {
+        let enabled = thinking.mode != ThinkingMode::Disabled
+            && thinking.effort != Some(ThinkingEffort::None);
+        generation["thinkingConfig"] = json!({
+            "includeThoughts": enabled,
+            "thinkingBudget": if enabled { thinking.budget_tokens.map(Value::from).unwrap_or(json!(-1)) } else { json!(0) }
+        });
+    }
+    let mut body = json!({"contents": contents, "generationConfig": generation});
+    if !system_parts.is_empty() {
+        body["systemInstruction"] = json!({"parts": system_parts});
+    }
+    if !request.tools.is_empty() {
+        body["tools"] = json!([{"functionDeclarations": request.tools.iter().map(|tool| json!({
+            "name": tool.name, "description": tool.description, "parametersJsonSchema": tool.input_schema
+        })).collect::<Vec<_>>()}]);
+        if request.tool_choice == UnifiedToolChoice::Required {
+            body["toolConfig"] = json!({"functionCallingConfig": {"mode": "ANY"}});
+        }
+    }
+    body
+}
+
+pub fn build_ollama_body(request: &UnifiedChatRequest) -> Value {
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .map(|message| {
+            let mut item = json!({"role": message.role, "content": content_text(&message.content)});
+            let thinking = message
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    UnifiedContent::Thinking { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !thinking.is_empty() && message.role == "assistant" {
+                item["thinking"] = json!(thinking);
+            }
+            item
+        })
+        .collect();
+    let mut body = json!({"model": request.model, "messages": messages, "stream": request.stream});
+    if let Some(thinking) = &request.thinking {
+        body["think"] = match thinking.effort {
+            Some(ThinkingEffort::None) => json!(false),
+            Some(ThinkingEffort::Minimal | ThinkingEffort::Low) => json!("low"),
+            Some(ThinkingEffort::Medium) => json!("medium"),
+            Some(ThinkingEffort::High | ThinkingEffort::Xhigh | ThinkingEffort::Max) => {
+                json!("high")
+            }
+            None => json!(thinking.mode != ThinkingMode::Disabled),
+        };
+    }
+    let mut options = json!({});
+    if let Some(tokens) = request.max_output_tokens {
+        options["num_predict"] = json!(tokens);
+    }
+    if let Some(temperature) = request.temperature {
+        options["temperature"] = json!(temperature);
+    }
+    if options.as_object().is_some_and(|object| !object.is_empty()) {
+        body["options"] = options;
+    }
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(request.tools.iter().map(|tool| json!({
+            "type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.input_schema}
+        })).collect());
+    }
+    body
+}
+
+fn push_thinking_text(
+    reasoning: &mut String,
+    thinking: &mut Vec<UnifiedContent>,
+    text: &str,
+    signature: Option<String>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    reasoning.push_str(text);
+    thinking.push(UnifiedContent::Thinking {
+        text: text.to_string(),
+        signature,
+        encrypted_data: None,
+    });
+}
+
+fn push_encrypted_thinking(thinking: &mut Vec<UnifiedContent>, encrypted_data: &str) {
+    if encrypted_data.is_empty() {
+        return;
+    }
+    thinking.push(UnifiedContent::Thinking {
+        text: String::new(),
+        signature: None,
+        encrypted_data: Some(encrypted_data.to_string()),
+    });
+}
+
+fn append_openai_reasoning_details(
+    value: Option<&Value>,
+    reasoning: &mut String,
+    thinking: &mut Vec<UnifiedContent>,
+) {
+    let Some(details) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for detail in details {
+        match detail.get("type").and_then(Value::as_str) {
+            Some("reasoning.encrypted") => {
+                if let Some(data) = detail
+                    .get("data")
+                    .or_else(|| detail.get("encrypted_content"))
+                    .and_then(Value::as_str)
+                {
+                    push_encrypted_thinking(thinking, data);
+                }
+            }
+            Some("reasoning.text") | Some("reasoning.summary") => {
+                if let Some(text) = detail.get("text").and_then(Value::as_str) {
+                    let signature = detail
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    push_thinking_text(reasoning, thinking, text, signature);
+                }
+            }
+            _ => {
+                if let Some(text) = detail.get("text").and_then(Value::as_str) {
+                    push_thinking_text(reasoning, thinking, text, None);
+                }
+            }
+        }
+    }
+}
+
+fn append_responses_reasoning_item(
+    item: &Value,
+    reasoning: &mut String,
+    thinking: &mut Vec<UnifiedContent>,
+) {
+    if let Some(data) = item.get("encrypted_content").and_then(Value::as_str) {
+        push_encrypted_thinking(thinking, data);
+    }
+    for key in ["summary", "content"] {
+        if let Some(parts) = item.get(key).and_then(Value::as_array) {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    push_thinking_text(reasoning, thinking, text, None);
+                }
+            }
+        }
+    }
+}
+
+fn append_responses_output_item(
+    item: &Value,
+    text: &mut String,
+    reasoning: &mut String,
+    thinking: &mut Vec<UnifiedContent>,
+    tool_calls: &mut Vec<UnifiedContent>,
+) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for part in content {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("output_text") | Some("refusal") => text
+                            .push_str(part.get("text").and_then(Value::as_str).unwrap_or_default()),
+                        Some("reasoning_text") | Some("summary_text") => push_thinking_text(
+                            reasoning,
+                            thinking,
+                            part.get("text").and_then(Value::as_str).unwrap_or_default(),
+                            None,
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some("function_call") => tool_calls.push(UnifiedContent::ToolCall {
+            id: item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            arguments: item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or(json!({})),
+        }),
+        Some("reasoning") => append_responses_reasoning_item(item, reasoning, thinking),
+        _ => {}
+    }
+}
+
+pub fn finish_reason_from_raw(protocol: ProviderProtocol, raw: &Value) -> Option<String> {
+    match protocol {
+        ProviderProtocol::OpenaiChat => raw
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ProviderProtocol::OpenaiResponses => raw
+            .pointer("/incomplete_details/reason")
+            .or_else(|| raw.pointer("/response/incomplete_details/reason"))
+            .or_else(|| raw.get("status"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ProviderProtocol::Anthropic => raw
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ProviderProtocol::Gemini => raw
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ProviderProtocol::Ollama => raw
+            .get("done_reason")
+            .or_else(|| raw.get("doneReason"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+pub fn finish_reason_is_truncation(reason: Option<&str>) -> bool {
+    reason
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "length"
+                    | "max_tokens"
+                    | "max_output_tokens"
+                    | "max_tokens_reached"
+                    | "model_context_window_exceeded"
+                    | "incomplete"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub fn normalize_response(
+    protocol: ProviderProtocol,
+    mut raw: Value,
+) -> Result<UnifiedChatResponse, String> {
+    if raw.get("choices").is_none() {
+        if let Some(data) = raw
+            .get("data")
+            .filter(|data| data.get("choices").is_some())
+            .cloned()
+        {
+            raw = data;
+        }
+    }
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut thinking = Vec::new();
+    let mut tool_calls = Vec::new();
+    let usage;
+    match protocol {
+        ProviderProtocol::OpenaiChat => {
+            let message = raw
+                .pointer("/choices/0/message")
+                .or_else(|| raw.pointer("/choices/0/delta"))
+                .cloned()
+                .unwrap_or(json!({}));
+            text = message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            reasoning = message
+                .get("reasoning_content")
+                .or_else(|| message.get("reasoning"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !reasoning.is_empty() {
+                thinking.push(UnifiedContent::Thinking {
+                    text: reasoning.clone(),
+                    signature: None,
+                    encrypted_data: None,
+                });
+            }
+            append_openai_reasoning_details(
+                message.get("reasoning_details"),
+                &mut reasoning,
+                &mut thinking,
+            );
+            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                tool_calls = calls
+                    .iter()
+                    .map(|call| UnifiedContent::ToolCall {
+                        id: call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: call
+                            .pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: call
+                            .pointer("/function/arguments")
+                            .and_then(Value::as_str)
+                            .and_then(|value| serde_json::from_str(value).ok())
+                            .unwrap_or(json!({})),
+                    })
+                    .collect();
+            }
+            usage = usage_from_openai(raw.get("usage"));
+        }
+        ProviderProtocol::OpenaiResponses => {
+            if let Some(event_type) = raw.get("type").and_then(Value::as_str) {
+                match event_type {
+                    "response.output_text.delta" | "response.refusal.delta" => {
+                        text.push_str(raw.get("delta").and_then(Value::as_str).unwrap_or_default());
+                    }
+                    "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                        push_thinking_text(
+                            &mut reasoning,
+                            &mut thinking,
+                            raw.get("delta").and_then(Value::as_str).unwrap_or_default(),
+                            None,
+                        );
+                    }
+                    "response.output_item.done" => {
+                        if let Some(item) = raw.get("item") {
+                            append_responses_output_item(
+                                item,
+                                &mut text,
+                                &mut reasoning,
+                                &mut thinking,
+                                &mut tool_calls,
+                            );
+                        }
+                    }
+                    "response.completed" => {
+                        if let Some(response) = raw.get("response") {
+                            if let Some(output) = response.get("output").and_then(Value::as_array) {
+                                for item in output {
+                                    append_responses_output_item(
+                                        item,
+                                        &mut text,
+                                        &mut reasoning,
+                                        &mut thinking,
+                                        &mut tool_calls,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(output) = raw.get("output").and_then(Value::as_array) {
+                for item in output {
+                    append_responses_output_item(
+                        item,
+                        &mut text,
+                        &mut reasoning,
+                        &mut thinking,
+                        &mut tool_calls,
+                    );
+                }
+            }
+            text.push_str(raw.get("delta").and_then(Value::as_str).unwrap_or_default());
+            usage = raw
+                .get("response")
+                .and_then(|response| usage_from_openai(response.get("usage")))
+                .or_else(|| usage_from_openai(raw.get("usage")));
+        }
+        ProviderProtocol::Anthropic => {
+            if let Some(content) = raw.get("content").and_then(Value::as_array) {
+                for part in content {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => text
+                            .push_str(part.get("text").and_then(Value::as_str).unwrap_or_default()),
+                        Some("thinking") => push_thinking_text(
+                            &mut reasoning,
+                            &mut thinking,
+                            part.get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            part.get("signature")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        ),
+                        Some("redacted_thinking") => {
+                            if let Some(data) = part.get("data").and_then(Value::as_str) {
+                                push_encrypted_thinking(&mut thinking, data);
+                            }
+                        }
+                        Some("tool_use") => tool_calls.push(UnifiedContent::ToolCall {
+                            id: part
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            name: part
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            arguments: part.get("input").cloned().unwrap_or(json!({})),
+                        }),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(delta) = raw.get("delta") {
+                text.push_str(
+                    delta
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                );
+                push_thinking_text(
+                    &mut reasoning,
+                    &mut thinking,
+                    delta
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    None,
+                );
+            }
+            usage = raw.get("usage").map(|value| UnifiedUsage {
+                input_tokens: value
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                output_tokens: value
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                cached_tokens: value
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            });
+        }
+        ProviderProtocol::Gemini => {
+            if let Some(parts) = raw
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+            {
+                for part in parts {
+                    if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                        push_thinking_text(
+                            &mut reasoning,
+                            &mut thinking,
+                            part.get("text").and_then(Value::as_str).unwrap_or_default(),
+                            None,
+                        );
+                    } else {
+                        text.push_str(part.get("text").and_then(Value::as_str).unwrap_or_default());
+                    }
+                    if let Some(call) = part.get("functionCall") {
+                        tool_calls.push(UnifiedContent::ToolCall {
+                            id: call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            name: call
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            arguments: call.get("args").cloned().unwrap_or(json!({})),
+                        });
+                    }
+                }
+            }
+            usage = raw.get("usageMetadata").map(|value| UnifiedUsage {
+                input_tokens: value
+                    .get("promptTokenCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                output_tokens: value
+                    .get("candidatesTokenCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    + value
+                        .get("thoughtsTokenCount")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                cached_tokens: value
+                    .get("cachedContentTokenCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            });
+        }
+        ProviderProtocol::Ollama => {
+            text = raw
+                .pointer("/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            reasoning = raw
+                .pointer("/message/thinking")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !reasoning.is_empty() {
+                thinking.push(UnifiedContent::Thinking {
+                    text: reasoning.clone(),
+                    signature: None,
+                    encrypted_data: None,
+                });
+            }
+            usage = Some(UnifiedUsage {
+                input_tokens: raw
+                    .get("prompt_eval_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                output_tokens: raw.get("eval_count").and_then(Value::as_u64).unwrap_or(0),
+                cached_tokens: 0,
+            });
+        }
+    }
+    Ok(UnifiedChatResponse {
+        text,
+        reasoning,
+        thinking,
+        tool_calls,
+        usage,
+        raw,
+    })
+}
+
+fn usage_from_openai(value: Option<&Value>) -> Option<UnifiedUsage> {
+    value.map(|value| UnifiedUsage {
+        input_tokens: value
+            .get("prompt_tokens")
+            .or_else(|| value.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: value
+            .get("completion_tokens")
+            .or_else(|| value.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cached_tokens: value
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .or_else(|| value.pointer("/input_tokens_details/cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ThinkingSummary, UnifiedTool};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn request() -> UnifiedChatRequest {
+        UnifiedChatRequest {
+            model: "deepseek-v4".into(),
+            messages: vec![UnifiedMessage {
+                role: "user".into(),
+                content: vec![UnifiedContent::Text {
+                    text: "hello".into(),
+                }],
+            }],
+            tools: vec![UnifiedTool {
+                name: "lookup".into(),
+                description: "Lookup".into(),
+                input_schema: json!({"type": "object"}),
+            }],
+            tool_choice: UnifiedToolChoice::Auto,
+            thinking: Some(ThinkingConfig {
+                mode: ThinkingMode::Enabled,
+                budget_tokens: Some(2048),
+                effort: Some(ThinkingEffort::Max),
+                summary: Some(ThinkingSummary::Concise),
+            }),
+            max_output_tokens: Some(4096),
+            temperature: None,
+            stream: true,
+        }
+    }
+
+    #[test]
+    fn maps_deepseek_reasoning_and_cache_control() {
+        let body = build_openai_chat_body("https://api.deepseek.com", &request());
+        assert_eq!(body.pointer("/thinking/type"), Some(&json!("enabled")));
+        assert_eq!(body.get("reasoning_effort"), Some(&json!("max")));
+    }
+
+    #[test]
+    fn anthropic_alternates_and_forces_auto_tool_choice() {
+        let mut request = request();
+        request.messages.insert(
+            0,
+            UnifiedMessage {
+                role: "user".into(),
+                content: vec![UnifiedContent::Text {
+                    text: "first".into(),
+                }],
+            },
+        );
+        let body = build_anthropic_body(&request);
+        assert_eq!(body.pointer("/messages/0/role"), Some(&json!("user")));
+        assert_eq!(body.pointer("/tool_choice/type"), Some(&json!("auto")));
+    }
+
+    #[test]
+    fn raw_base_url_skips_openai_version_injection() {
+        let adapter = RuntimeAdapter::new(
+            Client::new(),
+            ProviderRuntimeConfig {
+                protocol: ProviderProtocol::OpenaiChat,
+                base_url: "https://proxy.example/openai/v1".into(),
+                use_raw_base_url: true,
+                config: json!({}),
+                auth_type: "none".into(),
+                auth_header: "Authorization".into(),
+                credential: None,
+                custom_headers: Vec::new(),
+            },
+        );
+        let (url, _) = adapter.build_chat_request(&request()).expect("request");
+        assert_eq!(url, "https://proxy.example/openai/v1/chat/completions");
+    }
+
+    #[test]
+    fn builds_responses_input_with_tools_and_thinking() {
+        let mut request = request();
+        request.stream = false;
+        request.messages = vec![
+            UnifiedMessage {
+                role: "user".into(),
+                content: vec![UnifiedContent::Text {
+                    text: "Translate this.".into(),
+                }],
+            },
+            UnifiedMessage {
+                role: "assistant".into(),
+                content: vec![
+                    UnifiedContent::Thinking {
+                        text: "Plan".into(),
+                        signature: Some("sig".into()),
+                        encrypted_data: None,
+                    },
+                    UnifiedContent::Text {
+                        text: "Need lookup".into(),
+                    },
+                    UnifiedContent::ToolCall {
+                        id: "call_1".into(),
+                        name: "lookup".into(),
+                        arguments: json!({"term": "A"}),
+                    },
+                ],
+            },
+            UnifiedMessage {
+                role: "user".into(),
+                content: vec![UnifiedContent::ToolResult {
+                    call_id: "call_1".into(),
+                    content: "Result".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let body = build_openai_responses_body("https://api.openai.com", &request);
+        let input = body.get("input").and_then(Value::as_array).expect("input");
+        assert_eq!(
+            input[0].pointer("/content/0/type"),
+            Some(&json!("input_text"))
+        );
+        assert!(input
+            .iter()
+            .any(|item| item.get("type") == Some(&json!("reasoning"))));
+        assert!(input
+            .iter()
+            .any(|item| item.get("type") == Some(&json!("function_call"))));
+        assert!(input
+            .iter()
+            .any(|item| item.get("type") == Some(&json!("function_call_output"))));
+    }
+
+    #[test]
+    fn normalizes_openai_reasoning_details() {
+        let response = normalize_response(
+            ProviderProtocol::OpenaiChat,
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "ok",
+                        "reasoning_details": [
+                            {"type": "reasoning.text", "text": "think", "signature": "sig"},
+                            {"type": "reasoning.encrypted", "data": "secret"}
+                        ]
+                    }
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+            }),
+        )
+        .expect("normalize");
+        assert_eq!(response.text, "ok");
+        assert_eq!(response.reasoning, "think");
+        assert_eq!(response.thinking.len(), 2);
+    }
+
+    #[test]
+    fn parses_provider_rate_limit_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-limit-requests",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("2"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-requests",
+            HeaderValue::from_static("1.5s"),
+        );
+        headers.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("9000"));
+        headers.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("800"),
+        );
+        let telemetry = rate_limits_from_headers(&headers);
+        assert_eq!(telemetry.request_limit, Some(100));
+        assert_eq!(telemetry.request_remaining, Some(2));
+        assert_eq!(telemetry.request_reset_ms, Some(1500));
+        assert_eq!(telemetry.token_limit, Some(9000));
+        assert_eq!(telemetry.token_remaining, Some(800));
+        assert_eq!(telemetry.source.as_deref(), Some("openai-compatible"));
+    }
+
+    #[test]
+    fn detects_truncation_finish_reasons() {
+        assert!(finish_reason_is_truncation(Some("length")));
+        assert!(finish_reason_is_truncation(Some("MAX_TOKENS")));
+        assert!(finish_reason_is_truncation(Some("max_output_tokens")));
+        assert!(!finish_reason_is_truncation(Some("stop")));
+        assert!(!finish_reason_is_truncation(None));
+    }
+
+    #[tokio::test]
+    async fn fetches_models_from_mock_openai_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let body = r#"{"data":[{"id":"mock-model","name":"Mock Model"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write");
+        });
+        let adapter = RuntimeAdapter::new(
+            Client::new(),
+            ProviderRuntimeConfig {
+                protocol: ProviderProtocol::OpenaiChat,
+                base_url: format!("http://{address}"),
+                use_raw_base_url: false,
+                config: json!({}),
+                auth_type: "none".into(),
+                auth_header: "Authorization".into(),
+                credential: None,
+                custom_headers: Vec::new(),
+            },
+        );
+        let models = adapter.list_models().await.expect("list models");
+        assert_eq!(models[0].request_name, "mock-model");
+        server.join().expect("server");
+    }
+}

@@ -124,12 +124,26 @@ export function LanguageCombobox({
     return items;
   }, [allLabel, allValue, autoLabel, includeAuto]);
 
+  const selectedOption = useMemo(() => {
+    if (allValue && value === allValue) {
+      return options.find((option) => option.value === allValue) ?? null;
+    }
+    if (value === AUTO_LANGUAGE_CODE) {
+      return options.find((option) => option.value === AUTO_LANGUAGE_CODE) ?? null;
+    }
+    const normalized = normalizeLanguageCode(value);
+    return normalized
+      ? (options.find((option) => option.value === normalized) ?? null)
+      : null;
+  }, [allValue, options, value]);
+
   const selectedLabel = useMemo(() => {
+    if (selectedOption) return selectedOption.label;
     if (allValue && value === allValue) return allLabel ?? placeholder;
     if (value === AUTO_LANGUAGE_CODE) return autoLabel;
     const normalized = normalizeLanguageCode(value);
     return normalized ? displayLanguage(normalized) : placeholder;
-  }, [allLabel, allValue, autoLabel, placeholder, value]);
+  }, [allLabel, allValue, autoLabel, placeholder, selectedOption, value]);
 
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -158,7 +172,12 @@ export function LanguageCombobox({
           disabled={disabled}
           className={cn(selectTriggerClassName, "justify-between font-normal", className)}
         >
-          <span className="min-w-0 flex-1 truncate text-left">{selectedLabel}</span>
+          <span className="flex min-w-0 flex-1 items-center gap-2 text-left">
+            {selectedOption?.flagCode && (
+              <LanguageFlag code={selectedOption.flagCode} />
+            )}
+            <span className="min-w-0 truncate">{selectedLabel}</span>
+          </span>
           <ChevronDown className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.8} />
         </button>
       </PopoverTrigger>

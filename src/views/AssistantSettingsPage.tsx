@@ -107,9 +107,9 @@ function AssistantDetailsSkeleton() {
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center justify-between gap-3 border-b p-3">
         <div className="flex items-center gap-3">
-          <Skeleton className="size-10" />
+          <Skeleton className="size-9" />
           <div className="flex items-center gap-2">
-            <Skeleton className="h-5 w-36" />
+            <Skeleton className="h-4 w-32" />
             <Skeleton className="h-5 w-12" />
             <Skeleton className="size-7" />
           </div>

@@ -109,7 +109,7 @@ function mineruBasePreview(baseUrl: string, mode: MinerUMode): string[] {
 function BaseUrlLabel({ label }: { label: string }) {
   return (
     <div className="flex items-center gap-1.5">
-      <Label className="text-xs">{label}</Label>
+      <Label className="text-sm">{label}</Label>
       <HelpTooltip contentClassName="max-w-80">{BASE_URL_HELP_TEXT}</HelpTooltip>
     </div>
   );
@@ -162,10 +162,10 @@ export function ProviderDetailsPanel({
     >
       <div className="flex shrink-0 items-start justify-between gap-3 border-b p-3">
         <div className="flex min-w-0 items-center gap-3">
-          <ProviderAvatar name={provider.name} avatar={provider.avatar} className="size-10 text-xs" />
+          <ProviderAvatar name={provider.name} avatar={provider.avatar} className="size-9 text-2xs" />
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <h2 className="min-w-0 truncate text-lg font-semibold">{provider.name}</h2>
-            <Badge variant="outline" className="text-3xs">
+            <h2 className="min-w-0 truncate text-base font-semibold">{provider.name}</h2>
+            <Badge variant="outline" className="text-xs">
               {isMinerU ? "MinerU Document Parsing" : protocolLabel(provider.protocol)}
             </Badge>
           </div>
@@ -189,7 +189,7 @@ export function ProviderDetailsPanel({
               <>
                 <div className="grid grid-cols-[minmax(9rem,11.25rem)_minmax(0,1fr)] items-start gap-3 max-[820px]:grid-cols-1">
                   <div className="grid gap-1">
-                    <Label className="text-xs">解析模式</Label>
+                    <Label className="text-sm">解析模式</Label>
                     <Select
                       value={mineruConfig.mode}
                       onValueChange={(value) =>
@@ -239,7 +239,7 @@ export function ProviderDetailsPanel({
                 </div>
                 <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-end gap-2 max-[820px]:grid-cols-1">
                   <div className="grid gap-1">
-                    <Label className="text-xs">API Key</Label>
+                    <Label className="text-sm">API Key</Label>
                     <Input
                       disabled
                       value={
@@ -282,7 +282,7 @@ export function ProviderDetailsPanel({
                 </div>
                 <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-end gap-2 max-[820px]:grid-cols-1">
                   <div className="grid gap-1">
-                    <Label className="text-xs">API Key</Label>
+                    <Label className="text-sm">API Key</Label>
                     <Input disabled value={provider.credentialMask ? "•••••••••••••••••••••••••••••••••" : "尚未配置 API Key"} />
                   </div>
                   <Button className="min-w-0" variant="outline" size="control-sm" onClick={onOpenCredential}>

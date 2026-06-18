@@ -212,31 +212,32 @@ export function AssistantDetailsPanel({
           <AssistantIcon
             kind={settings.iconKind}
             value={settings.iconValue}
-            className="size-10 text-sm"
-            glyphClassName="size-5 text-lg"
+            className="size-9 text-sm"
+            glyphClassName="size-4 text-base"
           />
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <h2 className="min-w-0 truncate text-lg font-semibold">
+            <h2 className="min-w-0 truncate text-base font-semibold">
               {settings.name.trim() || assistant.name}
             </h2>
-            <Badge variant="outline" className="text-3xs">
+            <Badge variant="outline" className="text-xs">
               {purposeLabel(assistant.purpose)}
             </Badge>
-            <Button
-              size="icon-sm"
-              variant="outline"
-              onClick={() => setIdentityOpen(true)}
-              aria-label="编辑助手名称和图标"
-              title="编辑助手名称和图标"
-            >
-              <Pencil className="size-3.5" />
-            </Button>
           </div>
         </div>
+        <Button
+          size="icon-sm"
+          variant="outline"
+          className="self-center"
+          onClick={() => setIdentityOpen(true)}
+          aria-label="编辑助手名称和图标"
+          title="编辑助手名称和图标"
+        >
+          <Pencil className="size-3.5" />
+        </Button>
       </div>
 
       <ScrollArea className="min-h-0 flex-1">
-        <div className="grid gap-3 p-3">
+        <div className="grid gap-3 p-3 [&_[data-slot=label]]:text-sm">
           <section className="grid gap-1.5 rounded-[6px] border p-3">
             <Label>系统提示词</Label>
             <button

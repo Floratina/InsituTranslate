@@ -64,6 +64,34 @@ export interface UpdateTranslationTaskTagsInput {
   tags: string[];
 }
 
+export interface ImportTranslationTaskInput {
+  filePath: string;
+}
+
+export interface UpdateTranslationTaskNameInput {
+  id: string;
+  name: string;
+}
+
+export interface TranslationTaskIdsInput {
+  ids: string[];
+}
+
+export type TranslationTaskExportFormat = "source" | "pdf" | "pdf-bilingual";
+
+export interface TranslationTaskPdfOptions {
+  pageSize: string;
+  margin: string;
+  scale: number;
+}
+
+export interface ExportTranslationTaskInput {
+  id: string;
+  format: TranslationTaskExportFormat;
+  outputName: string;
+  pdfOptions?: TranslationTaskPdfOptions | null;
+}
+
 export interface TranslationTaskView {
   id: string;
   name: string;

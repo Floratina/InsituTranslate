@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,10 +29,17 @@ use crate::glossaries::{
     ImportGlossaryInput, PrepareAutoGlossaryInput, UpdateGlossaryEntryInput, UpdateGlossaryInput,
 };
 use crate::translation_tasks::{
-    self, CreateTranslationTaskInput, RunMode, TranslationConfigView, TranslationTaskDetail,
-    TranslationTaskFilters, TranslationTaskView, UpdateTranslationConfigInput,
-    UpdateTranslationTaskTagsInput,
+    self, CreateTranslationTaskInput, ExportTranslationTaskInput, ImportTranslationTaskInput,
+    RunMode, TranslationConfigView, TranslationInterrupt, TranslationTaskDetail,
+    TranslationTaskFilters, TranslationTaskIdsInput, TranslationTaskView,
+    UpdateTranslationConfigInput, UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
 };
+
+#[derive(Debug, Clone)]
+pub struct RunningTranslationTask {
+    pub id: String,
+    pub interrupt: TranslationInterrupt,
+}
 
 pub struct AppState {
     pub pool: SqlitePool,
@@ -39,7 +47,8 @@ pub struct AppState {
     pub translation_workspace_root: PathBuf,
     pub glossary_config_pool: SqlitePool,
     pub glossary_workspace_root: PathBuf,
-    pub running_translation_task: Arc<Mutex<Option<String>>>,
+    pub running_translation_task: Arc<Mutex<Option<RunningTranslationTask>>>,
+    pub translation_batch_cancel: Arc<AtomicBool>,
     pub client: Client,
 }
 
@@ -338,6 +347,32 @@ pub async fn list_translation_tasks(
 }
 
 #[tauri::command]
+pub async fn import_translation_task(
+    state: State<'_, AppState>,
+    input: ImportTranslationTaskInput,
+) -> Result<TranslationTaskView, String> {
+    translation_tasks::import_translation_task(
+        &state.translation_config_pool,
+        &state.translation_workspace_root,
+        input,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn update_translation_task_name(
+    state: State<'_, AppState>,
+    input: UpdateTranslationTaskNameInput,
+) -> Result<TranslationTaskView, String> {
+    translation_tasks::update_translation_task_name(
+        &state.translation_config_pool,
+        &state.translation_workspace_root,
+        input,
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn update_translation_task_tags(
     state: State<'_, AppState>,
     input: UpdateTranslationTaskTagsInput,
@@ -348,6 +383,23 @@ pub async fn update_translation_task_tags(
         input,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn open_translation_task_folder(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    translation_tasks::open_translation_task_folder(&state.translation_config_pool, &id).await
+}
+
+#[tauri::command]
+pub async fn export_translation_task(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: ExportTranslationTaskInput,
+) -> Result<(), String> {
+    translation_tasks::export_translation_task(app, &state.translation_config_pool, input).await
 }
 
 #[tauri::command]
@@ -364,8 +416,8 @@ pub async fn delete_translation_task(state: State<'_, AppState>, id: String) -> 
         .running_translation_task
         .lock()
         .await
-        .as_deref()
-        .is_some_and(|running_id| running_id == id)
+        .as_ref()
+        .is_some_and(|running| running.id == id)
     {
         return Err("Cannot delete a task while it is running".into());
     }
@@ -373,6 +425,27 @@ pub async fn delete_translation_task(state: State<'_, AppState>, id: String) -> 
         &state.translation_config_pool,
         &state.translation_workspace_root,
         &id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_translation_tasks(
+    state: State<'_, AppState>,
+    input: TranslationTaskIdsInput,
+) -> Result<(), String> {
+    {
+        let running = state.running_translation_task.lock().await;
+        if let Some(running) = running.as_ref() {
+            if input.ids.iter().any(|id| id == &running.id) {
+                return Err("请先暂停正在运行的任务".into());
+            }
+        }
+    }
+    translation_tasks::delete_translation_tasks(
+        &state.translation_config_pool,
+        &state.translation_workspace_root,
+        &input.ids,
     )
     .await
 }
@@ -404,18 +477,166 @@ pub async fn retranslate_translation_task(
     start_translation_task_with_mode(app, state, id, RunMode::Retranslate).await
 }
 
+#[tauri::command]
+pub async fn pause_translation_task(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TranslationTaskView, String> {
+    let interrupt = {
+        let running = state.running_translation_task.lock().await;
+        running
+            .as_ref()
+            .filter(|running| running.id == id)
+            .map(|running| running.interrupt.clone())
+    };
+    if let Some(interrupt) = interrupt {
+        interrupt.interrupt("Task paused");
+    }
+    translation_tasks::list_translation_tasks(
+        &state.translation_config_pool,
+        Some(TranslationTaskFilters {
+            tag: None,
+            source_language: None,
+            target_language: None,
+        }),
+    )
+    .await?
+    .into_iter()
+    .find(|task| task.id == id)
+    .ok_or_else(|| "Translation task not found".to_string())
+}
+
+#[tauri::command]
+pub async fn start_translation_tasks_batch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: TranslationTaskIdsInput,
+) -> Result<Vec<TranslationTaskView>, String> {
+    {
+        let running = state.running_translation_task.lock().await;
+        if let Some(current) = running.as_ref() {
+            return Err(format!("Translation task {} is already running", current.id));
+        }
+    }
+    state.translation_batch_cancel.store(false, Ordering::SeqCst);
+    let tasks = translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
+        .await?
+        .into_iter()
+        .filter(|task| input.ids.iter().any(|id| id == &task.id))
+        .collect::<Vec<_>>();
+    let ids = input.ids;
+    let provider_pool = state.pool.clone();
+    let config_pool = state.translation_config_pool.clone();
+    let workspace_root = state.translation_workspace_root.clone();
+    let client = state.client.clone();
+    let running = state.running_translation_task.clone();
+    let cancel = state.translation_batch_cancel.clone();
+    tauri::async_runtime::spawn(async move {
+        for id in ids {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(indexed) = translation_tasks::list_translation_tasks(&config_pool, None)
+                .await
+                .map(|tasks| tasks.into_iter().find(|task| task.id == id))
+            else {
+                continue;
+            };
+            let Some(indexed) = indexed else {
+                continue;
+            };
+            let mode = match indexed.status {
+                translation_tasks::TranslationTaskStatus::Pending => RunMode::Start,
+                translation_tasks::TranslationTaskStatus::Interrupted => RunMode::Resume,
+                _ => continue,
+            };
+            let interrupt = TranslationInterrupt::new();
+            {
+                let mut guard = running.lock().await;
+                if guard.is_some() {
+                    break;
+                }
+                *guard = Some(RunningTranslationTask {
+                    id: id.clone(),
+                    interrupt: interrupt.clone(),
+                });
+            }
+            let prepared = match translation_tasks::prepare_translation_run(
+                &config_pool,
+                &workspace_root,
+                &id,
+                mode,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    let mut guard = running.lock().await;
+                    if guard.as_ref().is_some_and(|current| current.id == id) {
+                        *guard = None;
+                    }
+                    continue;
+                }
+            };
+            let inp_path = prepared.inp_path.clone();
+            let result = translation_tasks::run_translation_task(
+                app.clone(),
+                provider_pool.clone(),
+                config_pool.clone(),
+                client.clone(),
+                prepared,
+                interrupt,
+            )
+            .await;
+            if let Err(error) = result {
+                let _ = translation_tasks::mark_task_failed_after_runtime_error(
+                    &config_pool,
+                    &inp_path,
+                    error,
+                )
+                .await;
+            }
+            let mut guard = running.lock().await;
+            if guard.as_ref().is_some_and(|current| current.id == id) {
+                *guard = None;
+            }
+        }
+    });
+    Ok(tasks)
+}
+
+#[tauri::command]
+pub async fn pause_translation_tasks_batch(state: State<'_, AppState>) -> Result<(), String> {
+    state.translation_batch_cancel.store(true, Ordering::SeqCst);
+    let interrupt = state
+        .running_translation_task
+        .lock()
+        .await
+        .as_ref()
+        .map(|running| running.interrupt.clone());
+    if let Some(interrupt) = interrupt {
+        interrupt.interrupt("Task paused");
+    }
+    Ok(())
+}
+
 async fn start_translation_task_with_mode(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     mode: RunMode,
 ) -> Result<TranslationTaskView, String> {
+    state.translation_batch_cancel.store(false, Ordering::SeqCst);
+    let interrupt = TranslationInterrupt::new();
     {
         let mut running = state.running_translation_task.lock().await;
         if let Some(current) = running.as_ref() {
-            return Err(format!("Translation task {current} is already running"));
+            return Err(format!("Translation task {} is already running", current.id));
         }
-        *running = Some(id.clone());
+        *running = Some(RunningTranslationTask {
+            id: id.clone(),
+            interrupt: interrupt.clone(),
+        });
     }
 
     let prepared = match translation_tasks::prepare_translation_run(
@@ -446,6 +667,7 @@ async fn start_translation_task_with_mode(
             config_pool.clone(),
             client,
             prepared,
+            interrupt,
         )
         .await;
         if let Err(error) = result {
@@ -457,7 +679,7 @@ async fn start_translation_task_with_mode(
             .await;
         }
         let mut guard = running.lock().await;
-        if guard.as_deref() == Some(task_id.as_str()) {
+        if guard.as_ref().is_some_and(|current| current.id == task_id) {
             *guard = None;
         }
     });
@@ -577,6 +799,26 @@ pub async fn pick_glossary_file(app: AppHandle) -> Result<Option<String>, String
         app.dialog()
             .file()
             .add_filter("Glossary", &["csv", "json"])
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    file_path
+        .map(|path| {
+            let path_buf: PathBuf = path
+                .try_into()
+                .map_err(|error| format!("Unable to resolve selected file path: {error}"))?;
+            Ok(path_buf.to_string_lossy().to_string())
+        })
+        .transpose()
+}
+
+#[tauri::command]
+pub async fn pick_translation_task_file(app: AppHandle) -> Result<Option<String>, String> {
+    let file_path = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("InsituTranslate Task", &["inp"])
             .blocking_pick_file()
     })
     .await

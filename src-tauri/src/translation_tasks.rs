@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{stream, StreamExt};
@@ -10,6 +11,7 @@ use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::adapters::{finish_reason_is_truncation, RateLimitTelemetry, RuntimeAdapter};
@@ -34,8 +36,10 @@ const DEFAULT_MAX_TOKENS_PER_MINUTE: i64 = 60_000;
 const INP_SCHEMA_VERSION: i64 = 1;
 const MAX_TASK_TAGS: usize = 12;
 const MAX_TASK_TAG_LENGTH: usize = 48;
+const MAX_TASK_NAME_LENGTH: usize = 120;
 const ERROR_RATE_FAILURE_THRESHOLD: f64 = 0.30;
 const TRANSLATION_PROGRESS_EVENT: &str = "translation-progress";
+const INP_FILE_DAMAGED: &str = "INP_FILE_DAMAGED";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -261,6 +265,50 @@ pub struct UpdateTranslationTaskTagsInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ImportTranslationTaskInput {
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTranslationTaskNameInput {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationTaskIdsInput {
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportTranslationTaskInput {
+    pub id: String,
+    pub format: TranslationTaskExportFormat,
+    pub output_name: String,
+    pub pdf_options: Option<TranslationTaskPdfOptions>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TranslationTaskExportFormat {
+    Source,
+    Pdf,
+    PdfBilingual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationTaskPdfOptions {
+    pub page_size: String,
+    pub margin: String,
+    pub scale: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TranslationTaskView {
     pub id: String,
     pub name: String,
@@ -319,6 +367,36 @@ pub enum RunMode {
     Start,
     Resume,
     Retranslate,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranslationInterrupt {
+    flag: Arc<AtomicBool>,
+    reason: Arc<StdMutex<Option<String>>>,
+}
+
+impl TranslationInterrupt {
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            reason: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    pub fn interrupt(&self, reason: impl Into<String>) {
+        if let Ok(mut current) = self.reason.lock() {
+            *current = Some(reason.into());
+        }
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    fn is_interrupted(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason.lock().ok().and_then(|current| current.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -623,6 +701,161 @@ async fn connect_inp(path: &Path) -> Result<SqlitePool, String> {
     let pool = connect_sqlite(path, 1).await?;
     migrate_inp_db(&pool).await?;
     Ok(pool)
+}
+
+async fn connect_inp_read_only(path: &Path) -> Result<SqlitePool, String> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .foreign_keys(true);
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|_| INP_FILE_DAMAGED.to_string())
+}
+
+async fn validate_inp_file(path: &Path) -> Result<TranslationTaskView, String> {
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("inp"))
+        != Some(true)
+    {
+        return Err(INP_FILE_DAMAGED.into());
+    }
+    let pool = connect_inp_read_only(path).await?;
+    let result = async {
+        validate_inp_schema(&pool).await?;
+        metadata_task(&pool, path).await
+    }
+    .await
+    .map_err(|_| INP_FILE_DAMAGED.to_string());
+    pool.close().await;
+    result
+}
+
+async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
+    require_columns(
+        pool,
+        "metadata",
+        &[
+            "task_id",
+            "schema_version",
+            "name",
+            "source_path",
+            "source_language",
+            "target_language",
+            "status",
+            "progress",
+            "provider_id",
+            "model_id",
+            "model_request_name",
+            "assistant_id",
+            "assistant_system_prompt",
+            "tags_json",
+            "token_limit",
+            "max_concurrency",
+            "max_retries",
+            "config_snapshot_json",
+            "total_chunks",
+            "completed_chunks",
+            "failed_chunks",
+            "interrupted_chunks",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "thinking_tokens",
+            "total_tokens",
+            "error_rate",
+            "last_error",
+            "rate_limit_status",
+            "created_at",
+            "updated_at",
+        ],
+    )
+    .await?;
+    require_columns(
+        pool,
+        "chunks",
+        &[
+            "id",
+            "sequence",
+            "source_text",
+            "translated_text",
+            "status",
+            "retry_count",
+            "error_message",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "thinking_tokens",
+            "total_tokens",
+            "updated_at",
+        ],
+    )
+    .await?;
+
+    let metadata_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata")
+        .fetch_one(pool)
+        .await
+        .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+    if metadata_count != 1 {
+        return Err(INP_FILE_DAMAGED.into());
+    }
+
+    let row = sqlx::query("SELECT * FROM metadata LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+    let schema_version: i64 = row.get("schema_version");
+    if schema_version != INP_SCHEMA_VERSION {
+        return Err(INP_FILE_DAMAGED.into());
+    }
+    TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
+        .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+    parse_tags_json(row.get("tags_json")).map_err(|_| INP_FILE_DAMAGED.to_string())?;
+
+    let chunk_rows = sqlx::query("SELECT sequence, status FROM chunks")
+        .fetch_all(pool)
+        .await
+        .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+    let mut seen_sequences = std::collections::HashSet::new();
+    for row in chunk_rows {
+        let sequence: i64 = row.get("sequence");
+        if sequence < 0 || !seen_sequences.insert(sequence) {
+            return Err(INP_FILE_DAMAGED.into());
+        }
+        TranslationChunkStatus::parse(row.get::<String, _>("status").as_str())
+            .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+    }
+    Ok(())
+}
+
+async fn require_columns(
+    pool: &SqlitePool,
+    table: &str,
+    required_columns: &[&str],
+) -> Result<(), String> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+    if rows.is_empty() {
+        return Err(INP_FILE_DAMAGED.into());
+    }
+    let columns = rows
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<std::collections::HashSet<_>>();
+    if required_columns
+        .iter()
+        .any(|column| !columns.contains(*column))
+    {
+        return Err(INP_FILE_DAMAGED.into());
+    }
+    Ok(())
 }
 
 async fn recover_running_tasks(config_pool: &SqlitePool) -> Result<(), String> {
@@ -969,6 +1202,34 @@ pub async fn create_translation_task(
     Ok(view)
 }
 
+pub async fn import_translation_task(
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    input: ImportTranslationTaskInput,
+) -> Result<TranslationTaskView, String> {
+    let source_path = PathBuf::from(input.file_path.trim());
+    let source_task = validate_inp_file(&source_path).await?;
+    if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_index WHERE id = ?")
+        .bind(&source_task.id)
+        .fetch_one(config_pool)
+        .await
+        .map_err(|error| error.to_string())?
+        > 0
+    {
+        return Err("任务已存在".into());
+    }
+
+    let destination = next_inp_path(workspace_root, &source_task.name).await?;
+    tokio::fs::copy(&source_path, &destination)
+        .await
+        .map_err(|error| format!("Unable to import task file: {error}"))?;
+    let inp_pool = connect_inp(&destination).await?;
+    let task = metadata_task(&inp_pool, &destination).await?;
+    upsert_task_index(config_pool, &task).await?;
+    inp_pool.close().await;
+    Ok(task)
+}
+
 pub async fn list_translation_tasks(
     config_pool: &SqlitePool,
     filters: Option<TranslationTaskFilters>,
@@ -997,6 +1258,32 @@ pub async fn list_translation_tasks(
     Ok(tasks)
 }
 
+pub async fn update_translation_task_name(
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    input: UpdateTranslationTaskNameInput,
+) -> Result<TranslationTaskView, String> {
+    let name = validate_task_name(&input.name)?;
+    let indexed = get_task_from_index(config_pool, &input.id).await?;
+    let inp_path = PathBuf::from(&indexed.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
+    let now = unix_timestamp();
+    let inp_pool = connect_inp(&inp_path).await?;
+    sqlx::query("UPDATE metadata SET name = ?, updated_at = ? WHERE task_id = ?")
+        .bind(name)
+        .bind(&now)
+        .bind(&input.id)
+        .execute(&inp_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let task = metadata_task(&inp_pool, &inp_path).await?;
+    upsert_task_index(config_pool, &task).await?;
+    inp_pool.close().await;
+    Ok(task)
+}
+
 pub async fn update_translation_task_tags(
     config_pool: &SqlitePool,
     workspace_root: &Path,
@@ -1023,6 +1310,69 @@ pub async fn update_translation_task_tags(
     upsert_task_index(config_pool, &task).await?;
     inp_pool.close().await;
     Ok(task)
+}
+
+pub async fn open_translation_task_folder(pool: &SqlitePool, id: &str) -> Result<(), String> {
+    let task = get_task_from_index(pool, id).await?;
+    open_folder_selecting_file(Path::new(&task.inp_path))
+}
+
+pub async fn export_translation_task(
+    app: AppHandle,
+    config_pool: &SqlitePool,
+    input: ExportTranslationTaskInput,
+) -> Result<(), String> {
+    match input.format {
+        TranslationTaskExportFormat::Pdf | TranslationTaskExportFormat::PdfBilingual => {
+            return Err("PDF export is not implemented yet".into());
+        }
+        TranslationTaskExportFormat::Source => {}
+    }
+
+    let task = get_task_from_index(config_pool, &input.id).await?;
+    let extension = source_extension(&task.source_path)?;
+    let default_name = export_file_name(&input.output_name, &task.name, extension);
+    let filter_name = extension.to_ascii_uppercase();
+    let filter_extensions = [extension];
+    let save_path = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(&default_name)
+            .add_filter(&filter_name, &filter_extensions)
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "Export cancelled".to_string())?;
+    let save_path: PathBuf = save_path
+        .try_into()
+        .map_err(|error| format!("Unable to resolve export path: {error}"))?;
+    let inp_pool = connect_inp(Path::new(&task.inp_path)).await?;
+    let output = translated_source_text(&inp_pool).await?;
+    inp_pool.close().await;
+    tokio::fs::write(&save_path, output)
+        .await
+        .map_err(|error| format!("Unable to export task: {error}"))?;
+    open_folder_selecting_file(&save_path)?;
+    Ok(())
+}
+
+async fn translated_source_text(inp_pool: &SqlitePool) -> Result<String, String> {
+    let rows = sqlx::query("SELECT source_text, translated_text FROM chunks ORDER BY sequence")
+        .fetch_all(inp_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let translated: String = row.get("translated_text");
+            if translated.is_empty() {
+                row.get::<String, _>("source_text")
+            } else {
+                translated
+            }
+        })
+        .collect::<String>())
 }
 
 pub async fn get_translation_task_detail(
@@ -1063,6 +1413,23 @@ pub async fn delete_translation_task(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+pub async fn delete_translation_tasks(
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    ids: &[String],
+) -> Result<(), String> {
+    for id in ids {
+        let task = get_task_from_index(config_pool, id).await?;
+        if task.status == TranslationTaskStatus::Running {
+            return Err("请先暂停正在运行的任务".into());
+        }
+    }
+    for id in ids {
+        delete_translation_task(config_pool, workspace_root, id).await?;
+    }
+    Ok(())
 }
 
 pub async fn prepare_translation_run(
@@ -1149,6 +1516,7 @@ pub async fn run_translation_task(
     config_pool: SqlitePool,
     client: Client,
     prepared: PreparedRun,
+    interrupt: TranslationInterrupt,
 ) -> Result<(), String> {
     let inp_pool = connect_inp(&prepared.inp_path).await?;
     let task = metadata_task(&inp_pool, &prepared.inp_path).await?;
@@ -1172,7 +1540,6 @@ pub async fn run_translation_task(
     let config = db::runtime_config(&provider_pool, &task.provider_id).await?;
     let adapter = Arc::new(RuntimeAdapter::new(client, config));
     let assistant_prompt = task_assistant_prompt(&inp_pool).await?;
-    let interrupted = Arc::new(AtomicBool::new(false));
     let dynamic_rate_limit = prepared.config.rate_limit_strategy == RateLimitStrategy::Dynamic;
     let limiter = Arc::new(AdaptiveLimiter::new(
         prepared.config.max_concurrency as usize,
@@ -1192,7 +1559,7 @@ pub async fn run_translation_task(
     let writer_config_pool = config_pool.clone();
     let writer_path = prepared.inp_path.clone();
     let writer_app = app.clone();
-    let writer_interrupted = interrupted.clone();
+    let writer_interrupted = interrupt.clone();
     let writer = tokio::spawn(async move {
         writer_loop(
             writer_app,
@@ -1214,7 +1581,7 @@ pub async fn run_translation_task(
         .for_each_concurrent(max_concurrency, |chunk| {
             let adapter = adapter.clone();
             let tx = tx.clone();
-            let interrupted = interrupted.clone();
+            let interrupted = interrupt.clone();
             let limiter = limiter.clone();
             let quota = quota.clone();
             let manual_limiter = manual_limiter.clone();
@@ -1222,13 +1589,13 @@ pub async fn run_translation_task(
             let target_language = target_language.clone();
             let assistant_prompt = assistant_prompt.clone();
             async move {
-                if interrupted.load(Ordering::SeqCst) {
+                if interrupted.is_interrupted() {
                     return;
                 }
-                let Some(_permit) = limiter.acquire(&interrupted).await else {
+                let Some(_permit) = limiter.acquire(&interrupted.flag).await else {
                     return;
                 };
-                if interrupted.load(Ordering::SeqCst) {
+                if interrupted.is_interrupted() {
                     return;
                 }
                 let outcome = translate_chunk(
@@ -1246,7 +1613,7 @@ pub async fn run_translation_task(
                 )
                 .await;
                 if outcome.interrupt_task {
-                    interrupted.store(true, Ordering::SeqCst);
+                    interrupted.interrupt("Rate limit reached; task interrupted");
                     limiter.notify_waiters();
                 }
                 let _ = tx.send(outcome).await;
@@ -1265,7 +1632,7 @@ async fn writer_loop(
     config_pool: SqlitePool,
     inp_path: PathBuf,
     mut rx: mpsc::Receiver<ChunkOutcome>,
-    interrupted: Arc<AtomicBool>,
+    interrupted: TranslationInterrupt,
 ) -> Result<(), String> {
     while let Some(outcome) = rx.recv().await {
         apply_chunk_outcome(&inp_pool, outcome).await?;
@@ -1276,10 +1643,14 @@ async fn writer_loop(
         );
     }
     let stats = aggregate_chunk_stats(&inp_pool).await?;
-    let (status, last_error) = if interrupted.load(Ordering::SeqCst) {
+    let (status, last_error) = if interrupted.is_interrupted() {
         (
             TranslationTaskStatus::Interrupted,
-            Some("Rate limit reached; task interrupted".to_string()),
+            Some(
+                interrupted
+                    .reason()
+                    .unwrap_or_else(|| "Task interrupted".to_string()),
+            ),
         )
     } else if stats.error_rate >= ERROR_RATE_FAILURE_THRESHOLD {
         (
@@ -2025,6 +2396,20 @@ fn parse_tags_json(tags_json: String) -> Result<Vec<String>, String> {
     normalize_tags(tags)
 }
 
+fn validate_task_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err("任务名称不能为空".into());
+    }
+    if name.len() > MAX_TASK_NAME_LENGTH {
+        return Err("任务名称过长".into());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("任务名称不能包含控制字符".into());
+    }
+    Ok(name.to_string())
+}
+
 fn validate_supported_source_file(path: &Path) -> Result<(), String> {
     let extension = path
         .extension()
@@ -2035,6 +2420,29 @@ fn validate_supported_source_file(path: &Path) -> Result<(), String> {
         "txt" | "md" => Ok(()),
         _ => Err("V1 translation tasks support .txt and .md files only".into()),
     }
+}
+
+fn source_extension(path: &str) -> Result<&'static str, String> {
+    match Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" => Ok("md"),
+        "txt" => Ok("txt"),
+        _ => Err("Unsupported source document format".into()),
+    }
+}
+
+fn export_file_name(output_name: &str, fallback_name: &str, extension: &str) -> String {
+    let name = output_name
+        .trim()
+        .strip_suffix(&format!(".{extension}"))
+        .unwrap_or(output_name.trim());
+    let base = sanitize_file_stem(if name.is_empty() { fallback_name } else { name });
+    format!("{base}.{extension}")
 }
 
 fn formats_from_path(path: &Path) -> Result<(DocumentFormat, ContentFormat), String> {
@@ -2239,6 +2647,35 @@ fn rate_limit_status(telemetry: &RateLimitTelemetry, window: usize) -> Option<St
         ))
     } else {
         Some(format!("aimd: window {window}"))
+    }
+}
+
+fn open_folder_selecting_file(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(format!("/select,{}", path.to_string_lossy()))
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let folder = path.parent().unwrap_or(path);
+        Command::new("xdg-open")
+            .arg(folder)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
     }
 }
 
@@ -2481,6 +2918,76 @@ pub async fn mark_task_failed_after_runtime_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "insitu-test-{label}-{}",
+            db::new_id("workspace")
+        ))
+    }
+
+    async fn write_test_inp(path: &Path, task_id: &str, name: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+
+        let pool = connect_inp(path).await?;
+        let now = unix_timestamp();
+        let tags_json = serialize_tags(&["review".to_string(), "client".to_string()])?;
+        let source_path = path.with_extension("txt").to_string_lossy().to_string();
+        sqlx::query(
+            "INSERT INTO metadata (
+                task_id, schema_version, name, source_path, source_language, target_language,
+                status, provider_id, model_id, model_request_name, tags_json, token_limit,
+                max_concurrency, max_retries, total_chunks, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(task_id)
+        .bind(INP_SCHEMA_VERSION)
+        .bind(name)
+        .bind(source_path)
+        .bind("en")
+        .bind("zh-Hans")
+        .bind(TranslationTaskStatus::Pending.as_str())
+        .bind("provider-test")
+        .bind("model-test")
+        .bind("test-model")
+        .bind(tags_json)
+        .bind(400)
+        .bind(2)
+        .bind(1)
+        .bind(2)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .map_err(|error| error.to_string())?;
+
+        for (sequence, (source_text, translated_text)) in
+            [("Hello ", "你好"), ("world", "")].into_iter().enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO chunks (
+                    id, sequence, source_text, translated_text, status, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(format!("{task_id}-chunk-{sequence}"))
+            .bind(sequence as i64)
+            .bind(source_text)
+            .bind(translated_text)
+            .bind(TranslationChunkStatus::Pending.as_str())
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+
+        pool.close().await;
+        Ok(())
+    }
 
     #[test]
     fn sanitizes_inp_file_stems() {
@@ -2539,6 +3046,143 @@ mod tests {
         assert_eq!(filters.tag.as_deref(), Some("client"));
         assert_eq!(filters.source_language.as_deref(), Some("auto"));
         assert_eq!(filters.target_language.as_deref(), Some("pl"));
+    }
+
+    #[tokio::test]
+    async fn validates_inp_files_and_rejects_damaged_shapes() {
+        let root = temp_root("inp-validation");
+        let valid_path = root.join("valid.inp");
+        write_test_inp(&valid_path, "task-valid", "Valid Task")
+            .await
+            .expect("write valid inp");
+
+        let task = validate_inp_file(&valid_path)
+            .await
+            .expect("valid inp is accepted");
+        assert_eq!(task.id, "task-valid");
+        assert_eq!(task.name, "Valid Task");
+        assert_eq!(task.tags, vec!["review".to_string(), "client".to_string()]);
+
+        let missing_chunks_path = root.join("missing-chunks.inp");
+        write_test_inp(&missing_chunks_path, "task-missing-chunks", "Missing Chunks")
+            .await
+            .expect("write inp before damage");
+        let pool = connect_sqlite(&missing_chunks_path, 1)
+            .await
+            .expect("open damaged inp");
+        sqlx::query("DROP TABLE chunks")
+            .execute(&pool)
+            .await
+            .expect("drop chunks");
+        pool.close().await;
+        assert_eq!(
+            validate_inp_file(&missing_chunks_path).await.unwrap_err(),
+            INP_FILE_DAMAGED
+        );
+
+        let missing_field_path = root.join("missing-field.inp");
+        let pool = connect_sqlite(&missing_field_path, 1)
+            .await
+            .expect("open incomplete inp");
+        sqlx::query("CREATE TABLE metadata (task_id TEXT PRIMARY KEY NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create incomplete metadata");
+        pool.close().await;
+        assert_eq!(
+            validate_inp_file(&missing_field_path).await.unwrap_err(),
+            INP_FILE_DAMAGED
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn imports_rejects_duplicates_and_renames_metadata_and_index() {
+        let root = temp_root("inp-import");
+        let external_root = temp_root("inp-external");
+        let external_path = external_root.join("incoming.inp");
+        write_test_inp(&external_path, "task-import", "Incoming Task")
+            .await
+            .expect("write external inp");
+
+        let pool = connect_config_db(&root).await.expect("connect config");
+        let imported = import_translation_task(
+            &pool,
+            &root,
+            ImportTranslationTaskInput {
+                file_path: external_path.to_string_lossy().to_string(),
+            },
+        )
+        .await
+        .expect("import task");
+        assert_eq!(imported.id, "task-import");
+        assert_eq!(imported.name, "Incoming Task");
+        assert!(PathBuf::from(&imported.inp_path).starts_with(root.join(TASKS_DIR)));
+        assert_ne!(PathBuf::from(&imported.inp_path), external_path);
+
+        let duplicate = import_translation_task(
+            &pool,
+            &root,
+            ImportTranslationTaskInput {
+                file_path: external_path.to_string_lossy().to_string(),
+            },
+        )
+        .await
+        .expect_err("duplicate task id is rejected");
+        assert_eq!(duplicate, "任务已存在");
+
+        let renamed = update_translation_task_name(
+            &pool,
+            &root,
+            UpdateTranslationTaskNameInput {
+                id: imported.id.clone(),
+                name: "Renamed Task".into(),
+            },
+        )
+        .await
+        .expect("rename task");
+        assert_eq!(renamed.name, "Renamed Task");
+
+        let indexed = get_task_from_index(&pool, &imported.id)
+            .await
+            .expect("read index");
+        assert_eq!(indexed.name, "Renamed Task");
+        let inp_pool = connect_inp(Path::new(&renamed.inp_path))
+            .await
+            .expect("open renamed inp");
+        let metadata_name: String = sqlx::query_scalar("SELECT name FROM metadata LIMIT 1")
+            .fetch_one(&inp_pool)
+            .await
+            .expect("read metadata name");
+        assert_eq!(metadata_name, "Renamed Task");
+        inp_pool.close().await;
+        pool.close().await;
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(external_root);
+    }
+
+    #[tokio::test]
+    async fn translated_source_text_uses_translations_and_falls_back_to_source() {
+        let root = temp_root("source-export");
+        let inp_path = root.join("source.inp");
+        write_test_inp(&inp_path, "task-export", "Source Export")
+            .await
+            .expect("write inp");
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        assert_eq!(
+            translated_source_text(&pool).await.expect("render source"),
+            "你好world"
+        );
+        assert_eq!(source_extension("chapter.md").expect("md"), "md");
+        assert_eq!(
+            export_file_name(" custom.txt ", "fallback", "txt"),
+            "custom.txt"
+        );
+        assert_eq!(export_file_name("", "fallback", "txt"), "fallback.txt");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

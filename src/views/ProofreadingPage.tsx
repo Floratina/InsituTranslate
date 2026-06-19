@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FilePenLine, RefreshCw } from "lucide-react";
+import { FilePenLine, RefreshCw, Upload } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -19,7 +19,9 @@ import {
 import { useToast } from "@/components/ui/toast-stack";
 import {
   getTranslationTaskDetail,
+  importTranslationTask,
   listTranslationTasks,
+  pickTranslationTaskFile,
 } from "@/features/translation/api";
 import { statusLabel } from "@/features/translation/format";
 import type {
@@ -30,6 +32,11 @@ import { appSessionCache } from "@/lib/session-cache";
 
 function getErrorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function formatImportError(cause: unknown): string {
+  const message = getErrorMessage(cause);
+  return message === "INP_FILE_DAMAGED" ? "文件已损坏" : message;
 }
 
 export default function ProofreadingPage() {
@@ -47,9 +54,10 @@ export default function ProofreadingPage() {
   const [detail, setDetail] = useState<TranslationTaskDetail | null>(cachedDetail ?? null);
   const [tasksLoading, setTasksLoading] = useState(!cachedTasks);
   const [detailLoading, setDetailLoading] = useState(Boolean(initialSelectedTaskId && !cachedDetail));
+  const [uploading, setUploading] = useState(false);
   const skipInitialTasksRefresh = useRef(Boolean(cachedTasks));
   const { pushToast } = useToast();
-  const loading = tasksLoading || detailLoading;
+  const loading = tasksLoading || detailLoading || uploading;
 
   const selectedTask = useMemo(
     () => tasks.find((task) => task.id === selectedTaskId) ?? null,
@@ -131,6 +139,27 @@ export default function ProofreadingPage() {
     }
   }
 
+  async function uploadTaskFile(): Promise<void> {
+    setUploading(true);
+    try {
+      const filePath = await pickTranslationTaskFile();
+      if (!filePath) return;
+
+      const importedTask = await importTranslationTask({ filePath });
+      appSessionCache.invalidateProofreading();
+      await refreshTasks(true);
+      appSessionCache.proofreadingSelectedTaskId = importedTask.id;
+      setSelectedTaskId(importedTask.id);
+      setDetail(null);
+      void refreshDetail(importedTask.id, true);
+      pushToast("任务已导入", "success");
+    } catch (error) {
+      pushToast(formatImportError(error), "error");
+    } finally {
+      setUploading(false);
+    }
+  }
+
   const sourceText = detail?.chunks.map((chunk) => chunk.sourceText).join("") ?? "";
   const translatedText = detail?.chunks.map((chunk) => chunk.translatedText).join("") ?? "";
 
@@ -146,10 +175,16 @@ export default function ProofreadingPage() {
             V1 先按 chunks 顺序显示纯文本，后续再接编辑器和格式化预览。
           </p>
         </div>
-        <Button variant="outline" size="sm" disabled={loading} onClick={() => void refreshDetail(selectedTaskId, true)}>
-          <RefreshCw className="size-4" />
-          刷新
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="outline" size="sm" disabled={loading} onClick={() => void uploadTaskFile()}>
+            <Upload className="size-4" />
+            上传 INP 任务
+          </Button>
+          <Button variant="outline" size="sm" disabled={loading} onClick={() => void refreshDetail(selectedTaskId, true)}>
+            <RefreshCw className="size-4" />
+            刷新
+          </Button>
+        </div>
       </header>
 
       <div className="mb-3 grid max-w-xl gap-2">

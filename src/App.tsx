@@ -4,6 +4,7 @@ import { motion, MotionConfig } from "motion/react";
 import { AppShell, type AppPage } from "@/components/layout/AppShell";
 import { ToastProvider } from "@/components/ui/toast-stack";
 import { AppearanceProvider } from "@/features/appearance/AppearanceProvider";
+import { appSessionCache } from "@/lib/session-cache";
 import ProviderSettingsPage from "@/views/ProviderSettingsPage";
 import AppearanceSettingsPage from "@/views/AppearanceSettingsPage";
 import AssistantSettingsPage, {
@@ -43,7 +44,12 @@ function App() {
     activePage === "start" ? (
       <StartPage onTaskCreated={() => navigate("tasks")} />
     ) : activePage === "tasks" ? (
-      <TranslationTasksPage />
+      <TranslationTasksPage
+        onOpenProofreading={(taskId) => {
+          appSessionCache.proofreadingSelectedTaskId = taskId;
+          navigate("proofreading");
+        }}
+      />
     ) : activePage === "proofreading" ? (
       <ProofreadingPage />
     ) : activePage === "glossary" ? (

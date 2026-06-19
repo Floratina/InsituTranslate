@@ -20,6 +20,7 @@ import {
   FileSpreadsheet,
   FolderOpen,
   Loader2,
+  MoreHorizontal,
   Pencil,
   Plus,
   Search,
@@ -40,6 +41,16 @@ import {
   ContextMenuSubTriggerItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTriggerItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -114,6 +125,7 @@ const DETAIL_MIN_WIDTHS = [128, 128];
 const DETAIL_INITIAL_WIDTHS = [430, 430];
 const DETAIL_MAX_WIDTHS = [760, 760];
 const DETAIL_FLEX_COLUMNS = [0, 1];
+const ACTION_COLUMN_WIDTH = 64;
 
 interface ListSortState {
   field: GlossarySortField;
@@ -257,11 +269,13 @@ function useAdaptiveColumnWidths<T extends HTMLElement>(
   widths: number[],
   minWidths: number[],
   flexColumns: number[],
+  reservedWidth = 0,
 ) {
   const [ref, containerWidth] = useElementWidth<T>();
+  const availableWidth = Math.max(0, containerWidth - reservedWidth);
   const adaptiveWidths = useMemo(
-    () => fitColumnWidths(widths, minWidths, containerWidth, flexColumns),
-    [containerWidth, flexColumns, minWidths, widths],
+    () => fitColumnWidths(widths, minWidths, availableWidth, flexColumns),
+    [availableWidth, flexColumns, minWidths, widths],
   );
   return [ref, adaptiveWidths, containerWidth] as const;
 }
@@ -1126,8 +1140,9 @@ function GlossaryListTable({
     widths,
     LIST_MIN_WIDTHS,
     LIST_FLEX_COLUMNS,
+    ACTION_COLUMN_WIDTH,
   );
-  const tableWidth = sum(adaptiveWidths);
+  const tableWidth = sum(adaptiveWidths) + ACTION_COLUMN_WIDTH;
   const tableNeedsHorizontalScroll = tableWidth > tableViewportWidth + 1;
   const bodyKey = listLoading
     ? "loading"
@@ -1155,17 +1170,22 @@ function GlossaryListTable({
           ref={tableViewportRef}
           className={cn(
             "h-full overflow-y-auto pb-20",
+            "scrollbar-subtle overscroll-contain",
             tableNeedsHorizontalScroll ? "overflow-x-auto" : "overflow-x-hidden",
           )}
         >
           <table
             className="table-fixed text-left text-sm"
-            style={{ minWidth: `${sum(LIST_MIN_WIDTHS)}px`, width: `${tableWidth}px` }}
+            style={{
+              minWidth: `${sum(LIST_MIN_WIDTHS) + ACTION_COLUMN_WIDTH}px`,
+              width: `${tableWidth}px`,
+            }}
           >
             <colgroup>
               {adaptiveWidths.map((width, index) => (
                 <col key={index} style={{ width }} />
               ))}
+              <col style={{ width: ACTION_COLUMN_WIDTH }} />
             </colgroup>
             <thead className="sticky top-0 z-10 bg-card">
               <tr>
@@ -1205,11 +1225,11 @@ function GlossaryListTable({
                   loadingField={listSortLoading}
                   columnIndex={3}
                   canResize
-                  isLastColumn
                   onSort={onSort}
                   onResize={onResize}
                   onAutoFit={onAutoFit}
                 />
+                <ActionHeader />
               </tr>
             </thead>
             <motion.tbody
@@ -1219,13 +1239,13 @@ function GlossaryListTable({
               transition={TABLE_REFRESH_TRANSITION}
             >
               {listLoading ? (
-                <TableSkeletonRows columns={4} />
+                <TableSkeletonRows columns={5} />
               ) : listLoading ? (
-                <TableMessage colSpan={4} icon={<Loader2 className="size-4 animate-spin" />}>
+                <TableMessage colSpan={5} icon={<Loader2 className="size-4 animate-spin" />}>
                   正在读取术语表索引
                 </TableMessage>
               ) : glossaries.length === 0 ? (
-                <TableMessage colSpan={4}>暂无术语表</TableMessage>
+                <TableMessage colSpan={5}>暂无术语表</TableMessage>
               ) : (
                 glossaries.map((glossary) => (
                   <ContextMenu key={glossary.id}>
@@ -1248,47 +1268,26 @@ function GlossaryListTable({
                         <td className="h-10 min-w-0 truncate px-3 py-2 text-sm">
                           {displayLanguagePair(glossary.sourceLanguage, glossary.targetLanguage)}
                         </td>
+                        <td className="h-10 px-2 py-1.5 text-center">
+                          <GlossaryListActionDropdown
+                            glossary={glossary}
+                            onOpen={onOpen}
+                            onEditInfo={onEditInfo}
+                            onOpenFolder={onOpenFolder}
+                            onExport={onExport}
+                            onDelete={onDelete}
+                          />
+                        </td>
                       </motion.tr>
                     </ContextMenuTrigger>
-                    <ContextMenuContent className="w-56">
-                      <ContextMenuItem onSelect={() => onOpen(glossary)}>
-                        <BookOpen className="size-3.5" />
-                        打开术语表
-                      </ContextMenuItem>
-                      <ContextMenuItem onSelect={() => onEditInfo(glossary)}>
-                        <Pencil className="size-3.5" />
-                        编辑术语表信息
-                      </ContextMenuItem>
-                      <ContextMenuSeparator />
-                      <ContextMenuItem onSelect={() => onOpenFolder(glossary)}>
-                        <FolderOpen className="size-3.5" />
-                        打开文件夹
-                      </ContextMenuItem>
-                      <ContextMenuSub>
-                        <ContextMenuSubTriggerItem>
-                          <Download className="size-3.5" />
-                          导出术语表
-                        </ContextMenuSubTriggerItem>
-                        <ContextMenuSubContent className="w-40">
-                          <ContextMenuItem onSelect={() => onExport(glossary, "csv")}>
-                            <FileSpreadsheet className="size-3.5" />
-                            导出 CSV
-                          </ContextMenuItem>
-                          <ContextMenuItem onSelect={() => onExport(glossary, "json")}>
-                            <FileJson className="size-3.5" />
-                            导出 JSON
-                          </ContextMenuItem>
-                        </ContextMenuSubContent>
-                      </ContextMenuSub>
-                      <ContextMenuSeparator />
-                      <ContextMenuItem
-                        className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-                        onSelect={() => onDelete(glossary)}
-                      >
-                        <Trash2 className="size-3.5" />
-                        删除术语表
-                      </ContextMenuItem>
-                    </ContextMenuContent>
+                    <GlossaryListContextMenuContent
+                      glossary={glossary}
+                      onOpen={onOpen}
+                      onEditInfo={onEditInfo}
+                      onOpenFolder={onOpenFolder}
+                      onExport={onExport}
+                      onDelete={onDelete}
+                    />
                   </ContextMenu>
                 ))
               )}
@@ -1304,6 +1303,133 @@ function GlossaryListTable({
           onPageSizeChange={onPageSizeChange}
         />
       </motion.section>
+  );
+}
+
+interface GlossaryListActionMenuProps {
+  glossary: GlossaryView;
+  onOpen: (glossary: GlossaryView) => void;
+  onEditInfo: (glossary: GlossaryView) => void;
+  onOpenFolder: (glossary: GlossaryView) => void;
+  onExport: (glossary: GlossaryView, format: GlossaryExportFormat) => void;
+  onDelete: (glossary: GlossaryView) => void;
+}
+
+function GlossaryListContextMenuContent({
+  glossary,
+  onOpen,
+  onEditInfo,
+  onOpenFolder,
+  onExport,
+  onDelete,
+}: GlossaryListActionMenuProps) {
+  return (
+    <ContextMenuContent className="w-56">
+      <ContextMenuItem onSelect={() => onOpen(glossary)}>
+        <BookOpen className="size-3.5" />
+        打开术语表
+      </ContextMenuItem>
+      <ContextMenuItem onSelect={() => onEditInfo(glossary)}>
+        <Pencil className="size-3.5" />
+        编辑术语表信息
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem onSelect={() => onOpenFolder(glossary)}>
+        <FolderOpen className="size-3.5" />
+        打开文件夹
+      </ContextMenuItem>
+      <ContextMenuSub>
+        <ContextMenuSubTriggerItem>
+          <Download className="size-3.5" />
+          导出术语表
+        </ContextMenuSubTriggerItem>
+        <ContextMenuSubContent className="w-40">
+          <ContextMenuItem onSelect={() => onExport(glossary, "csv")}>
+            <FileSpreadsheet className="size-3.5" />
+            导出 CSV
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => onExport(glossary, "json")}>
+            <FileJson className="size-3.5" />
+            导出 JSON
+          </ContextMenuItem>
+        </ContextMenuSubContent>
+      </ContextMenuSub>
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+        onSelect={() => onDelete(glossary)}
+      >
+        <Trash2 className="size-3.5" />
+        删除术语表
+      </ContextMenuItem>
+    </ContextMenuContent>
+  );
+}
+
+function GlossaryListActionDropdown({
+  glossary,
+  onOpen,
+  onEditInfo,
+  onOpenFolder,
+  onExport,
+  onDelete,
+}: GlossaryListActionMenuProps) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          className="mx-auto size-7 border-0 bg-transparent text-muted-foreground shadow-none hover:bg-muted/60 hover:text-foreground active:bg-muted/80 focus-visible:border-transparent focus-visible:ring-0 aria-expanded:bg-muted/60 aria-expanded:text-foreground"
+          aria-label={`${glossary.name} 操作`}
+          title="操作"
+          onClick={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+        >
+          <MoreHorizontal className="size-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-56">
+        <DropdownMenuItem onSelect={() => onOpen(glossary)}>
+          <BookOpen className="size-3.5" />
+          打开术语表
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onEditInfo(glossary)}>
+          <Pencil className="size-3.5" />
+          编辑术语表信息
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => onOpenFolder(glossary)}>
+          <FolderOpen className="size-3.5" />
+          打开文件夹
+        </DropdownMenuItem>
+        <DropdownMenuSub>
+          <DropdownMenuSubTriggerItem>
+            <Download className="size-3.5" />
+            导出术语表
+          </DropdownMenuSubTriggerItem>
+          <DropdownMenuSubContent className="w-40">
+            <DropdownMenuItem onSelect={() => onExport(glossary, "csv")}>
+              <FileSpreadsheet className="size-3.5" />
+              导出 CSV
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onExport(glossary, "json")}>
+              <FileJson className="size-3.5" />
+              导出 JSON
+            </DropdownMenuItem>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+          onSelect={() => onDelete(glossary)}
+        >
+          <Trash2 className="size-3.5" />
+          删除术语表
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -1357,8 +1483,9 @@ function GlossaryDetailView({
     widths,
     DETAIL_MIN_WIDTHS,
     DETAIL_FLEX_COLUMNS,
+    ACTION_COLUMN_WIDTH,
   );
-  const tableWidth = sum(adaptiveWidths);
+  const tableWidth = sum(adaptiveWidths) + ACTION_COLUMN_WIDTH;
   const tableNeedsHorizontalScroll = tableWidth > tableViewportWidth + 1;
   const bodyKey = entryLoading
     ? "loading"
@@ -1417,17 +1544,22 @@ function GlossaryDetailView({
           ref={tableViewportRef}
           className={cn(
             "h-full overflow-y-auto pb-20",
+            "scrollbar-subtle overscroll-contain",
             tableNeedsHorizontalScroll ? "overflow-x-auto" : "overflow-x-hidden",
           )}
         >
           <table
             className="table-fixed text-left text-sm"
-            style={{ minWidth: `${sum(DETAIL_MIN_WIDTHS)}px`, width: `${tableWidth}px` }}
+            style={{
+              minWidth: `${sum(DETAIL_MIN_WIDTHS) + ACTION_COLUMN_WIDTH}px`,
+              width: `${tableWidth}px`,
+            }}
           >
             <colgroup>
               {adaptiveWidths.map((width, index) => (
                 <col key={index} style={{ width }} />
               ))}
+              <col style={{ width: ACTION_COLUMN_WIDTH }} />
             </colgroup>
             <thead className="sticky top-0 z-10 bg-card">
               <tr>
@@ -1449,11 +1581,11 @@ function GlossaryDetailView({
                   loadingField={entrySortLoading}
                   columnIndex={1}
                   canResize
-                  isLastColumn
                   onSort={onSort}
                   onResize={onResize}
                   onAutoFit={onAutoFit}
                 />
+                <ActionHeader />
               </tr>
             </thead>
             <motion.tbody
@@ -1463,11 +1595,11 @@ function GlossaryDetailView({
               transition={TABLE_REFRESH_TRANSITION}
             >
               {entryLoading ? (
-                <TableMessage colSpan={2} icon={<Loader2 className="size-4 animate-spin" />}>
+                <TableMessage colSpan={3} icon={<Loader2 className="size-4 animate-spin" />}>
                   正在加载术语条目
                 </TableMessage>
               ) : entryPage.entries.length === 0 ? (
-                <TableMessage colSpan={2}>暂无术语条目</TableMessage>
+                <TableMessage colSpan={3}>暂无术语条目</TableMessage>
               ) : (
                 entryPage.entries.map((entry) => (
                   <ContextMenu key={entry.id}>
@@ -1481,22 +1613,20 @@ function GlossaryDetailView({
                         <td className="h-9 min-w-0 truncate px-3 py-2" title={entry.dst}>
                           {entry.dst}
                         </td>
+                        <td className="h-9 px-2 py-1 text-center">
+                          <GlossaryEntryActionDropdown
+                            entry={entry}
+                            onEdit={onEdit}
+                            onDelete={onDelete}
+                          />
+                        </td>
                       </motion.tr>
                     </ContextMenuTrigger>
-                    <ContextMenuContent className="w-40">
-                      <ContextMenuItem onSelect={() => onEdit(entry)}>
-                        <Edit3 className="size-3.5" />
-                        编辑条目
-                      </ContextMenuItem>
-                      <ContextMenuSeparator />
-                      <ContextMenuItem
-                        className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-                        onSelect={() => onDelete(entry)}
-                      >
-                        <Trash2 className="size-3.5" />
-                        删除条目
-                      </ContextMenuItem>
-                    </ContextMenuContent>
+                    <GlossaryEntryContextMenuContent
+                      entry={entry}
+                      onEdit={onEdit}
+                      onDelete={onDelete}
+                    />
                   </ContextMenu>
                 ))
               )}
@@ -1513,6 +1643,82 @@ function GlossaryDetailView({
         />
       </motion.section>
     </motion.div>
+  );
+}
+
+interface GlossaryEntryActionMenuProps {
+  entry: GlossaryEntryView;
+  onEdit: (entry: GlossaryEntryView) => void;
+  onDelete: (entry: GlossaryEntryView) => void;
+}
+
+function GlossaryEntryContextMenuContent({
+  entry,
+  onEdit,
+  onDelete,
+}: GlossaryEntryActionMenuProps) {
+  return (
+    <ContextMenuContent className="w-40">
+      <ContextMenuItem onSelect={() => onEdit(entry)}>
+        <Edit3 className="size-3.5" />
+        编辑条目
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+        onSelect={() => onDelete(entry)}
+      >
+        <Trash2 className="size-3.5" />
+        删除条目
+      </ContextMenuItem>
+    </ContextMenuContent>
+  );
+}
+
+function GlossaryEntryActionDropdown({
+  entry,
+  onEdit,
+  onDelete,
+}: GlossaryEntryActionMenuProps) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          className="mx-auto size-7 border-0 bg-transparent text-muted-foreground shadow-none hover:bg-muted/60 hover:text-foreground active:bg-muted/80 focus-visible:border-transparent focus-visible:ring-0 aria-expanded:bg-muted/60 aria-expanded:text-foreground"
+          aria-label={`${entry.src} 操作`}
+          title="操作"
+          onClick={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+        >
+          <MoreHorizontal className="size-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-40">
+        <DropdownMenuItem onSelect={() => onEdit(entry)}>
+          <Edit3 className="size-3.5" />
+          编辑条目
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+          onSelect={() => onDelete(entry)}
+        >
+          <Trash2 className="size-3.5" />
+          删除条目
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function ActionHeader() {
+  return (
+    <th className="h-9 border-b px-2 text-center text-xs font-medium whitespace-nowrap text-muted-foreground">
+      操作
+    </th>
   );
 }
 
@@ -1679,7 +1885,7 @@ function TagList({ tags }: { tags: string[] }) {
         <Badge
           key={tag}
           variant="secondary"
-          className="max-w-24 rounded-[6px] border-transparent bg-accent/45 text-accent-foreground dark:bg-accent/35"
+          className="max-w-24 rounded-full border-transparent bg-accent/45 text-accent-foreground dark:bg-accent/35"
         >
           <span className="truncate">{tag}</span>
         </Badge>
@@ -1687,7 +1893,7 @@ function TagList({ tags }: { tags: string[] }) {
       {tags.length > 3 && (
         <Badge
           variant="secondary"
-          className="rounded-[6px] border-transparent bg-accent/35 text-accent-foreground dark:bg-accent/30"
+          className="rounded-full border-transparent bg-accent/35 text-accent-foreground dark:bg-accent/30"
         >
           +{tags.length - 3}
         </Badge>

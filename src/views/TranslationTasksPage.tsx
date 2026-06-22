@@ -14,7 +14,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Download,
-  Eraser,
   FilePenLine,
   FolderOpen,
   ListChecks,
@@ -397,9 +396,6 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   const [deleteTarget, setDeleteTarget] = useState<TranslationTaskView | null>(null);
   const [clearTargets, setClearTargets] = useState<TranslationTaskView[] | null>(null);
 
-  const activeFilters = search.trim() !== "" ||
-    [tagFilter, sourceLanguageFilter, targetLanguageFilter].some((value) => value !== ALL_FILTER_VALUE);
-
   const filteredTasks = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     return tasks.filter((task) => {
@@ -640,13 +636,6 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     });
   }
 
-  function clearFilters(): void {
-    setSearch("");
-    setTagFilter(ALL_FILTER_VALUE);
-    setSourceLanguageFilter(ALL_FILTER_VALUE);
-    setTargetLanguageFilter(ALL_FILTER_VALUE);
-  }
-
   function updateSort(field: TaskSortField): void {
     setSortLoading(field);
     setSort((current) => ({
@@ -694,7 +683,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         </p>
       </motion.header>
 
-      <div className="mb-3 grid shrink-0 gap-2 lg:grid-cols-[minmax(16rem,1fr)_11rem_11rem_11rem_auto]">
+      <div className="mb-3 grid shrink-0 gap-2 lg:grid-cols-[minmax(16rem,1fr)_11rem_11rem_11rem]">
         <div className="relative">
           <Search className="pointer-events-none absolute top-1/2 left-2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -733,10 +722,6 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
           placeholder="目标语言"
           searchPlaceholder="搜索目标语言"
         />
-        <Button variant="outline" size="sm" onClick={clearFilters} disabled={!activeFilters}>
-          <Eraser className="size-4" />
-          清空
-        </Button>
       </div>
 
       <Tabs value={tab} onValueChange={(value) => setTab(value as TaskTab)} className="mb-2 shrink-0">

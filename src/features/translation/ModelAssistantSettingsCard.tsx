@@ -66,7 +66,7 @@ export function ModelAssistantSettingsCard({
                     <ProviderAvatar
                       name={provider.name}
                       avatar={provider.avatar}
-                      className="size-4 text-[7px]"
+                      size="2xs"
                     />
                     <span>{provider.name}</span>
                   </span>

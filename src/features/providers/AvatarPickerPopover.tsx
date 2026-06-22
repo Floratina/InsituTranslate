@@ -69,7 +69,7 @@ export function AvatarPickerPopover({
           className="rounded-full outline-none focus-visible:ring-3 focus-visible:ring-ring/35"
           title="设置头像"
         >
-          <ProviderAvatar name={name} avatar={avatar} className="size-16 text-xl" />
+          <ProviderAvatar name={name} avatar={avatar} size="xl" />
         </motion.button>
       </PopoverTrigger>
       <PopoverContent className="w-[500px] p-2" align="center">
@@ -134,7 +134,7 @@ export function AvatarPickerPopover({
                         setOpen(false);
                       }}
                     >
-                      <ProviderAvatar name={item.name} avatar={item.src} className="size-7 text-3xs" />
+                      <ProviderAvatar name={item.name} avatar={item.src} size="sm" />
                       <span className="truncate text-xs font-medium">{item.name}</span>
                     </button>
                   ))}

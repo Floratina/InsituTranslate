@@ -41,6 +41,8 @@ interface ProviderDetailsPanelProps {
 
 const panelTransition = { duration: 0.28, ease: [0.03, 0.59, 0.19, 1] as const };
 const BASE_URL_HELP_TEXT = "在末尾添加“#”会以当前输入为完整路径";
+const GEMINI_KEY_TYPE_HELP_TEXT =
+  "Google 正在从标准 API 密钥切换到授权 (auth) 密钥，2026 年 9 月起将拒绝任何标准密钥的请求，InsituTranslate 已经适配。详情参考 Gemini API 文档。";
 
 function protocolLabel(protocol: ProviderProtocol): string {
   const labels: Record<ProviderProtocol, string> = {
@@ -148,6 +150,7 @@ export function ProviderDetailsPanel({
   }
 
   const isMinerU = isMinerUProvider(provider);
+  const isGemini = provider.protocol === "gemini" && !isMinerU;
   const mineruConfig = getMinerUConfig(draft.config);
   const activeMinerUBaseUrl =
     mineruConfig.mode === "flash" ? mineruConfig.flashBaseUrl : draft.baseUrl;
@@ -162,12 +165,15 @@ export function ProviderDetailsPanel({
     >
       <div className="flex shrink-0 items-start justify-between gap-3 border-b p-3">
         <div className="flex min-w-0 items-center gap-3">
-          <ProviderAvatar name={provider.name} avatar={provider.avatar} className="size-9 text-2xs" />
+          <ProviderAvatar name={provider.name} avatar={provider.avatar} size="lg" />
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 className="min-w-0 truncate text-base font-semibold">{provider.name}</h2>
             <Badge variant="outline" className="text-xs">
               {isMinerU ? "MinerU Document Parsing" : protocolLabel(provider.protocol)}
             </Badge>
+            {isGemini && (
+              <HelpTooltip contentClassName="max-w-96">{GEMINI_KEY_TYPE_HELP_TEXT}</HelpTooltip>
+            )}
           </div>
         </div>
         <Switch

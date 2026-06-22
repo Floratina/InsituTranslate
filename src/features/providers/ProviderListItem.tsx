@@ -120,7 +120,7 @@ export function ProviderListItem({
               selected && "bg-accent",
             )}
           >
-            <ProviderAvatar name={provider.name} avatar={provider.avatar} className="size-8 text-3xs" />
+            <ProviderAvatar name={provider.name} avatar={provider.avatar} size="md" />
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-medium">{provider.name}</div>
               <div className="text-2xs text-muted-foreground">{provider.models.length} 个模型</div>

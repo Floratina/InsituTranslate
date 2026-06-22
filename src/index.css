@@ -41,6 +41,7 @@
 
 :root {
   --app-font-family: Inter, "Segoe UI", sans-serif;
+  --avatar-letter-font-family: "Aptos Display", "Segoe UI Variable Display", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", var(--app-font-family);
   --placeholder-mono-family: Consolas, "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Menlo, Monaco, var(--app-font-family), "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", sans-serif;
   --emoji-font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
   font-family: var(--app-font-family);

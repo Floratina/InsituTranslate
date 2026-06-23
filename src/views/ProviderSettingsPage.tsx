@@ -62,6 +62,11 @@ import { getMinerUConfig, isMinerUProvider } from "@/features/providers/mineru";
 import { ProviderDetailsPanel } from "@/features/providers/ProviderDetailsPanel";
 import { ProviderListItem } from "@/features/providers/ProviderListItem";
 import { useProviderEnabledToggle } from "@/features/providers/useProviderEnabledToggle";
+import {
+  getVertexAiConfig,
+  type ImportVertexAiServiceAccountInput,
+  type UpdateVertexAiConfigInput,
+} from "@/features/providers/vertexAi";
 import type {
   ConnectivityResult,
   ModelView,
@@ -125,6 +130,7 @@ function protocolLabel(protocol: ProviderProtocol): string {
     "openai-responses": "OpenAI Responses",
     anthropic: "Anthropic Messages",
     gemini: "Gemini API",
+    "vertex-ai": "Agent Platform (Vertex AI)",
     ollama: "Ollama Chat",
   };
   return labels[protocol];
@@ -297,6 +303,11 @@ function ProviderSettingsPage() {
   const [credentialValue, setCredentialValue] = useState<string>("");
   const [headersOpen, setHeadersOpen] = useState<boolean>(false);
   const [headersJson, setHeadersJson] = useState<string>("");
+  const [serviceAccountOpen, setServiceAccountOpen] = useState<boolean>(false);
+  const [serviceAccountJson, setServiceAccountJson] = useState<string>("");
+  const [privateKeyOpen, setPrivateKeyOpen] = useState<boolean>(false);
+  const [privateKeyValue, setPrivateKeyValue] = useState<string>("");
+  const [privateKeyLoading, setPrivateKeyLoading] = useState<boolean>(false);
   const [remoteModelsOpen, setRemoteModelsOpen] = useState<boolean>(false);
   const [remoteModels, setRemoteModels] = useState<RemoteModel[]>([]);
   const [remoteModelsLoading, setRemoteModelsLoading] =
@@ -490,6 +501,99 @@ function ProviderSettingsPage() {
       setError("");
     } catch (cause) {
       setError(getErrorMessage(cause));
+    }
+  }
+
+  async function updateVertexAiConfig(input: UpdateVertexAiConfigInput): Promise<void> {
+    try {
+      const updated = await invoke<ProviderView>("update_vertex_ai_config", {
+        input,
+      });
+      setProvidersAndCache((items) =>
+        items.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      setError("");
+    } catch (cause) {
+      throw new Error(getErrorMessage(cause));
+    }
+  }
+
+  async function parseServiceAccountJson(clear = false): Promise<void> {
+    if (!selectedProvider) return;
+    setBusy(true);
+    try {
+      const vertexConfig = getVertexAiConfig(selectedProvider.config ?? {});
+      const updated = clear
+        ? await invoke<ProviderView>("update_vertex_ai_config", {
+            input: {
+              providerId: selectedProvider.id,
+              projectId: vertexConfig.projectId,
+              location: vertexConfig.location,
+              clientEmail: vertexConfig.clientEmail,
+              privateKey: "",
+            } satisfies UpdateVertexAiConfigInput,
+          })
+        : await invoke<ProviderView>("import_vertex_ai_service_account", {
+            input: {
+              providerId: selectedProvider.id,
+              serviceAccountJson: serviceAccountJson.trim(),
+              location: vertexConfig.location,
+            } satisfies ImportVertexAiServiceAccountInput,
+          });
+      setProvidersAndCache((items) =>
+        items.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      setServiceAccountJson("");
+      setServiceAccountOpen(false);
+      pushToast(clear ? "服务账号私钥已清空" : "服务账号 JSON 已解析并安全保存", "success");
+    } catch (cause) {
+      pushToast(getErrorMessage(cause), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openPrivateKeyEditor(): Promise<void> {
+    if (!selectedProvider) return;
+    setPrivateKeyOpen(true);
+    setPrivateKeyValue("");
+    setPrivateKeyLoading(true);
+    try {
+      const value = await invoke<string | null>("get_vertex_ai_private_key", {
+        providerId: selectedProvider.id,
+      });
+      setPrivateKeyValue(value ?? "");
+    } catch (cause) {
+      pushToast(getErrorMessage(cause), "error");
+    } finally {
+      setPrivateKeyLoading(false);
+    }
+  }
+
+  async function saveVertexPrivateKey(clear = false): Promise<void> {
+    if (!selectedProvider) return;
+    setBusy(true);
+    try {
+      const vertexConfig = getVertexAiConfig(selectedProvider.config ?? {});
+      const updated = await invoke<ProviderView>("update_vertex_ai_config", {
+        input: {
+          providerId: selectedProvider.id,
+          projectId: vertexConfig.projectId,
+          location: vertexConfig.location,
+          clientEmail: vertexConfig.clientEmail,
+          privateKey: clear ? "" : privateKeyValue,
+        } satisfies UpdateVertexAiConfigInput,
+      });
+      setProvidersAndCache((items) =>
+        items.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      setPrivateKeyValue("");
+      setPrivateKeyOpen(false);
+      pushToast(clear ? "私钥已清空" : "私钥已安全保存", "success");
+    } catch (cause) {
+      pushToast(getErrorMessage(cause), "error");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -855,6 +959,10 @@ function ProviderSettingsPage() {
                 onAddModel={() => setAddModelOpen(true)}
                 onTestModel={(model) => void testModel(model)}
                 onOpenModelSettings={(model) => setSettingsModel({ ...model })}
+                onOpenServiceAccountJson={() => setServiceAccountOpen(true)}
+                onOpenPrivateKey={() => void openPrivateKeyEditor()}
+                onUpdateVertexAiConfig={updateVertexAiConfig}
+                onError={setError}
               />
             )}
           </Card>
@@ -912,6 +1020,7 @@ function ProviderSettingsPage() {
                       "openai-responses",
                       "anthropic",
                       "gemini",
+                      "vertex-ai",
                       "ollama",
                     ] as ProviderProtocol[]
                   ).map((protocol) => (
@@ -1031,6 +1140,90 @@ function ProviderSettingsPage() {
               onClick={() => void replaceHeaders()}
             >
               保存并替换
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={serviceAccountOpen}
+        onOpenChange={(open) => {
+          setServiceAccountOpen(open);
+          if (!open) setServiceAccountJson("");
+        }}
+      >
+        <DialogContent open={serviceAccountOpen} className="overflow-x-hidden">
+          <DialogHeader>
+            <DialogTitle>解析服务账号JSON密钥</DialogTitle>
+            <DialogDescription>
+              粘贴 Google Cloud Service Account JSON，解析成功后只安全保存项目 ID、客户端邮箱和私钥。
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            wrap="soft"
+            className="min-h-48 overflow-x-hidden overflow-y-auto break-all font-mono text-xs whitespace-pre-wrap"
+            spellCheck={false}
+            value={serviceAccountJson}
+            placeholder={'{\n  "type": "service_account",\n  "project_id": "my-project",\n  "private_key": "-----BEGIN PRIVATE KEY-----\\\\n...\\\\n-----END PRIVATE KEY-----\\\\n",\n  "client_email": "name@my-project.iam.gserviceaccount.com"\n}'}
+            onChange={(event) => setServiceAccountJson(event.target.value)}
+          />
+          <DialogFooter className="justify-between">
+            <Button
+              variant="destructive"
+              disabled={busy || !selectedProvider}
+              onClick={() => void parseServiceAccountJson(true)}
+            >
+              清空密钥
+            </Button>
+            <Button
+              disabled={!serviceAccountJson.trim() || busy}
+              onClick={() => void parseServiceAccountJson()}
+            >
+              解析
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={privateKeyOpen}
+        onOpenChange={(open) => {
+          setPrivateKeyOpen(open);
+          if (!open) {
+            setPrivateKeyValue("");
+          }
+        }}
+      >
+        <DialogContent open={privateKeyOpen} className="overflow-x-hidden">
+          <DialogHeader>
+            <DialogTitle>修改私钥</DialogTitle>
+            <DialogDescription>
+              这里显示当前保存的 private_key。保存后会覆盖原私钥。
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            rows={4}
+            wrap="soft"
+            className="h-24 min-h-24 max-h-24 resize-none overflow-x-hidden overflow-y-auto break-all font-mono text-xs leading-5 whitespace-pre-wrap [field-sizing:fixed]"
+            spellCheck={false}
+            value={privateKeyValue}
+            placeholder={privateKeyLoading ? "正在读取已保存的私钥…" : "粘贴 private_key 字段"}
+            disabled={privateKeyLoading}
+            onChange={(event) => setPrivateKeyValue(event.target.value)}
+          />
+          <DialogFooter className="justify-between">
+            <Button
+              variant="destructive"
+              disabled={busy || privateKeyLoading || !selectedProvider}
+              onClick={() => void saveVertexPrivateKey(true)}
+            >
+              清空私钥
+            </Button>
+            <Button
+              disabled={!privateKeyValue.trim() || busy || privateKeyLoading}
+              onClick={() => void saveVertexPrivateKey()}
+            >
+              保存私钥
             </Button>
           </DialogFooter>
         </DialogContent>

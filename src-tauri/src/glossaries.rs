@@ -11,7 +11,9 @@ use sqlx::{Row, SqlitePool};
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 
-use crate::languages::{normalize_language_code, normalize_source_language, normalize_target_language};
+use crate::languages::{
+    normalize_language_code, normalize_source_language, normalize_target_language,
+};
 
 const CONFIG_DB_FILE: &str = "config.db";
 const GLOSSARIES_DIR: &str = "glossaries";
@@ -853,7 +855,10 @@ fn normalize_list_query(query: Option<GlossaryListQuery>) -> Result<GlossaryList
 }
 
 fn same_language(left: &str, right: &str) -> bool {
-    match (normalize_language_code(left), normalize_language_code(right)) {
+    match (
+        normalize_language_code(left),
+        normalize_language_code(right),
+    ) {
         (Some(left_code), Some(right_code)) => left_code == right_code,
         _ => left.trim().eq_ignore_ascii_case(right.trim()),
     }
@@ -1530,9 +1535,15 @@ mod tests {
 
     #[test]
     fn normalizes_glossary_languages_to_supported_codes() {
-        assert_eq!(normalize_glossary_source_language(" English ").unwrap(), "en");
+        assert_eq!(
+            normalize_glossary_source_language(" English ").unwrap(),
+            "en"
+        );
         assert_eq!(normalize_language("Simplified Chinese").unwrap(), "zh-CN");
-        assert_eq!(normalize_language("Chinese (Traditional)").unwrap(), "zh-HK");
+        assert_eq!(
+            normalize_language("Chinese (Traditional)").unwrap(),
+            "zh-HK"
+        );
         assert!(normalize_glossary_source_language("auto").is_err());
         assert!(normalize_language("Klingon").is_err());
     }

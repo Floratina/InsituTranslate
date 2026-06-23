@@ -7,17 +7,20 @@ use sqlx::{Row, SqlitePool};
 
 use crate::domain::{
     AddModelInput, AssistantIconKind, AssistantToolMode, AssistantView, CopyAssistantInput,
-    CopyProviderInput, CreateAssistantInput, CreateProviderInput, ModelView, ProviderProtocol,
-    ProviderPurpose, ProviderRuntimeConfig, ProviderView, ReorderAssistantsInput,
-    ReorderProvidersInput, SetProviderEnabledInput, UpdateAssistantCustomParametersInput,
-    UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
-    UpdateProviderConfigInput, UpdateProviderMetadataInput,
+    CopyProviderInput, CreateAssistantInput, CreateProviderInput,
+    ImportVertexAiServiceAccountInput, ModelView, ProviderProtocol, ProviderPurpose,
+    ProviderRuntimeConfig, ProviderView, ReorderAssistantsInput, ReorderProvidersInput,
+    SetProviderEnabledInput, UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput,
+    UpdateAssistantSettingsInput, UpdateModelInput, UpdateProviderConfigInput,
+    UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
 };
 use crate::secrets;
+use crate::vertex_ai;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const MINERU_PROVIDER_ID: &str = "builtin_document-parsing_mineru";
+pub const AGENT_PLATFORM_PROVIDER_ID: &str = "builtin_translation_agent_platform";
 pub const MINERU_STANDARD_BASE_URL: &str = "https://mineru.net/api/v4";
 pub const MINERU_FLASH_BASE_URL: &str = "https://mineru.net/api/v1/agent";
 
@@ -28,6 +31,17 @@ pub fn default_mineru_config() -> Value {
             "flashBaseUrl": MINERU_FLASH_BASE_URL,
         }
     })
+}
+
+pub fn default_vertex_ai_config() -> Value {
+    vertex_ai::default_config()
+}
+
+fn default_provider_config(protocol: ProviderProtocol) -> Value {
+    match protocol {
+        ProviderProtocol::VertexAi => default_vertex_ai_config(),
+        _ => json!({}),
+    }
 }
 
 pub fn is_mineru_provider(provider: &ProviderView) -> bool {
@@ -328,6 +342,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             ProviderProtocol::OpenaiResponses,
             "https://api.openai.com",
             "openai",
+            json!({}),
         ),
         (
             "builtin_gemini",
@@ -335,6 +350,15 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             ProviderProtocol::Gemini,
             "https://generativelanguage.googleapis.com",
             "gemini",
+            json!({}),
+        ),
+        (
+            "builtin_agent_platform",
+            "Agent Platform",
+            ProviderProtocol::VertexAi,
+            vertex_ai::DEFAULT_BASE_URL,
+            "vertex-ai",
+            default_vertex_ai_config(),
         ),
         (
             "builtin_anthropic",
@@ -342,6 +366,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             ProviderProtocol::Anthropic,
             "https://api.anthropic.com",
             "anthropic",
+            json!({}),
         ),
         (
             "builtin_deepseek",
@@ -349,6 +374,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             ProviderProtocol::OpenaiChat,
             "https://api.deepseek.com",
             "deepseek",
+            json!({}),
         ),
         (
             "builtin_qwen",
@@ -356,6 +382,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             ProviderProtocol::OpenaiChat,
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
             "qwen",
+            json!({}),
         ),
         (
             "builtin_openrouter",
@@ -363,6 +390,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             ProviderProtocol::OpenaiChat,
             "https://openrouter.ai/api/v1",
             "openrouter",
+            json!({}),
         ),
         (
             "builtin_ollama",
@@ -370,11 +398,13 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             ProviderProtocol::Ollama,
             "http://localhost:11434/api",
             "ollama",
+            json!({}),
         ),
     ];
     let mut inserted_any = false;
     let purpose = ProviderPurpose::Translation;
-    for (sort_order, (key, name, protocol, base_url, avatar)) in presets.iter().enumerate() {
+    for (sort_order, (key, name, protocol, base_url, avatar, config)) in presets.iter().enumerate()
+    {
         let id = format!(
             "builtin_{}_{}",
             purpose.as_str(),
@@ -388,7 +418,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         if exists == 0 {
             let (auth_type, auth_header) = authentication_for_protocol(*protocol);
             let inserted = sqlx::query(
-                "INSERT INTO providers (id, name, protocol, base_url, auth_type, auth_header, avatar, is_builtin, enabled, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?) ON CONFLICT(id) DO NOTHING",
+                "INSERT INTO providers (id, name, protocol, base_url, auth_type, auth_header, config_json, avatar, is_builtin, enabled, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?) ON CONFLICT(id) DO NOTHING",
             )
             .bind(&id)
             .bind(name)
@@ -396,6 +426,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             .bind(base_url)
             .bind(auth_type)
             .bind(auth_header)
+            .bind(config.to_string())
             .bind(avatar)
             .bind(sort_order as i64)
             .execute(pool)
@@ -486,6 +517,11 @@ async fn migrate_duplicate_builtins(pool: &SqlitePool) -> Result<(), String> {
     for (canonical_id, legacy_id, default_name) in [
         ("builtin_translation_openai", "builtin_openai", "OpenAI"),
         ("builtin_translation_gemini", "builtin_gemini", "Gemini"),
+        (
+            AGENT_PLATFORM_PROVIDER_ID,
+            "builtin_agent_platform",
+            "Agent Platform",
+        ),
         (
             "builtin_translation_anthropic",
             "builtin_anthropic",
@@ -610,6 +646,7 @@ async fn migrate_translation_only_builtins(pool: &SqlitePool) -> Result<(), Stri
     for id in [
         "builtin_translation_openai",
         "builtin_translation_gemini",
+        AGENT_PLATFORM_PROVIDER_ID,
         "builtin_translation_anthropic",
         "builtin_translation_deepseek",
         "builtin_translation_qwen",
@@ -712,6 +749,7 @@ fn default_base_url(protocol: ProviderProtocol) -> &'static str {
         }
         ProviderProtocol::Anthropic => "https://api.anthropic.com",
         ProviderProtocol::Gemini => "https://generativelanguage.googleapis.com",
+        ProviderProtocol::VertexAi => vertex_ai::DEFAULT_BASE_URL,
         ProviderProtocol::Ollama => "http://localhost:11434/api",
     }
 }
@@ -720,6 +758,7 @@ fn authentication_for_protocol(protocol: ProviderProtocol) -> (&'static str, &'s
     match protocol {
         ProviderProtocol::Anthropic => ("api-key", "x-api-key"),
         ProviderProtocol::Gemini => ("api-key", "x-goog-api-key"),
+        ProviderProtocol::VertexAi => ("service-account", "Authorization"),
         ProviderProtocol::Ollama => ("none", "Authorization"),
         ProviderProtocol::OpenaiChat | ProviderProtocol::OpenaiResponses => {
             ("bearer", "Authorization")
@@ -1086,7 +1125,7 @@ pub async fn create_provider(
     let (auth_type, auth_header) = authentication_for_protocol(input.protocol);
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query(
-        "INSERT INTO providers (id, name, protocol, base_url, auth_type, auth_header, credential_ref, avatar) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO providers (id, name, protocol, base_url, auth_type, auth_header, config_json, credential_ref, avatar) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(input.name.trim())
@@ -1094,6 +1133,7 @@ pub async fn create_provider(
     .bind(default_base_url(input.protocol))
     .bind(auth_type)
     .bind(auth_header)
+    .bind(default_provider_config(input.protocol).to_string())
     .bind(&credential_ref)
     .bind(input.avatar)
     .execute(&mut *transaction)
@@ -1192,7 +1232,198 @@ fn normalize_provider_config(config: Option<Value>) -> Result<Option<String>, St
         mineru.insert("flashBaseUrl".into(), Value::String(flash_base_url));
         object.insert("mineru".into(), Value::Object(mineru));
     }
+    if object.contains_key(vertex_ai::CONFIG_KEY) {
+        let mut vertex = match object.remove(vertex_ai::CONFIG_KEY) {
+            Some(Value::Object(vertex)) => vertex,
+            _ => return Err("Agent Platform config must be a JSON object".into()),
+        };
+        let project_id = vertex
+            .get("projectId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let client_email = vertex
+            .get("clientEmail")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let location = vertex
+            .get("location")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(vertex_ai::DEFAULT_LOCATION)
+            .to_string();
+        vertex.remove("privateKey");
+        vertex.remove("private_key");
+        vertex.remove("serviceAccount");
+        vertex.insert("projectId".into(), Value::String(project_id));
+        vertex.insert("clientEmail".into(), Value::String(client_email));
+        vertex.insert("location".into(), Value::String(location));
+        object.insert(vertex_ai::CONFIG_KEY.into(), Value::Object(vertex));
+    }
     Ok(Some(Value::Object(object).to_string()))
+}
+
+pub async fn update_vertex_ai_config(
+    pool: &SqlitePool,
+    input: UpdateVertexAiConfigInput,
+) -> Result<ProviderView, String> {
+    save_vertex_ai_config(
+        pool,
+        &input.provider_id,
+        input.project_id,
+        input.location,
+        input.client_email,
+        input.private_key,
+    )
+    .await
+}
+
+pub async fn import_vertex_ai_service_account(
+    pool: &SqlitePool,
+    input: ImportVertexAiServiceAccountInput,
+) -> Result<ProviderView, String> {
+    let parsed = vertex_ai::parse_service_account_json(&input.service_account_json)?;
+    let existing = get_provider(pool, &input.provider_id).await?;
+    let current_vertex = existing
+        .config
+        .get(vertex_ai::CONFIG_KEY)
+        .and_then(Value::as_object);
+    let location = input
+        .location
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            current_vertex
+                .and_then(|vertex| vertex.get("location"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or(vertex_ai::DEFAULT_LOCATION)
+        .to_string();
+    let project_id = if parsed.project_id.trim().is_empty() {
+        current_vertex
+            .and_then(|vertex| vertex.get("projectId"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        parsed.project_id
+    };
+    save_vertex_ai_config(
+        pool,
+        &input.provider_id,
+        project_id,
+        location,
+        parsed.client_email,
+        Some(parsed.private_key),
+    )
+    .await
+}
+
+pub async fn get_vertex_ai_private_key(
+    pool: &SqlitePool,
+    provider_id: &str,
+) -> Result<Option<String>, String> {
+    let row = sqlx::query("SELECT protocol, credential_ref FROM providers WHERE id = ?")
+        .bind(provider_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Provider not found".to_string())?;
+    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
+    if protocol != ProviderProtocol::VertexAi {
+        return Err("Private key can only be read from Agent Platform providers".into());
+    }
+    let credential_ref: Option<String> = row.get("credential_ref");
+    match credential_ref {
+        Some(reference) => secrets::read(&reference),
+        None => Ok(None),
+    }
+}
+
+async fn save_vertex_ai_config(
+    pool: &SqlitePool,
+    provider_id: &str,
+    project_id: String,
+    location: String,
+    client_email: String,
+    private_key: Option<String>,
+) -> Result<ProviderView, String> {
+    let row = sqlx::query("SELECT protocol, config_json FROM providers WHERE id = ?")
+        .bind(provider_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Provider not found".to_string())?;
+    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
+    if protocol != ProviderProtocol::VertexAi {
+        return Err("Agent Platform config can only be saved on Agent Platform providers".into());
+    }
+    let config_json: String = row.get("config_json");
+    let mut object = serde_json::from_str::<Value>(&config_json)
+        .unwrap_or_else(|_| json!({}))
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let mut vertex = object
+        .remove(vertex_ai::CONFIG_KEY)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    vertex.insert(
+        "projectId".into(),
+        Value::String(project_id.trim().to_string()),
+    );
+    let location = location.trim();
+    let location = if location.is_empty() {
+        vertex_ai::DEFAULT_LOCATION
+    } else {
+        location
+    };
+    vertex.insert("location".into(), Value::String(location.to_string()));
+    vertex.insert(
+        "clientEmail".into(),
+        Value::String(client_email.trim().to_string()),
+    );
+    object.insert(vertex_ai::CONFIG_KEY.into(), Value::Object(vertex));
+    let normalized = normalize_provider_config(Some(Value::Object(object)))?
+        .unwrap_or_else(|| json!({}).to_string());
+
+    if let Some(private_key) = private_key {
+        let reference = format!("provider/{provider_id}/credential");
+        let trimmed = private_key.trim();
+        let mask = if trimmed.is_empty() {
+            secrets::delete(&reference)?;
+            None
+        } else {
+            let formatted = vertex_ai::format_private_key(trimmed)?;
+            secrets::write(&reference, &formatted)?;
+            Some(secrets::mask(&formatted))
+        };
+        sqlx::query("UPDATE providers SET config_json = ?, credential_ref = ?, credential_mask = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(normalized)
+            .bind(reference)
+            .bind(mask)
+            .bind(provider_id)
+            .execute(pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        sqlx::query(
+            "UPDATE providers SET config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(normalized)
+        .bind(provider_id)
+        .execute(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    get_provider(pool, provider_id).await
 }
 
 pub async fn update_provider_metadata(
@@ -1605,10 +1836,11 @@ mod tests {
     use super::*;
     use crate::domain::{
         AddModelInput, AssistantIconKind, AssistantToolMode, CopyAssistantInput, CopyProviderInput,
-        CreateAssistantInput, CreateProviderInput, ProviderProtocol, ProviderPurpose,
-        ReorderAssistantsInput, ReorderProvidersInput, UpdateAssistantCustomParametersInput,
-        UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
-        UpdateProviderConfigInput, UpdateProviderMetadataInput,
+        CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput,
+        ProviderProtocol, ProviderPurpose, ReorderAssistantsInput, ReorderProvidersInput,
+        UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput,
+        UpdateAssistantSettingsInput, UpdateModelInput, UpdateProviderConfigInput,
+        UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
     };
 
     #[tokio::test]
@@ -1682,6 +1914,7 @@ mod tests {
             vec![
                 "OpenAI",
                 "Gemini",
+                "Agent Platform",
                 "Anthropic",
                 "DeepSeek",
                 "Qwen",
@@ -1737,6 +1970,96 @@ mod tests {
         assert_eq!(ordered[0].id, second.id);
         assert_eq!(ordered[1].id, first.id);
 
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn imports_updates_and_copies_vertex_ai_service_account_config() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let agent_platform = list_providers(&pool, Some(ProviderPurpose::Translation))
+            .await
+            .expect("providers")
+            .into_iter()
+            .find(|provider| provider.id == AGENT_PLATFORM_PROVIDER_ID)
+            .expect("agent platform provider");
+
+        let imported = import_vertex_ai_service_account(
+            &pool,
+            ImportVertexAiServiceAccountInput {
+                provider_id: agent_platform.id.clone(),
+                location: None,
+                service_account_json: json!({
+                    "project_id": "vertex-project",
+                    "client_email": "svc@vertex-project.iam.gserviceaccount.com",
+                    "private_key": "abc"
+                })
+                .to_string(),
+            },
+        )
+        .await
+        .expect("import service account");
+        assert_eq!(
+            imported.config.pointer("/vertexAi/projectId"),
+            Some(&json!("vertex-project"))
+        );
+        assert_eq!(
+            imported.config.pointer("/vertexAi/location"),
+            Some(&json!("global"))
+        );
+        assert!(imported.config.pointer("/vertexAi/privateKey").is_none());
+        assert!(imported.credential_mask.is_some());
+
+        let runtime = runtime_config(&pool, &imported.id).await.expect("runtime");
+        assert_eq!(runtime.protocol, ProviderProtocol::VertexAi);
+        assert!(runtime
+            .credential
+            .as_deref()
+            .unwrap_or_default()
+            .contains("-----BEGIN PRIVATE KEY-----"));
+        assert_eq!(
+            get_vertex_ai_private_key(&pool, &imported.id)
+                .await
+                .expect("private key")
+                .as_deref(),
+            runtime.credential.as_deref()
+        );
+
+        let updated = update_vertex_ai_config(
+            &pool,
+            UpdateVertexAiConfigInput {
+                provider_id: imported.id.clone(),
+                project_id: "vertex-project".into(),
+                location: "us-central1".into(),
+                client_email: "svc@vertex-project.iam.gserviceaccount.com".into(),
+                private_key: None,
+            },
+        )
+        .await
+        .expect("update vertex config");
+        assert_eq!(
+            updated.config.pointer("/vertexAi/location"),
+            Some(&json!("us-central1"))
+        );
+        let copied = copy_provider(
+            &pool,
+            CopyProviderInput {
+                provider_id: updated.id.clone(),
+                purpose: ProviderPurpose::Translation,
+            },
+        )
+        .await
+        .expect("copy provider");
+        let copied_runtime = runtime_config(&pool, &copied.id)
+            .await
+            .expect("copied runtime");
+        assert_eq!(copied_runtime.protocol, ProviderProtocol::VertexAi);
+        assert!(copied_runtime.credential.is_some());
+
+        let _ = secrets::delete(&format!("provider/{}/credential", imported.id));
+        let _ = secrets::delete(&format!("provider/{}/credential", copied.id));
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
@@ -1943,7 +2266,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             builtins.len(),
-            7,
+            8,
             "editing a preset must not seed a duplicate"
         );
         assert_eq!(

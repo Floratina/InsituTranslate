@@ -4,11 +4,12 @@ use reqwest::{Client, Method};
 use serde_json::{json, Value};
 
 use crate::domain::{
-    ProviderProtocol, ProviderRuntimeConfig, RemoteModel, ThinkingConfig, ThinkingEffort,
-    ThinkingMode, ThinkingSummary, UnifiedChatRequest, UnifiedChatResponse, UnifiedContent,
-    UnifiedMessage, UnifiedToolChoice, UnifiedUsage,
+    LogprobStats, ProviderProtocol, ProviderRuntimeConfig, RemoteModel, ThinkingConfig,
+    ThinkingEffort, ThinkingMode, ThinkingSummary, UnifiedChatRequest, UnifiedChatResponse,
+    UnifiedContent, UnifiedMessage, UnifiedToolChoice, UnifiedUsage,
 };
 use crate::features::{is_feature_supported, FeatureId};
+use crate::vertex_ai;
 use std::fmt;
 
 pub trait ProviderAdapter {
@@ -86,35 +87,48 @@ impl RuntimeAdapter {
         Self { client, config }
     }
 
-    fn headers(&self) -> Result<HeaderMap, String> {
+    async fn headers(&self) -> Result<HeaderMap, String> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(credential) = self
-            .config
-            .credential
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            let name = HeaderName::from_bytes(self.config.auth_header.as_bytes())
-                .map_err(|error| format!("Invalid authentication header: {error}"))?;
-            let value = if self.config.auth_type == "bearer" && name == AUTHORIZATION {
-                format!("Bearer {credential}")
-            } else {
-                credential.to_string()
-            };
-            headers.insert(
-                name,
-                HeaderValue::from_str(&value)
-                    .map_err(|error| format!("Invalid authentication value: {error}"))?,
-            );
+        if self.config.protocol != ProviderProtocol::VertexAi {
+            if let Some(credential) = self
+                .config
+                .credential
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                let name = HeaderName::from_bytes(self.config.auth_header.as_bytes())
+                    .map_err(|error| format!("Invalid authentication header: {error}"))?;
+                let value = if self.config.auth_type == "bearer" && name == AUTHORIZATION {
+                    format!("Bearer {credential}")
+                } else {
+                    credential.to_string()
+                };
+                headers.insert(
+                    name,
+                    HeaderValue::from_str(&value)
+                        .map_err(|error| format!("Invalid authentication value: {error}"))?,
+                );
+            }
         }
         for (name, value) in &self.config.custom_headers {
             let header_name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|error| format!("Invalid custom header {name}: {error}"))?;
+            if self.config.protocol == ProviderProtocol::VertexAi && header_name == AUTHORIZATION {
+                continue;
+            }
             headers.insert(
                 header_name,
                 HeaderValue::from_str(value)
                     .map_err(|error| format!("Invalid custom header value for {name}: {error}"))?,
+            );
+        }
+        if self.config.protocol == ProviderProtocol::VertexAi {
+            let token = vertex_ai::access_token(&self.client, &self.config).await?;
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|error| format!("Invalid Agent Platform token: {error}"))?,
             );
         }
         if self.config.protocol == ProviderProtocol::Anthropic
@@ -159,7 +173,7 @@ impl RuntimeAdapter {
         let mut request = self
             .client
             .request(method, url)
-            .headers(self.headers().map_err(|error| ProviderChatError {
+            .headers(self.headers().await.map_err(|error| ProviderChatError {
                 status: None,
                 message: error,
                 rate_limits: RateLimitTelemetry::default(),
@@ -223,6 +237,18 @@ impl RuntimeAdapter {
                 self.request_json(Method::GET, self.endpoint(suffix), None)
                     .await
             }
+            ProviderProtocol::VertexAi => {
+                let vertex = vertex_ai::runtime_config(&self.config)?;
+                self.request_json(
+                    Method::GET,
+                    format!(
+                        "{}?pageSize=100&listAllVersions=true",
+                        vertex_ai::publisher_models_url(&self.config.base_url, &vertex.location, "google")
+                    ),
+                    None,
+                )
+                .await
+            }
             ProviderProtocol::Ollama => {
                 let base = endpoint_base_url(&self.config.base_url).trim_end_matches('/');
                 let url = if self.config.use_raw_base_url {
@@ -254,6 +280,12 @@ impl ProviderAdapter for RuntimeAdapter {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default(),
+            ProviderProtocol::VertexAi => value
+                .get("publisherModels")
+                .or_else(|| value.get("models"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
             ProviderProtocol::Ollama => value
                 .get("models")
                 .and_then(Value::as_array)
@@ -262,13 +294,21 @@ impl ProviderAdapter for RuntimeAdapter {
         };
         let mut models = Vec::new();
         for item in items {
-            let request_name = item
+            let mut request_name = item
                 .get("id")
                 .or_else(|| item.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            if self.config.protocol == ProviderProtocol::VertexAi {
+                request_name = vertex_ai::model_id(&request_name);
+            }
             if request_name.is_empty() {
+                continue;
+            }
+            if self.config.protocol == ProviderProtocol::VertexAi
+                && !request_name.to_ascii_lowercase().starts_with("gemini")
+            {
                 continue;
             }
             let alias = item
@@ -288,7 +328,7 @@ impl ProviderAdapter for RuntimeAdapter {
     }
 
     fn build_chat_request(&self, request: &UnifiedChatRequest) -> Result<(String, Value), String> {
-        Ok(match self.config.protocol {
+        let (url, body) = match self.config.protocol {
             ProviderProtocol::OpenaiChat => (
                 self.openai_endpoint("chat/completions"),
                 build_openai_chat_body(&self.config.base_url, request),
@@ -322,6 +362,19 @@ impl ProviderAdapter for RuntimeAdapter {
                 )),
                 build_gemini_body(request),
             ),
+            ProviderProtocol::VertexAi => {
+                let vertex = vertex_ai::runtime_config(&self.config)?;
+                (
+                    vertex_ai::generate_content_url(
+                        &self.config.base_url,
+                        &vertex.project_id,
+                        &vertex.location,
+                        &request.model,
+                        request.stream,
+                    ),
+                    build_gemini_body(request),
+                )
+            }
             ProviderProtocol::Ollama => {
                 let base = endpoint_base_url(&self.config.base_url).trim_end_matches('/');
                 (
@@ -335,7 +388,10 @@ impl ProviderAdapter for RuntimeAdapter {
                     build_ollama_body(request),
                 )
             }
-        })
+        };
+        let mut body = merge_custom_parameters(body, &request.custom_parameters)?;
+        apply_request_overrides(&mut body, self.config.protocol, request);
+        Ok((url, body))
     }
 
     async fn send_chat(&self, request: &UnifiedChatRequest) -> Result<UnifiedChatResponse, String> {
@@ -353,7 +409,7 @@ impl ProviderAdapter for RuntimeAdapter {
         let response = self
             .client
             .post(url)
-            .headers(self.headers()?)
+            .headers(self.headers().await?)
             .json(&body)
             .send()
             .await
@@ -590,6 +646,49 @@ fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+fn merge_custom_parameters(mut body: Value, custom_parameters: &Value) -> Result<Value, String> {
+    if custom_parameters.is_null() {
+        return Ok(body);
+    }
+    let Some(custom) = custom_parameters.as_object() else {
+        return Err("Custom request body parameters must be a JSON object".into());
+    };
+    if custom.is_empty() {
+        return Ok(body);
+    }
+    let Some(body_object) = body.as_object_mut() else {
+        return Err("Provider request body must be a JSON object".into());
+    };
+    deep_merge_object(body_object, custom);
+    Ok(body)
+}
+
+fn apply_request_overrides(
+    body: &mut Value,
+    protocol: ProviderProtocol,
+    request: &UnifiedChatRequest,
+) {
+    if protocol == ProviderProtocol::OpenaiChat && request.logprobs {
+        body["logprobs"] = json!(true);
+    }
+}
+
+fn deep_merge_object(
+    target: &mut serde_json::Map<String, Value>,
+    incoming: &serde_json::Map<String, Value>,
+) {
+    for (key, value) in incoming {
+        match (target.get_mut(key), value) {
+            (Some(Value::Object(target_object)), Value::Object(incoming_object)) => {
+                deep_merge_object(target_object, incoming_object);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 fn content_text(parts: &[UnifiedContent]) -> String {
     parts
         .iter()
@@ -775,6 +874,9 @@ pub fn build_openai_chat_body(base_url: &str, request: &UnifiedChatRequest) -> V
     }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
+    }
+    if request.logprobs {
+        body["logprobs"] = json!(true);
     }
     let mut tools: Vec<Value> = request
         .tools
@@ -1433,6 +1535,10 @@ pub fn finish_reason_from_raw(protocol: ProviderProtocol, raw: &Value) -> Option
             .pointer("/candidates/0/finishReason")
             .and_then(Value::as_str)
             .map(str::to_string),
+        ProviderProtocol::VertexAi => raw
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         ProviderProtocol::Ollama => raw
             .get("done_reason")
             .or_else(|| raw.get("doneReason"))
@@ -1659,7 +1765,7 @@ pub fn normalize_response(
                     .unwrap_or(0),
             });
         }
-        ProviderProtocol::Gemini => {
+        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
             if let Some(parts) = raw
                 .pointer("/candidates/0/content/parts")
                 .and_then(Value::as_array)
@@ -1739,13 +1845,79 @@ pub fn normalize_response(
             });
         }
     }
+    let logprob_stats = logprob_stats_from_raw(protocol, &raw);
     Ok(UnifiedChatResponse {
         text,
         reasoning,
         thinking,
         tool_calls,
         usage,
+        logprob_stats,
         raw,
+    })
+}
+
+fn logprob_stats_from_raw(protocol: ProviderProtocol, raw: &Value) -> Option<LogprobStats> {
+    if protocol != ProviderProtocol::OpenaiChat {
+        return None;
+    }
+    let mut logprobs = Vec::new();
+    if let Some(content) = raw
+        .pointer("/choices/0/logprobs/content")
+        .and_then(Value::as_array)
+    {
+        logprobs.extend(
+            content
+                .iter()
+                .filter_map(|item| item.get("logprob").and_then(Value::as_f64))
+                .filter(|value| value.is_finite()),
+        );
+    }
+    if logprobs.is_empty() {
+        if let Some(token_logprobs) = raw
+            .pointer("/choices/0/logprobs/token_logprobs")
+            .and_then(Value::as_array)
+        {
+            logprobs.extend(
+                token_logprobs
+                    .iter()
+                    .filter_map(Value::as_f64)
+                    .filter(|value| value.is_finite()),
+            );
+        }
+    }
+    confidence_index(&logprobs)
+}
+
+fn confidence_index(logprobs: &[f64]) -> Option<LogprobStats> {
+    if logprobs.is_empty() {
+        return None;
+    }
+    let probabilities: Vec<f64> = logprobs
+        .iter()
+        .map(|value| value.exp())
+        .filter(|value| value.is_finite())
+        .collect();
+    if probabilities.is_empty() {
+        return None;
+    }
+    let token_count = probabilities.len() as u64;
+    let average_probability = probabilities.iter().sum::<f64>() / probabilities.len() as f64;
+    let variance = probabilities
+        .iter()
+        .map(|value| {
+            let diff = value - average_probability;
+            diff * diff
+        })
+        .sum::<f64>()
+        / probabilities.len() as f64;
+    let standard_deviation = variance.sqrt();
+    let confidence = (average_probability - 0.5 * standard_deviation).clamp(0.0, 1.0);
+    Some(LogprobStats {
+        token_count,
+        average_probability,
+        standard_deviation,
+        confidence,
     })
 }
 
@@ -1800,6 +1972,8 @@ mod tests {
             max_output_tokens: Some(4096),
             temperature: None,
             stream: true,
+            logprobs: false,
+            custom_parameters: json!({}),
         }
     }
 
@@ -1808,6 +1982,41 @@ mod tests {
         let body = build_openai_chat_body("https://api.deepseek.com", &request());
         assert_eq!(body.pointer("/thinking/type"), Some(&json!("enabled")));
         assert_eq!(body.get("reasoning_effort"), Some(&json!("max")));
+    }
+
+    #[test]
+    fn builds_openai_logprobs_only_when_requested() {
+        let mut request = request();
+        request.stream = false;
+        let body = build_openai_chat_body("https://api.openai.com", &request);
+        assert!(body.get("logprobs").is_none());
+
+        request.logprobs = true;
+        let body = build_openai_chat_body("https://api.openai.com", &request);
+        assert_eq!(body.get("logprobs"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn requested_logprobs_override_custom_parameters() {
+        let adapter = RuntimeAdapter::new(
+            Client::new(),
+            ProviderRuntimeConfig {
+                protocol: ProviderProtocol::OpenaiChat,
+                base_url: "https://api.openai.com".into(),
+                use_raw_base_url: false,
+                config: json!({}),
+                auth_type: "none".into(),
+                auth_header: "Authorization".into(),
+                credential: None,
+                custom_headers: Vec::new(),
+            },
+        );
+        let mut request = request();
+        request.stream = false;
+        request.logprobs = true;
+        request.custom_parameters = json!({"logprobs": false});
+        let (_, body) = adapter.build_chat_request(&request).expect("request");
+        assert_eq!(body.get("logprobs"), Some(&json!(true)));
     }
 
     #[test]
@@ -1922,6 +2131,31 @@ mod tests {
         assert_eq!(response.text, "ok");
         assert_eq!(response.reasoning, "think");
         assert_eq!(response.thinking.len(), 2);
+    }
+
+    #[test]
+    fn normalizes_openai_logprob_stats() {
+        let response = normalize_response(
+            ProviderProtocol::OpenaiChat,
+            json!({
+                "choices": [{
+                    "message": {"content": "ok"},
+                    "logprobs": {
+                        "content": [
+                            {"token": "o", "logprob": 0.0},
+                            {"token": "k", "logprob": -1.3862943611198906}
+                        ]
+                    }
+                }]
+            }),
+        )
+        .expect("normalize");
+        let stats = response.logprob_stats.expect("stats");
+        assert_eq!(response.text, "ok");
+        assert_eq!(stats.token_count, 2);
+        assert!((stats.average_probability - 0.625).abs() < 0.000001);
+        assert!((stats.standard_deviation - 0.375).abs() < 0.000001);
+        assert!((stats.confidence - 0.4375).abs() < 0.000001);
     }
 
     #[test]

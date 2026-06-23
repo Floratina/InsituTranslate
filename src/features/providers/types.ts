@@ -9,6 +9,7 @@ export type ProviderProtocol =
   | "openai-responses"
   | "anthropic"
   | "gemini"
+  | "vertex-ai"
   | "ollama";
 
 export type MinerUMode = "standard" | "flash";
@@ -20,7 +21,14 @@ export interface MinerUProviderConfig {
 
 export interface ProviderConfig {
   mineru?: MinerUProviderConfig;
+  vertexAi?: VertexAiProviderConfig;
   [key: string]: unknown;
+}
+
+export interface VertexAiProviderConfig {
+  projectId: string;
+  location: string;
+  clientEmail: string;
 }
 
 export interface ModelView {

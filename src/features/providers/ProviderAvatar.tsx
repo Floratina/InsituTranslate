@@ -28,6 +28,14 @@ const fallbackSizeClassNames: Record<ProviderAvatarSize, string> = {
   xl: "text-xl",
 };
 
+const glyphOffsetClassNames: Record<ProviderAvatarSize, string> = {
+  "2xs": "translate-y-[0.08em]",
+  sm: "translate-y-[0.02em]",
+  md: "-translate-y-[0.03em]",
+  lg: "-translate-y-[0.04em]",
+  xl: "-translate-y-[0.04em]",
+};
+
 function providerInitial(name: string): string {
   return Array.from(name.trim())[0]?.toUpperCase() ?? "A";
 }
@@ -52,11 +60,13 @@ export function ProviderAvatar({
       {source && <AvatarImage src={source} alt="" />}
       <AvatarFallback
         className={cn(
-          "bg-primary leading-none font-semibold tracking-normal text-primary-foreground [font-family:var(--avatar-letter-font-family)] [&>span]:-translate-y-[0.04em]",
+          "bg-primary leading-none font-semibold tracking-normal text-primary-foreground [font-family:var(--avatar-letter-font-family)]",
           fallbackSizeClassNames[size],
         )}
       >
-        <span>{providerInitial(name)}</span>
+        <span className={cn("inline-block", glyphOffsetClassNames[size])}>
+          {providerInitial(name)}
+        </span>
       </AvatarFallback>
     </Avatar>
   );

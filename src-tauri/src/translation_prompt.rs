@@ -116,6 +116,8 @@ mod tests {
             max_output_tokens: None,
             temperature: None,
             stream: false,
+            logprobs: false,
+            custom_parameters: json!({}),
         }
     }
 
@@ -129,10 +131,8 @@ mod tests {
         assert_eq!(messages[1].role, "user");
         assert_eq!(message_text(&messages[1]), INJECTION_TEXT);
         assert!(!message_text(&messages[0]).contains(INJECTION_TEXT));
-        assert!(
-            message_text(&messages[0])
-                .contains("translate the user's input text into Chinese (Simplified)")
-        );
+        assert!(message_text(&messages[0])
+            .contains("translate the user's input text into Chinese (Simplified)"));
         assert!(!message_text(&messages[0]).contains(TARGET_LANGUAGE_PLACEHOLDER));
         assert_eq!(
             message_text(&messages[0]),
@@ -147,10 +147,7 @@ mod tests {
         input.target_language = "ko".into();
         let messages = request_messages(build_translation_prompt(input).unwrap());
 
-        assert!(
-            message_text(&messages[0])
-                .contains("translate the user's input text into Korean")
-        );
+        assert!(message_text(&messages[0]).contains("translate the user's input text into Korean"));
         assert!(!message_text(&messages[0]).contains("into ko"));
     }
 
@@ -204,12 +201,7 @@ mod tests {
 
     #[test]
     fn validates_supported_language_values() {
-        for target_language in [
-            "en",
-            "zh-Hans",
-            "Polish",
-            "Simplified Chinese",
-        ] {
+        for target_language in ["en", "zh-Hans", "Polish", "Simplified Chinese"] {
             let mut input = prompt_input(None, "Translate me.");
             input.target_language = target_language.into();
             assert!(
@@ -256,6 +248,7 @@ mod tests {
             (DocumentFormat::Epub, "epub"),
             (DocumentFormat::Html, "html"),
             (DocumentFormat::Txt, "txt"),
+            (DocumentFormat::Json, "json"),
             (DocumentFormat::Docx, "docx"),
             (DocumentFormat::Xlsx, "xlsx"),
             (DocumentFormat::Srt, "srt"),
@@ -268,6 +261,7 @@ mod tests {
             (ContentFormat::Html, "html"),
             (ContentFormat::Xhtml, "xhtml"),
             (ContentFormat::Xml, "xml"),
+            (ContentFormat::Json, "json"),
             (ContentFormat::Srt, "srt"),
             (ContentFormat::Ass, "ass"),
             (ContentFormat::Lrc, "lrc"),

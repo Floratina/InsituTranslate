@@ -1,5 +1,23 @@
+fn encode_secret(secret: &str) -> Vec<u8> {
+    secret.as_bytes().to_vec()
+}
+
+fn decode_secret(bytes: &[u8]) -> Result<String, String> {
+    if bytes.contains(&0) && bytes.len() % 2 == 0 {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16(&units)
+            .map_err(|error| format!("Credential is not valid UTF-16: {error}"));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|error| format!("Credential is not valid UTF-8: {error}"))
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
+    use super::{decode_secret, encode_secret};
     use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
@@ -47,10 +65,7 @@ mod platform {
     pub fn write(reference: &str, secret: &str) -> Result<(), String> {
         let mut target_name = wide(&target(reference));
         let mut user_name = wide("InsituTranslate");
-        let mut blob: Vec<u8> = secret
-            .encode_utf16()
-            .flat_map(|unit| unit.to_le_bytes())
-            .collect();
+        let mut blob = encode_secret(secret);
         let credential = CredentialW {
             flags: 0,
             credential_type: CRED_TYPE_GENERIC,
@@ -95,12 +110,7 @@ mod platform {
                 item.credential_blob,
                 item.credential_blob_size as usize,
             );
-            let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                .collect();
-            let decoded = String::from_utf16(&units)
-                .map_err(|error| format!("Credential is not valid UTF-16: {error}"))?;
+            let decoded = decode_secret(bytes)?;
             CredFree(credential.cast());
             decoded
         };
@@ -147,4 +157,42 @@ pub fn delete(reference: &str) -> Result<(), String> {
 
 pub fn mask(_secret: &str) -> String {
     "••••••••••••".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_secret, delete, encode_secret, read, write};
+
+    #[test]
+    fn encodes_new_secrets_as_utf8_and_reads_legacy_utf16() {
+        let secret = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----";
+        let encoded = encode_secret(secret);
+        assert_eq!(encoded.len(), secret.len());
+        assert_eq!(decode_secret(&encoded).expect("utf8"), secret);
+
+        let legacy: Vec<u8> = secret
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        assert_eq!(decode_secret(&legacy).expect("utf16"), secret);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn writes_service_account_sized_secret_to_windows_credential_manager() {
+        let reference = format!(
+            "test/large-secret-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let secret = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+            "a".repeat(2200)
+        );
+        write(&reference, &secret).expect("write large secret");
+        assert_eq!(read(&reference).expect("read large secret"), Some(secret));
+        delete(&reference).expect("delete large secret");
+    }
 }

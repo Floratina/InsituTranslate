@@ -1,6 +1,7 @@
 mod adapters;
 mod commands;
 mod db;
+mod document_parsing;
 mod domain;
 mod features;
 mod glossaries;
@@ -17,6 +18,7 @@ mod task_prompt;
 #[allow(dead_code)]
 mod translation_prompt;
 mod translation_tasks;
+mod vertex_ai;
 
 use tauri::Manager;
 
@@ -79,6 +81,9 @@ pub fn run() {
             commands::delete_assistant,
             commands::create_provider,
             commands::update_provider_config,
+            commands::update_vertex_ai_config,
+            commands::import_vertex_ai_service_account,
+            commands::get_vertex_ai_private_key,
             commands::update_provider_metadata,
             commands::set_provider_enabled,
             commands::reorder_providers,

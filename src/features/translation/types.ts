@@ -36,10 +36,12 @@ export interface TranslationConfigView {
   useGlossary: boolean;
   glossaryMode: GlossaryMode;
   glossaryId: string | null;
+  confidenceMode: ConfidenceMode;
 }
 
 export type RateLimitStrategy = "dynamic" | "manual";
 export type GlossaryMode = "auto" | "existing";
+export type ConfidenceMode = "off" | "confidence-index";
 
 export type UpdateTranslationConfigInput = TranslationConfigView;
 
@@ -121,8 +123,12 @@ export interface TranslationTaskView {
 export interface TranslationChunkView {
   id: string;
   sequence: number;
+  mapJson: string;
+  preprocessedText: string;
   sourceText: string;
+  afterTranslateText: string;
   translatedText: string;
+  confidence: number | null;
   status: TranslationChunkStatus;
   retryCount: number;
   errorMessage: string | null;

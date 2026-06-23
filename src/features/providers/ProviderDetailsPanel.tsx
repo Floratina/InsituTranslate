@@ -23,7 +23,9 @@ import {
 } from "./mineru";
 import { ProviderAvatar } from "./ProviderAvatar";
 import { ProviderModelList } from "./ProviderModelList";
+import { VertexAiConfigPanel } from "./VertexAiConfigPanel";
 import type { MinerUMode, ModelView, ProviderDraft, ProviderProtocol, ProviderView } from "./types";
+import type { UpdateVertexAiConfigInput } from "./vertexAi";
 
 interface ProviderDetailsPanelProps {
   provider: ProviderView | null;
@@ -37,6 +39,10 @@ interface ProviderDetailsPanelProps {
   onAddModel: () => void;
   onTestModel: (model: ModelView) => void;
   onOpenModelSettings: (model: ModelView) => void;
+  onOpenServiceAccountJson: () => void;
+  onOpenPrivateKey: () => void;
+  onUpdateVertexAiConfig: (input: UpdateVertexAiConfigInput) => Promise<void>;
+  onError: (message: string) => void;
 }
 
 const panelTransition = { duration: 0.28, ease: [0.03, 0.59, 0.19, 1] as const };
@@ -50,6 +56,7 @@ function protocolLabel(protocol: ProviderProtocol): string {
     "openai-responses": "OpenAI Responses",
     anthropic: "Anthropic Messages",
     gemini: "Gemini API",
+    "vertex-ai": "Agent Platform",
     ollama: "Ollama Chat",
   };
   return labels[protocol];
@@ -139,6 +146,10 @@ export function ProviderDetailsPanel({
   onAddModel,
   onTestModel,
   onOpenModelSettings,
+  onOpenServiceAccountJson,
+  onOpenPrivateKey,
+  onUpdateVertexAiConfig,
+  onError,
 }: ProviderDetailsPanelProps) {
   if (!provider || !draft) {
     return (
@@ -151,6 +162,7 @@ export function ProviderDetailsPanel({
 
   const isMinerU = isMinerUProvider(provider);
   const isGemini = provider.protocol === "gemini" && !isMinerU;
+  const isVertexAi = provider.protocol === "vertex-ai";
   const mineruConfig = getMinerUConfig(draft.config);
   const activeMinerUBaseUrl =
     mineruConfig.mode === "flash" ? mineruConfig.flashBaseUrl : draft.baseUrl;
@@ -267,6 +279,17 @@ export function ProviderDetailsPanel({
                   </Button>
                 </div>
               </>
+            ) : isVertexAi ? (
+              <VertexAiConfigPanel
+                provider={provider}
+                draft={draft}
+                onDraftChange={onDraftChange}
+                onOpenHeaders={onOpenHeaders}
+                onOpenServiceAccountJson={onOpenServiceAccountJson}
+                onOpenPrivateKey={onOpenPrivateKey}
+                onUpdateConfig={onUpdateVertexAiConfig}
+                onError={onError}
+              />
             ) : (
               <>
                 <div className="grid gap-1">

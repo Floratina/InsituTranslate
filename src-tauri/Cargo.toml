@@ -15,12 +15,16 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 futures-util = "0.3"
 fontdb = "0.23"
+jsonwebtoken = "9"
+pdf_oxide = { version = "0.3", default-features = false }
+quick-xml = "0.36"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
 url = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }

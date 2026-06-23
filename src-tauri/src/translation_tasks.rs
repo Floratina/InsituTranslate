@@ -7,15 +7,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-use crate::adapters::{finish_reason_is_truncation, RateLimitTelemetry, RuntimeAdapter};
+use crate::adapters::{
+    finish_reason_is_truncation, ProviderChatError, ProviderChatMeta, RateLimitTelemetry,
+    RuntimeAdapter,
+};
 use crate::db;
+use crate::document_parsing::types::RenderedChunk;
+use crate::document_parsing::{self, restore_chunk_for_map};
 use crate::domain::{UnifiedChatRequest, UnifiedToolChoice};
 use crate::languages::{
     normalize_source_language, normalize_target_language, DEFAULT_SOURCE_LANGUAGE,
@@ -28,12 +33,12 @@ use crate::translation_prompt::{
 
 const CONFIG_DB_FILE: &str = "config.db";
 const TASKS_DIR: &str = "tasks";
-const DEFAULT_CHUNK_TOKEN_LIMIT: i64 = 4000;
+const DEFAULT_CHUNK_TOKEN_LIMIT: i64 = 800;
 const DEFAULT_MAX_CONCURRENCY: i64 = 5;
 const DEFAULT_MAX_RETRIES: i64 = 5;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: i64 = 60;
 const DEFAULT_MAX_TOKENS_PER_MINUTE: i64 = 60_000;
-const INP_SCHEMA_VERSION: i64 = 1;
+const INP_SCHEMA_VERSION: i64 = 3;
 const MAX_TASK_TAGS: usize = 12;
 const MAX_TASK_TAG_LENGTH: usize = 48;
 const MAX_TASK_NAME_LENGTH: usize = 120;
@@ -147,6 +152,25 @@ impl Default for GlossaryMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfidenceMode {
+    Off,
+    ConfidenceIndex,
+}
+
+impl ConfidenceMode {
+    fn enabled(self) -> bool {
+        self == Self::ConfidenceIndex
+    }
+}
+
+impl Default for ConfidenceMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenStats {
@@ -186,6 +210,7 @@ pub struct TranslationConfigView {
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
+    pub confidence_mode: ConfidenceMode,
 }
 
 impl Default for TranslationConfigView {
@@ -207,6 +232,7 @@ impl Default for TranslationConfigView {
             use_glossary: false,
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
+            confidence_mode: ConfidenceMode::Off,
         }
     }
 }
@@ -230,6 +256,8 @@ pub struct UpdateTranslationConfigInput {
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
+    #[serde(default)]
+    pub confidence_mode: ConfidenceMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,8 +368,12 @@ pub struct TranslationTaskView {
 pub struct TranslationChunkView {
     pub id: String,
     pub sequence: i64,
+    pub map_json: String,
+    pub preprocessed_text: String,
     pub source_text: String,
+    pub after_translate_text: String,
     pub translated_text: String,
+    pub confidence: Option<f64>,
     pub status: TranslationChunkStatus,
     pub retry_count: i64,
     pub error_message: Option<String>,
@@ -410,6 +442,7 @@ pub struct PreparedRun {
 struct ChunkRecord {
     id: String,
     source_text: String,
+    map_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -417,11 +450,13 @@ struct ChunkOutcome {
     chunk_id: String,
     status: TranslationChunkStatus,
     interrupt_task: bool,
+    after_translate_text: String,
     translated_text: String,
     retry_count: i64,
     error_message: Option<String>,
     token_stats: TokenStats,
     rate_limit_status: Option<String>,
+    confidence: Option<f64>,
 }
 
 pub fn default_workspace_root() -> PathBuf {
@@ -782,8 +817,12 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
         &[
             "id",
             "sequence",
+            "map_json",
+            "preprocessed_text",
             "source_text",
+            "after_translate_text",
             "translated_text",
+            "confidence",
             "status",
             "retry_count",
             "error_message",
@@ -810,8 +849,16 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
         .await
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     let schema_version: i64 = row.get("schema_version");
-    if schema_version != INP_SCHEMA_VERSION {
+    if !(1..=INP_SCHEMA_VERSION).contains(&schema_version) {
         return Err(INP_FILE_DAMAGED.into());
+    }
+    if schema_version >= 2 {
+        require_columns(
+            pool,
+            "chunks",
+            &["map_json", "preprocessed_text", "after_translate_text"],
+        )
+        .await?;
     }
     TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -910,6 +957,7 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             model_request_name TEXT NOT NULL,
             assistant_id TEXT,
             assistant_system_prompt TEXT,
+            assistant_custom_parameters_json TEXT NOT NULL DEFAULT '{}',
             tags_json TEXT NOT NULL DEFAULT '[]',
             token_limit INTEGER NOT NULL,
             max_concurrency INTEGER NOT NULL,
@@ -933,8 +981,12 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
         r#"CREATE TABLE IF NOT EXISTS chunks (
             id TEXT PRIMARY KEY NOT NULL,
             sequence INTEGER NOT NULL,
+            map_json TEXT NOT NULL DEFAULT '{}',
+            preprocessed_text TEXT NOT NULL DEFAULT '',
             source_text TEXT NOT NULL,
+            after_translate_text TEXT NOT NULL DEFAULT '',
             translated_text TEXT NOT NULL DEFAULT '',
+            confidence REAL DEFAULT NULL,
             status TEXT NOT NULL,
             retry_count INTEGER NOT NULL DEFAULT 0,
             error_message TEXT,
@@ -955,6 +1007,35 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     add_column_if_missing(pool, "metadata", "tags_json", "TEXT NOT NULL DEFAULT '[]'").await?;
+    add_column_if_missing(
+        pool,
+        "metadata",
+        "assistant_custom_parameters_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )
+    .await?;
+    add_column_if_missing(pool, "chunks", "map_json", "TEXT NOT NULL DEFAULT '{}'").await?;
+    add_column_if_missing(
+        pool,
+        "chunks",
+        "preprocessed_text",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "chunks",
+        "after_translate_text",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    add_column_if_missing(pool, "chunks", "confidence", "REAL DEFAULT NULL").await?;
+    sqlx::query("UPDATE metadata SET schema_version = ? WHERE schema_version < ?")
+        .bind(INP_SCHEMA_VERSION)
+        .bind(INP_SCHEMA_VERSION)
+        .execute(pool)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1078,6 +1159,7 @@ pub async fn update_translation_config(
             .glossary_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        confidence_mode: input.confidence_mode,
     };
     validate_translation_config(&config)?;
     let config_json = serde_json::to_string(&config).map_err(|error| error.to_string())?;
@@ -1114,33 +1196,27 @@ pub async fn create_translation_task(
     let tags_json = serialize_tags(&tags)?;
     let source_path = PathBuf::from(input.file_path.trim());
     validate_supported_source_file(&source_path)?;
-    let source_text = tokio::fs::read_to_string(&source_path)
-        .await
-        .map_err(|error| format!("Unable to read source file: {error}"))?;
     let model = db::get_model(provider_pool, &input.model_id).await?;
     if model.provider_id != input.provider_id {
         return Err("Selected model does not belong to the selected provider".into());
     }
-    let assistant_prompt = match input
+    let (assistant_prompt, assistant_custom_parameters) = match input
         .assistant_id
         .as_deref()
         .filter(|value| !value.is_empty())
     {
-        Some(id) => Some(db::get_assistant(provider_pool, id).await?.system_prompt),
-        None => None,
+        Some(id) => {
+            let assistant = db::get_assistant(provider_pool, id).await?;
+            (Some(assistant.system_prompt), assistant.custom_parameters)
+        }
+        None => (None, json!({})),
     };
     let config = get_translation_config(config_pool).await?;
     let task_id = db::new_id("task");
     let display_name = display_name_from_path(&source_path);
     let inp_path = next_inp_path(workspace_root, &display_name).await?;
-    let (document_format, content_format) = formats_from_path(&source_path)?;
-    let chunks = split_text_into_chunks(
-        &task_id,
-        &source_text,
-        config.chunk_token_limit,
-        document_format,
-        content_format,
-    );
+    let chunks =
+        document_parsing::parse_source_file(&task_id, &source_path, config.chunk_token_limit)?;
     let created_at = unix_timestamp();
     let inp_pool = connect_inp(&inp_path).await?;
     let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
@@ -1148,10 +1224,11 @@ pub async fn create_translation_task(
     sqlx::query(
         "INSERT INTO metadata (
             task_id, schema_version, name, source_path, source_language, target_language, status,
-            progress, provider_id, model_id, model_request_name, assistant_id, assistant_system_prompt, tags_json,
+            progress, provider_id, model_id, model_request_name, assistant_id, assistant_system_prompt,
+            assistant_custom_parameters_json, tags_json,
             token_limit, max_concurrency, max_retries, config_snapshot_json, total_chunks,
             created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&task_id)
     .bind(INP_SCHEMA_VERSION)
@@ -1165,6 +1242,7 @@ pub async fn create_translation_task(
     .bind(&model.request_name)
     .bind(input.assistant_id.as_deref().filter(|value| !value.is_empty()))
     .bind(assistant_prompt.as_deref())
+    .bind(assistant_custom_parameters.to_string())
     .bind(tags_json)
     .bind(config.chunk_token_limit)
     .bind(config.max_concurrency)
@@ -1180,12 +1258,15 @@ pub async fn create_translation_task(
     for chunk in chunks {
         sqlx::query(
             "INSERT INTO chunks (
-                id, sequence, source_text, translated_text, status, retry_count,
+                id, sequence, map_json, preprocessed_text, source_text,
+                after_translate_text, translated_text, status, retry_count,
                 input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens, updated_at
-             ) VALUES (?, ?, ?, '', ?, 0, 0, 0, 0, 0, 0, ?)",
+             ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?)",
         )
-        .bind(chunk.id)
+        .bind(format!("{task_id}_chunk_{:06}", chunk.sequence))
         .bind(chunk.sequence)
+        .bind(chunk.map_json)
+        .bind(chunk.preprocessed_text)
         .bind(chunk.source_text)
         .bind(TranslationChunkStatus::Pending.as_str())
         .bind(&created_at)
@@ -1348,7 +1429,7 @@ pub async fn export_translation_task(
         .try_into()
         .map_err(|error| format!("Unable to resolve export path: {error}"))?;
     let inp_pool = connect_inp(Path::new(&task.inp_path)).await?;
-    let output = translated_source_text(&inp_pool).await?;
+    let output = rendered_task_document(&inp_pool, Path::new(&task.source_path)).await?;
     inp_pool.close().await;
     tokio::fs::write(&save_path, output)
         .await
@@ -1357,6 +1438,37 @@ pub async fn export_translation_task(
     Ok(())
 }
 
+async fn rendered_task_document(
+    inp_pool: &SqlitePool,
+    source_path: &Path,
+) -> Result<Vec<u8>, String> {
+    let rows = sqlx::query(
+        "SELECT sequence, source_text, translated_text, map_json FROM chunks ORDER BY sequence",
+    )
+    .fetch_all(inp_pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let chunks = rows
+        .iter()
+        .map(|row| {
+            let translated_text: String = row.get("translated_text");
+            let source_text: String = row.get("source_text");
+            RenderedChunk {
+                sequence: row.get("sequence"),
+                source_text: source_text.clone(),
+                translated_text: if translated_text.is_empty() {
+                    source_text
+                } else {
+                    translated_text
+                },
+                map_json: row.get("map_json"),
+            }
+        })
+        .collect::<Vec<_>>();
+    document_parsing::render_translated_document(source_path, &chunks)
+}
+
+#[cfg(test)]
 async fn translated_source_text(inp_pool: &SqlitePool) -> Result<String, String> {
     let rows = sqlx::query("SELECT source_text, translated_text FROM chunks ORDER BY sequence")
         .fetch_all(inp_pool)
@@ -1456,7 +1568,7 @@ pub async fn prepare_translation_run(
         RunMode::Resume => {
             sqlx::query(
                 "UPDATE chunks
-                 SET status = ?, error_message = NULL, updated_at = ?
+                 SET status = ?, error_message = NULL, confidence = NULL, updated_at = ?
                  WHERE status IN (?, ?)",
             )
             .bind(TranslationChunkStatus::Pending.as_str())
@@ -1468,17 +1580,8 @@ pub async fn prepare_translation_run(
             .map_err(|error| error.to_string())?;
         }
         RunMode::Retranslate => {
-            sqlx::query(
-                "UPDATE chunks
-                 SET translated_text = '', status = ?, retry_count = 0, error_message = NULL,
-                     input_tokens = 0, output_tokens = 0, cached_tokens = 0,
-                     thinking_tokens = 0, total_tokens = 0, updated_at = ?",
-            )
-            .bind(TranslationChunkStatus::Pending.as_str())
-            .bind(&now)
-            .execute(&inp_pool)
-            .await
-            .map_err(|error| error.to_string())?;
+            rebuild_chunks_for_retranslate(&inp_pool, &indexed, config.chunk_token_limit, &now)
+                .await?;
         }
     }
     sqlx::query(
@@ -1508,6 +1611,45 @@ pub async fn prepare_translation_run(
         inp_path,
         config,
     })
+}
+
+async fn rebuild_chunks_for_retranslate(
+    inp_pool: &SqlitePool,
+    indexed: &TranslationTaskView,
+    token_limit: i64,
+    now: &str,
+) -> Result<(), String> {
+    let source_path = PathBuf::from(&indexed.source_path);
+    let chunks = document_parsing::parse_source_file(&indexed.id, &source_path, token_limit)?;
+    let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
+    sqlx::query("DELETE FROM chunks")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+    for chunk in chunks {
+        sqlx::query(
+            "INSERT INTO chunks (
+                id, sequence, map_json, preprocessed_text, source_text,
+                after_translate_text, translated_text, status, retry_count,
+                input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens, updated_at
+             ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?)",
+        )
+        .bind(format!("{}_chunk_{:06}", indexed.id, chunk.sequence))
+        .bind(chunk.sequence)
+        .bind(chunk.map_json)
+        .bind(chunk.preprocessed_text)
+        .bind(chunk.source_text)
+        .bind(TranslationChunkStatus::Pending.as_str())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub async fn run_translation_task(
@@ -1540,6 +1682,7 @@ pub async fn run_translation_task(
     let config = db::runtime_config(&provider_pool, &task.provider_id).await?;
     let adapter = Arc::new(RuntimeAdapter::new(client, config));
     let assistant_prompt = task_assistant_prompt(&inp_pool).await?;
+    let assistant_custom_parameters = task_assistant_custom_parameters(&inp_pool).await?;
     let dynamic_rate_limit = prepared.config.rate_limit_strategy == RateLimitStrategy::Dynamic;
     let limiter = Arc::new(AdaptiveLimiter::new(
         prepared.config.max_concurrency as usize,
@@ -1573,6 +1716,7 @@ pub async fn run_translation_task(
     });
     let max_concurrency = prepared.config.max_concurrency.max(1) as usize;
     let max_retries = prepared.config.max_retries.max(0) as u32;
+    let confidence_mode = prepared.config.confidence_mode;
     let target_language = task.target_language.clone();
     let document_format = document_format_from_source_path(&task.source_path)?;
     let content_format = content_format_from_source_path(&task.source_path)?;
@@ -1588,6 +1732,7 @@ pub async fn run_translation_task(
             let model_request_name = model.request_name.clone();
             let target_language = target_language.clone();
             let assistant_prompt = assistant_prompt.clone();
+            let assistant_custom_parameters = assistant_custom_parameters.clone();
             async move {
                 if interrupted.is_interrupted() {
                     return;
@@ -1603,10 +1748,12 @@ pub async fn run_translation_task(
                     model_request_name,
                     target_language,
                     assistant_prompt,
+                    assistant_custom_parameters,
                     document_format,
                     content_format,
                     chunk,
                     max_retries,
+                    confidence_mode,
                     quota,
                     limiter.clone(),
                     manual_limiter,
@@ -1680,10 +1827,12 @@ async fn translate_chunk(
     model_request_name: String,
     target_language: String,
     assistant_prompt: Option<String>,
+    assistant_custom_parameters: Value,
     document_format: DocumentFormat,
     content_format: ContentFormat,
     chunk: ChunkRecord,
     max_retries: u32,
+    confidence_mode: ConfidenceMode,
     quota: Arc<HeaderQuotaPolicy>,
     limiter: Arc<AdaptiveLimiter>,
     manual_limiter: Option<Arc<ManualRateLimiter>>,
@@ -1705,15 +1854,32 @@ async fn translate_chunk(
         });
         let messages = match prompt {
             Ok(TranslationPromptBuildResult::Passthrough { text }) => {
+                let translated_text = match restore_chunk_for_map(&chunk.map_json, &text) {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        return failed_outcome(
+                            chunk,
+                            TranslationChunkStatus::Failed,
+                            retry_count,
+                            Some(error),
+                            Some(text),
+                            last_stats,
+                            None,
+                            false,
+                        );
+                    }
+                };
                 return ChunkOutcome {
                     chunk_id: chunk.id,
                     status: TranslationChunkStatus::Success,
                     interrupt_task: false,
-                    translated_text: text,
+                    after_translate_text: text,
+                    translated_text,
                     retry_count,
                     error_message: None,
                     token_stats: TokenStats::default(),
                     rate_limit_status: None,
+                    confidence: None,
                 };
             }
             Ok(TranslationPromptBuildResult::Request { messages }) => messages,
@@ -1739,13 +1905,24 @@ async fn translate_chunk(
             max_output_tokens: None,
             temperature: Some(0.0),
             stream: false,
+            logprobs: confidence_mode.enabled(),
+            custom_parameters: assistant_custom_parameters.clone(),
         };
         let estimated_tokens = estimate_tokens(&chunk.source_text) + 256;
         if let Some(manual_limiter) = manual_limiter.as_ref() {
             manual_limiter.before_request(estimated_tokens).await;
         }
         quota.before_request(estimated_tokens).await;
-        match adapter.send_chat_with_meta(&request).await {
+        match send_chat_with_logprobs_fallback(
+            &adapter,
+            &request,
+            estimated_tokens,
+            &quota,
+            &limiter,
+            manual_limiter.as_ref(),
+        )
+        .await
+        {
             Ok(meta) => {
                 quota.update(&meta.rate_limits).await;
                 limiter
@@ -1762,6 +1939,14 @@ async fn translate_chunk(
                 stats.total_tokens =
                     stats.input_tokens + stats.output_tokens + stats.thinking_tokens;
                 last_stats = stats.clone();
+                let confidence = if request.logprobs {
+                    meta.response
+                        .logprob_stats
+                        .as_ref()
+                        .map(|stats| stats.confidence)
+                } else {
+                    None
+                };
                 let text = meta.response.text;
                 let rate_status =
                     current_rate_limit_status(&meta.rate_limits, &limiter, &manual_limiter).await;
@@ -1823,15 +2008,36 @@ async fn translate_chunk(
                     }
                     continue;
                 }
+                let translated_text = match restore_chunk_for_map(&chunk.map_json, &text) {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt == max_retries {
+                            return failed_outcome(
+                                chunk,
+                                TranslationChunkStatus::Failed,
+                                retry_count,
+                                last_error,
+                                last_text,
+                                last_stats,
+                                rate_status,
+                                false,
+                            );
+                        }
+                        continue;
+                    }
+                };
                 return ChunkOutcome {
                     chunk_id: chunk.id,
                     status: TranslationChunkStatus::Success,
                     interrupt_task: false,
-                    translated_text: text,
+                    after_translate_text: text,
+                    translated_text,
                     retry_count,
                     error_message: None,
                     token_stats: stats,
                     rate_limit_status: rate_status,
+                    confidence,
                 };
             }
             Err(error) => {
@@ -1886,6 +2092,43 @@ async fn translate_chunk(
     )
 }
 
+async fn send_chat_with_logprobs_fallback(
+    adapter: &RuntimeAdapter,
+    request: &UnifiedChatRequest,
+    estimated_tokens: u64,
+    quota: &HeaderQuotaPolicy,
+    limiter: &AdaptiveLimiter,
+    manual_limiter: Option<&Arc<ManualRateLimiter>>,
+) -> Result<ProviderChatMeta, ProviderChatError> {
+    match adapter.send_chat_with_meta(request).await {
+        Ok(meta) => Ok(meta),
+        Err(error) if request.logprobs && logprobs_parameter_rejected(&error) => {
+            quota.update(&error.rate_limits).await;
+            limiter
+                .on_result(
+                    error.rate_limits.has_quota_headers(),
+                    false,
+                    error.is_rate_limited(),
+                )
+                .await;
+            let mut fallback = request.clone();
+            fallback.logprobs = false;
+            if let Some(manual_limiter) = manual_limiter {
+                manual_limiter.before_request(estimated_tokens).await;
+            }
+            quota.before_request(estimated_tokens).await;
+            adapter.send_chat_with_meta(&fallback).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn logprobs_parameter_rejected(error: &ProviderChatError) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    matches!(error.status, Some(400) | Some(404) | Some(422))
+        && (message.contains("logprob") || message.contains("log_probs"))
+}
+
 fn failed_outcome(
     chunk: ChunkRecord,
     status: TranslationChunkStatus,
@@ -1905,22 +2148,27 @@ fn failed_outcome(
         chunk_id: chunk.id,
         status,
         interrupt_task,
+        after_translate_text: translated_text
+            .clone()
+            .unwrap_or_else(|| chunk.source_text.clone()),
         translated_text: translated_text.unwrap_or(chunk.source_text),
         retry_count,
         error_message,
         token_stats,
         rate_limit_status,
+        confidence: None,
     }
 }
 
 async fn apply_chunk_outcome(pool: &SqlitePool, outcome: ChunkOutcome) -> Result<(), String> {
     sqlx::query(
         "UPDATE chunks
-         SET translated_text = ?, status = ?, retry_count = ?, error_message = ?,
+         SET after_translate_text = ?, translated_text = ?, status = ?, retry_count = ?, error_message = ?,
              input_tokens = ?, output_tokens = ?, cached_tokens = ?, thinking_tokens = ?,
-             total_tokens = ?, updated_at = ?
+             total_tokens = ?, confidence = ?, updated_at = ?
          WHERE id = ?",
     )
+    .bind(outcome.after_translate_text)
     .bind(outcome.translated_text)
     .bind(outcome.status.as_str())
     .bind(outcome.retry_count)
@@ -1930,6 +2178,7 @@ async fn apply_chunk_outcome(pool: &SqlitePool, outcome: ChunkOutcome) -> Result
     .bind(outcome.token_stats.cached_tokens as i64)
     .bind(outcome.token_stats.thinking_tokens as i64)
     .bind(outcome.token_stats.total_tokens as i64)
+    .bind(outcome.confidence)
     .bind(unix_timestamp())
     .bind(outcome.chunk_id)
     .execute(pool)
@@ -2238,8 +2487,12 @@ fn chunk_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranslationChunkView,
     Ok(TranslationChunkView {
         id: row.get("id"),
         sequence: row.get("sequence"),
+        map_json: row.get("map_json"),
+        preprocessed_text: row.get("preprocessed_text"),
         source_text: row.get("source_text"),
+        after_translate_text: row.get("after_translate_text"),
         translated_text: row.get("translated_text"),
+        confidence: row.get("confidence"),
         status: TranslationChunkStatus::parse(row.get::<String, _>("status").as_str())?,
         retry_count: row.get("retry_count"),
         error_message: row.get("error_message"),
@@ -2256,7 +2509,7 @@ fn chunk_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranslationChunkView,
 
 async fn pending_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>, String> {
     let rows = sqlx::query(
-        "SELECT id, sequence, source_text FROM chunks WHERE status = ? ORDER BY sequence",
+        "SELECT id, sequence, source_text, map_json FROM chunks WHERE status = ? ORDER BY sequence",
     )
     .bind(TranslationChunkStatus::Pending.as_str())
     .fetch_all(pool)
@@ -2267,6 +2520,7 @@ async fn pending_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>, String> {
         .map(|row| ChunkRecord {
             id: row.get("id"),
             source_text: row.get("source_text"),
+            map_json: row.get("map_json"),
         })
         .collect())
 }
@@ -2279,6 +2533,27 @@ async fn task_assistant_prompt(pool: &SqlitePool) -> Result<Option<String>, Stri
             .map_err(|error| error.to_string())?
             .flatten();
     Ok(prompt)
+}
+
+async fn task_assistant_custom_parameters(pool: &SqlitePool) -> Result<Value, String> {
+    let json: Option<String> =
+        sqlx::query_scalar("SELECT assistant_custom_parameters_json FROM metadata LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| error.to_string())?
+            .flatten();
+    match json {
+        Some(value) if !value.trim().is_empty() => {
+            let parsed = serde_json::from_str::<Value>(&value)
+                .map_err(|error| format!("Assistant custom parameters JSON is invalid: {error}"))?;
+            if parsed.is_object() {
+                Ok(parsed)
+            } else {
+                Ok(json!({}))
+            }
+        }
+        _ => Ok(json!({})),
+    }
 }
 
 fn token_stats_from_response(
@@ -2319,6 +2594,7 @@ fn config_snapshot_json(
         "rateLimitStrategy": config.rate_limit_strategy,
         "maxRequestsPerMinute": config.max_requests_per_minute,
         "maxTokensPerMinute": config.max_tokens_per_minute,
+        "confidenceMode": config.confidence_mode,
         "providerId": provider_id,
         "modelId": model_id
     })
@@ -2411,29 +2687,15 @@ fn validate_task_name(value: &str) -> Result<String, String> {
 }
 
 fn validate_supported_source_file(path: &Path) -> Result<(), String> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "txt" | "md" => Ok(()),
-        _ => Err("V1 translation tasks support .txt and .md files only".into()),
+    if document_parsing::supported_source_file(path) {
+        Ok(())
+    } else {
+        Err("Unsupported source document format".into())
     }
 }
 
 fn source_extension(path: &str) -> Result<&'static str, String> {
-    match Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "md" => Ok("md"),
-        "txt" => Ok("txt"),
-        _ => Err("Unsupported source document format".into()),
-    }
+    document_parsing::source_extension(path)
 }
 
 fn export_file_name(output_name: &str, fallback_name: &str, extension: &str) -> String {
@@ -2445,48 +2707,22 @@ fn export_file_name(output_name: &str, fallback_name: &str, extension: &str) -> 
     format!("{base}.{extension}")
 }
 
-fn formats_from_path(path: &Path) -> Result<(DocumentFormat, ContentFormat), String> {
-    Ok((
-        document_format_from_source_path(&path.to_string_lossy())?,
-        content_format_from_source_path(&path.to_string_lossy())?,
-    ))
-}
-
 fn document_format_from_source_path(path: &str) -> Result<DocumentFormat, String> {
-    match Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "md" => Ok(DocumentFormat::Markdown),
-        "txt" => Ok(DocumentFormat::Txt),
-        _ => Err("Unsupported source document format".into()),
-    }
+    document_parsing::document_format_from_path(Path::new(path))
 }
 
 fn content_format_from_source_path(path: &str) -> Result<ContentFormat, String> {
-    match Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "md" => Ok(ContentFormat::Markdown),
-        "txt" => Ok(ContentFormat::PlainText),
-        _ => Err("Unsupported source content format".into()),
-    }
+    document_parsing::content_format_from_path(Path::new(path))
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct RawChunk {
-    id: String,
     sequence: i64,
     source_text: String,
 }
 
+#[cfg(test)]
 fn split_text_into_chunks(
     task_id: &str,
     text: &str,
@@ -2522,6 +2758,7 @@ fn split_text_into_chunks(
     chunks
 }
 
+#[cfg(test)]
 fn split_long_segment(segment: &str, max_chars: usize) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -2537,10 +2774,11 @@ fn split_long_segment(segment: &str, max_chars: usize) -> Vec<String> {
     parts
 }
 
+#[cfg(test)]
 fn push_raw_chunk(task_id: &str, chunks: &mut Vec<RawChunk>, source_text: String) {
     let sequence = chunks.len() as i64;
+    let _ = task_id;
     chunks.push(RawChunk {
-        id: format!("{task_id}_chunk_{sequence:06}"),
         sequence,
         source_text,
     });
@@ -2921,10 +3159,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn temp_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "insitu-test-{label}-{}",
-            db::new_id("workspace")
-        ))
+        std::env::temp_dir().join(format!("insitu-test-{label}-{}", db::new_id("workspace")))
     }
 
     async fn write_test_inp(path: &Path, task_id: &str, name: &str) -> Result<(), String> {
@@ -2987,6 +3222,94 @@ mod tests {
 
         pool.close().await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn inp_migration_adds_confidence_column() {
+        let root = temp_root("confidence-migration");
+        let inp_path = root.join("legacy.inp");
+        if let Some(parent) = inp_path.parent() {
+            tokio::fs::create_dir_all(parent).await.expect("mkdir");
+        }
+        let pool = connect_sqlite(&inp_path, 1).await.expect("connect");
+        sqlx::query(
+            r#"CREATE TABLE chunks (
+                id TEXT PRIMARY KEY NOT NULL,
+                sequence INTEGER NOT NULL,
+                source_text TEXT NOT NULL,
+                translated_text TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
+                thinking_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy chunks");
+        pool.close().await;
+
+        let migrated = connect_inp(&inp_path).await.expect("migrate");
+        let columns = sqlx::query("PRAGMA table_info(chunks)")
+            .fetch_all(&migrated)
+            .await
+            .expect("columns");
+        assert!(columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "confidence"));
+        migrated.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn apply_chunk_outcome_writes_confidence() {
+        let root = temp_root("confidence-write");
+        let inp_path = root.join("task.inp");
+        write_test_inp(&inp_path, "task-confidence", "Confidence")
+            .await
+            .expect("write inp");
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        apply_chunk_outcome(
+            &pool,
+            ChunkOutcome {
+                chunk_id: "task-confidence-chunk-0".into(),
+                status: TranslationChunkStatus::Success,
+                interrupt_task: false,
+                after_translate_text: "你好".into(),
+                translated_text: "你好".into(),
+                retry_count: 0,
+                error_message: None,
+                token_stats: TokenStats::default(),
+                rate_limit_status: None,
+                confidence: Some(0.875),
+            },
+        )
+        .await
+        .expect("apply outcome");
+        let confidence: Option<f64> =
+            sqlx::query_scalar("SELECT confidence FROM chunks WHERE id = ?")
+                .bind("task-confidence-chunk-0")
+                .fetch_one(&pool)
+                .await
+                .expect("confidence");
+        assert_eq!(confidence, Some(0.875));
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn detects_logprobs_parameter_rejection() {
+        let error = ProviderChatError {
+            status: Some(400),
+            message: "Unrecognized request argument supplied: logprobs".into(),
+            rate_limits: RateLimitTelemetry::default(),
+        };
+        assert!(logprobs_parameter_rejected(&error));
     }
 
     #[test]
@@ -3064,9 +3387,13 @@ mod tests {
         assert_eq!(task.tags, vec!["review".to_string(), "client".to_string()]);
 
         let missing_chunks_path = root.join("missing-chunks.inp");
-        write_test_inp(&missing_chunks_path, "task-missing-chunks", "Missing Chunks")
-            .await
-            .expect("write inp before damage");
+        write_test_inp(
+            &missing_chunks_path,
+            "task-missing-chunks",
+            "Missing Chunks",
+        )
+        .await
+        .expect("write inp before damage");
         let pool = connect_sqlite(&missing_chunks_path, 1)
             .await
             .expect("open damaged inp");
@@ -3206,6 +3533,7 @@ mod tests {
         assert!(!config.use_glossary);
         assert_eq!(config.glossary_mode, GlossaryMode::Auto);
         assert_eq!(config.glossary_id, None);
+        assert_eq!(config.confidence_mode, ConfidenceMode::Off);
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3257,6 +3585,7 @@ mod tests {
                 use_glossary: true,
                 glossary_mode: GlossaryMode::Auto,
                 glossary_id: None,
+                confidence_mode: ConfidenceMode::ConfidenceIndex,
             },
         )
         .await
@@ -3279,6 +3608,7 @@ mod tests {
         assert_eq!(persisted.rate_limit_strategy, RateLimitStrategy::Manual);
         assert!(persisted.use_glossary);
         assert_eq!(persisted.glossary_mode, GlossaryMode::Auto);
+        assert_eq!(persisted.confidence_mode, ConfidenceMode::ConfidenceIndex);
         migrated_pool.close().await;
 
         let final_pool = connect_config_db(&root).await.expect("final reconnect");
@@ -3299,6 +3629,10 @@ mod tests {
         assert_eq!(final_config.max_requests_per_minute, 90);
         assert!(final_config.use_glossary);
         assert_eq!(final_config.glossary_mode, GlossaryMode::Auto);
+        assert_eq!(
+            final_config.confidence_mode,
+            ConfidenceMode::ConfidenceIndex
+        );
         final_pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }

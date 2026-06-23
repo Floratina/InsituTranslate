@@ -13,6 +13,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   Check,
   ChevronDown,
+  FileCheck2,
   FileText,
   Gauge,
   BookOpen,
@@ -28,6 +29,7 @@ import { motion } from "motion/react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { HelpTooltip } from "@/components/ui/help-tooltip";
 import {
   Card,
   CardContent,
@@ -71,6 +73,7 @@ import {
 import { LanguageSettingsCard } from "@/features/translation/LanguageSettingsCard";
 import { ModelAssistantSettingsCard } from "@/features/translation/ModelAssistantSettingsCard";
 import type {
+  ConfidenceMode,
   RateLimitStrategy,
   TranslationConfigView,
 } from "@/features/translation/types";
@@ -88,6 +91,11 @@ interface RateLimitOption {
   icon: LucideIcon;
 }
 
+interface ConfidenceOption {
+  value: ConfidenceMode;
+  label: string;
+}
+
 type NumericConfigKey =
   | "chunkTokenLimit"
   | "maxConcurrency"
@@ -103,7 +111,7 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   providerId: "",
   modelId: "",
   assistantId: "__none__",
-  chunkTokenLimit: 4000,
+  chunkTokenLimit: 800,
   maxConcurrency: 5,
   maxRetries: 5,
   rateLimitStrategy: "dynamic",
@@ -112,7 +120,13 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   useGlossary: false,
   glossaryMode: "auto",
   glossaryId: null,
+  confidenceMode: "off",
 };
+
+const CONFIDENCE_OPTIONS: ConfidenceOption[] = [
+  { value: "off", label: "关闭" },
+  { value: "confidence-index", label: "综合置信度指数" },
+];
 
 const RATE_LIMIT_OPTIONS: RateLimitOption[] = [
   {
@@ -131,7 +145,20 @@ const RATE_LIMIT_OPTIONS: RateLimitOption[] = [
 
 const START_GLOSSARY_ALL_VALUE = "__all__";
 const START_GLOSSARY_WIDTHS = [320, 84, 220, 260];
-const SUPPORTED_EXTENSIONS = new Set(["txt", "md"]);
+const SUPPORTED_EXTENSIONS = new Set([
+  "pdf",
+  "md",
+  "epub",
+  "html",
+  "htm",
+  "txt",
+  "docx",
+  "xlsx",
+  "json",
+  "srt",
+  "ass",
+  "lrc",
+]);
 
 function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -165,6 +192,17 @@ function normalizeGlossaryConfig(
   };
 }
 
+function normalizeStartConfig(
+  config: TranslationConfigView,
+  glossaries?: GlossaryView[],
+): TranslationConfigView {
+  const withDefaults: TranslationConfigView = {
+    ...config,
+    confidenceMode: config.confidenceMode ?? "off",
+  };
+  return glossaries ? normalizeGlossaryConfig(withDefaults, glossaries) : withDefaults;
+}
+
 export default function StartPage({ onTaskCreated }: StartPageProps) {
   const cachedDraft = appSessionCache.startDraft.read();
   const cachedProviderOptions = appSessionCache.providers("translation").read();
@@ -173,9 +211,9 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   const cachedGlossaries = cachedGlossaryIndex?.filterSeed;
   const cachedConfig = cachedDraft?.config ?? appSessionCache.translationConfig.read();
   const initialConfig =
-    cachedConfig && cachedGlossaries
-      ? normalizeGlossaryConfig(cachedConfig, cachedGlossaries)
-      : (cachedDraft?.config ?? DEFAULT_CONFIG);
+    cachedConfig
+      ? normalizeStartConfig(cachedConfig, cachedGlossaries)
+      : normalizeStartConfig(cachedDraft?.config ?? DEFAULT_CONFIG);
   const hasCachedOptions = Boolean(
     cachedDraft ||
       (cachedProviderOptions && cachedAssistantOptions && cachedGlossaries && cachedConfig),
@@ -228,7 +266,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     const supported = paths.filter(supportedFile);
     setFilePaths((current) => Array.from(new Set([...current, ...supported])));
     if (paths.length > supported.length) {
-      pushToast("已忽略不受支持的文件，目前仅支持 .txt 和 .md", "warning");
+      pushToast("已忽略不受支持的文件", "warning");
     }
   }, [pushToast]);
 
@@ -467,7 +505,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
 
   async function createTasks(): Promise<void> {
     if (filePaths.length === 0) {
-      pushToast("请先添加至少一个 .txt 或 .md 文件", "warning");
+      pushToast("请先添加至少一个支持的文件", "warning");
       return;
     }
     if (!providerId || !modelId) {
@@ -567,7 +605,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
                   拖拽文件到这里，或点击选择文件
                 </span>
                 <span className="text-xs text-muted-foreground">
-                  支持批量添加 .txt 与 .md 文件，每个文件会创建一个任务
+                  支持批量添加 PDF、Markdown、EPUB、HTML、TXT、DOCX、XLSX、JSON、字幕与歌词文件
                 </span>
               </motion.button>
 
@@ -639,7 +677,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
               </div>
             </CardHeader>
             <CardContent className="grid gap-3 px-3">
-              <div className="grid gap-3 md:grid-cols-2">
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                 <section className="grid content-start gap-3 rounded-[6px] border bg-muted/15 p-3">
                   <div>
                     <div className="text-xs font-medium">基础参数</div>
@@ -745,6 +783,45 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
                       />
                     </div>
                   )}
+                </section>
+
+                <section className="grid content-start gap-3 rounded-[6px] border bg-muted/15 p-3">
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <FileCheck2 className="size-3.5 text-primary" />
+                      <div className="text-xs font-medium">校对</div>
+                      <HelpTooltip contentClassName="max-w-80">
+                        具体支持情况根据提供商而定。
+                      </HelpTooltip>
+                    </div>
+                    <p className="mt-0.5 text-2xs text-muted-foreground">
+                      记录每个分块的模型置信度，供后续校对筛选使用。
+                    </p>
+                  </div>
+                  <div className="grid gap-2">
+                    <Label>置信度检测</Label>
+                    <Select
+                      value={config.confidenceMode}
+                      onValueChange={(value) =>
+                        setConfig((current) => ({
+                          ...current,
+                          confidenceMode: value as ConfidenceMode,
+                        }))
+                      }
+                      disabled={loading}
+                    >
+                      <SelectTrigger className="h-8 rounded-[6px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {CONFIDENCE_OPTIONS.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </section>
               </div>
             </CardContent>

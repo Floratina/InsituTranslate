@@ -8,6 +8,7 @@ pub enum ProviderProtocol {
     OpenaiResponses,
     Anthropic,
     Gemini,
+    VertexAi,
     Ollama,
 }
 
@@ -18,6 +19,7 @@ impl ProviderProtocol {
             Self::OpenaiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
+            Self::VertexAi => "vertex-ai",
             Self::Ollama => "ollama",
         }
     }
@@ -28,6 +30,7 @@ impl ProviderProtocol {
             "openai-responses" => Ok(Self::OpenaiResponses),
             "anthropic" => Ok(Self::Anthropic),
             "gemini" => Ok(Self::Gemini),
+            "vertex-ai" => Ok(Self::VertexAi),
             "ollama" => Ok(Self::Ollama),
             _ => Err(format!("Unsupported provider protocol: {value}")),
         }
@@ -235,6 +238,26 @@ pub struct UpdateProviderConfigInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdateVertexAiConfigInput {
+    pub provider_id: String,
+    pub project_id: String,
+    pub location: String,
+    pub client_email: String,
+    #[serde(default)]
+    pub private_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportVertexAiServiceAccountInput {
+    pub provider_id: String,
+    pub service_account_json: String,
+    #[serde(default)]
+    pub location: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateProviderMetadataInput {
     pub id: String,
     pub name: String,
@@ -398,6 +421,14 @@ pub struct UnifiedChatRequest {
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f64>,
     pub stream: bool,
+    #[serde(default)]
+    pub logprobs: bool,
+    #[serde(default = "default_custom_parameters")]
+    pub custom_parameters: Value,
+}
+
+fn default_custom_parameters() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,12 +441,22 @@ pub struct UnifiedUsage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LogprobStats {
+    pub token_count: u64,
+    pub average_probability: f64,
+    pub standard_deviation: f64,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UnifiedChatResponse {
     pub text: String,
     pub reasoning: String,
     pub thinking: Vec<UnifiedContent>,
     pub tool_calls: Vec<UnifiedContent>,
     pub usage: Option<UnifiedUsage>,
+    pub logprob_stats: Option<LogprobStats>,
     pub raw: Value,
 }
 

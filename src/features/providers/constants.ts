@@ -30,6 +30,7 @@ export const BUILTIN_AVATARS = new Set([
   "ollama",
   "openrouter",
   "mineru",
+  "vertex-ai",
 ]);
 
 export const AVATAR_LIBRARY: Array<{ name: string; src: string }> = ([
@@ -55,6 +56,7 @@ export const AVATAR_LIBRARY: Array<{ name: string; src: string }> = ([
   ["Perplexity", "perplexity-BwIm93Ua.png"], ["PH8", "ph8-JO6U1vW7.png"],
   ["Qwen", "qwen-2vDMq7H8.png"],
   ["Together AI", "together-0h26j0S1.png"], ["TokenFlux", "tokenflux-CvotEeez.png"],
+  ["Vertex AI", "vertex-ai-O6Mq7HyP.png"],
   ["Volcengine", "volcengine-la_PI8m-.png"], ["Voyage AI", "voyageai-UINPkc3N.png"],
   ["Xirang", "xirang-B42-6Dao.png"], ["Zero One", "zero-one-CLSpCDeh.png"],
   ["Zhipu AI", "zhipu-CFgqzqwQ.png"],

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -16,12 +16,12 @@ use crate::adapters::{ProviderAdapter, RuntimeAdapter};
 use crate::db;
 use crate::domain::{
     AddModelInput, AssistantView, ConnectivityResult, CopyAssistantInput, CopyProviderInput,
-    CreateAssistantInput, CreateProviderInput, ModelView, ProviderPurpose, ProviderRuntimeConfig,
-    ProviderView, RemoteModel, ReorderAssistantsInput, ReorderProvidersInput,
-    SetProviderEnabledInput, UnifiedChatRequest, UnifiedChatResponse, UnifiedContent,
-    UnifiedMessage, UnifiedToolChoice, UpdateAssistantCustomParametersInput,
+    CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput, ModelView,
+    ProviderPurpose, ProviderRuntimeConfig, ProviderView, RemoteModel, ReorderAssistantsInput,
+    ReorderProvidersInput, SetProviderEnabledInput, UnifiedChatRequest, UnifiedChatResponse,
+    UnifiedContent, UnifiedMessage, UnifiedToolChoice, UpdateAssistantCustomParametersInput,
     UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
-    UpdateProviderConfigInput, UpdateProviderMetadataInput,
+    UpdateProviderConfigInput, UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
 };
 use crate::glossaries::{
     self, CreateGlossaryEntryInput, DeleteGlossaryEntryInput, ExportGlossaryInput,
@@ -135,6 +135,30 @@ pub async fn update_provider_config(
     input: UpdateProviderConfigInput,
 ) -> Result<ProviderView, String> {
     db::update_provider_config(&state.pool, input).await
+}
+
+#[tauri::command]
+pub async fn update_vertex_ai_config(
+    state: State<'_, AppState>,
+    input: UpdateVertexAiConfigInput,
+) -> Result<ProviderView, String> {
+    db::update_vertex_ai_config(&state.pool, input).await
+}
+
+#[tauri::command]
+pub async fn import_vertex_ai_service_account(
+    state: State<'_, AppState>,
+    input: ImportVertexAiServiceAccountInput,
+) -> Result<ProviderView, String> {
+    db::import_vertex_ai_service_account(&state.pool, input).await
+}
+
+#[tauri::command]
+pub async fn get_vertex_ai_private_key(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<Option<String>, String> {
+    db::get_vertex_ai_private_key(&state.pool, &provider_id).await
 }
 
 #[tauri::command]
@@ -274,6 +298,8 @@ pub async fn test_model_connectivity(
         max_output_tokens: Some(8),
         temperature: Some(0.0),
         stream: false,
+        logprobs: false,
+        custom_parameters: json!({}),
     };
     let started = Instant::now();
     let result = adapter.send_chat(&request).await;
@@ -515,10 +541,15 @@ pub async fn start_translation_tasks_batch(
     {
         let running = state.running_translation_task.lock().await;
         if let Some(current) = running.as_ref() {
-            return Err(format!("Translation task {} is already running", current.id));
+            return Err(format!(
+                "Translation task {} is already running",
+                current.id
+            ));
         }
     }
-    state.translation_batch_cancel.store(false, Ordering::SeqCst);
+    state
+        .translation_batch_cancel
+        .store(false, Ordering::SeqCst);
     let tasks = translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
         .await?
         .into_iter()
@@ -626,12 +657,17 @@ async fn start_translation_task_with_mode(
     id: String,
     mode: RunMode,
 ) -> Result<TranslationTaskView, String> {
-    state.translation_batch_cancel.store(false, Ordering::SeqCst);
+    state
+        .translation_batch_cancel
+        .store(false, Ordering::SeqCst);
     let interrupt = TranslationInterrupt::new();
     {
         let mut running = state.running_translation_task.lock().await;
         if let Some(current) = running.as_ref() {
-            return Err(format!("Translation task {} is already running", current.id));
+            return Err(format!(
+                "Translation task {} is already running",
+                current.id
+            ));
         }
         *running = Some(RunningTranslationTask {
             id: id.clone(),
@@ -838,7 +874,13 @@ pub async fn pick_translation_files(app: AppHandle) -> Result<Vec<String>, Strin
     let file_paths = tauri::async_runtime::spawn_blocking(move || {
         app.dialog()
             .file()
-            .add_filter("Text / Markdown", &["txt", "md"])
+            .add_filter(
+                "Documents",
+                &[
+                    "pdf", "md", "epub", "html", "htm", "txt", "docx", "xlsx", "json", "srt",
+                    "ass", "lrc",
+                ],
+            )
             .blocking_pick_files()
     })
     .await

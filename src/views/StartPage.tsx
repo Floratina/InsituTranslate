@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -92,8 +93,9 @@ interface RateLimitOption {
 }
 
 interface ConfidenceOption {
-  value: ConfidenceMode;
+  value: Extract<ConfidenceMode, "confidence-index">;
   label: string;
+  description: string;
 }
 
 type NumericConfigKey =
@@ -124,8 +126,11 @@ const DEFAULT_CONFIG: TranslationConfigView = {
 };
 
 const CONFIDENCE_OPTIONS: ConfidenceOption[] = [
-  { value: "off", label: "关闭" },
-  { value: "confidence-index", label: "综合置信度指数" },
+  {
+    value: "confidence-index",
+    label: "综合置信度检测",
+    description: "综合置信度检测视提供商的支持情况而定，提供商不支持时会默认忽略。",
+  },
 ];
 
 const RATE_LIMIT_OPTIONS: RateLimitOption[] = [
@@ -787,40 +792,32 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
 
                 <section className="grid content-start gap-3 rounded-[6px] border bg-muted/15 p-3">
                   <div>
-                    <div className="flex items-center gap-1.5">
-                      <FileCheck2 className="size-3.5 text-primary" />
-                      <div className="text-xs font-medium">校对</div>
+                    <div className="flex items-center gap-2">
+                      <FileCheck2 className="size-4 text-primary" />
+                      <div className="text-sm font-medium">校对</div>
                       <HelpTooltip contentClassName="max-w-80">
                         具体支持情况根据提供商而定。
                       </HelpTooltip>
                     </div>
-                    <p className="mt-0.5 text-2xs text-muted-foreground">
-                      记录每个分块的模型置信度，供后续校对筛选使用。
-                    </p>
                   </div>
-                  <div className="grid gap-2">
-                    <Label>置信度检测</Label>
-                    <Select
-                      value={config.confidenceMode}
-                      onValueChange={(value) =>
-                        setConfig((current) => ({
-                          ...current,
-                          confidenceMode: value as ConfidenceMode,
-                        }))
-                      }
-                      disabled={loading}
-                    >
-                      <SelectTrigger className="h-8 rounded-[6px]">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {CONFIDENCE_OPTIONS.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                  <div className="grid gap-1">
+                    {CONFIDENCE_OPTIONS.map((option) => {
+                      const selected = config.confidenceMode === option.value;
+                      return (
+                        <SelectableOptionButton
+                          key={option.value}
+                          label={option.label}
+                          description={option.description}
+                          selected={selected}
+                          disabled={loading}
+                          onClick={() => setConfig((current) => ({
+                            ...current,
+                            confidenceMode:
+                              current.confidenceMode === option.value ? "off" : option.value,
+                          }))}
+                        />
+                      );
+                    })}
                   </div>
                 </section>
               </div>

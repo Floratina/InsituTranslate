@@ -1,7 +1,9 @@
 use futures_util::StreamExt;
+use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 
 use crate::domain::{
     LogprobStats, ProviderProtocol, ProviderRuntimeConfig, RemoteModel, ThinkingConfig,
@@ -80,6 +82,14 @@ struct JsonResponseMeta {
     raw: Value,
     status: u16,
     rate_limits: RateLimitTelemetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogprobsRequestSpec {
+    None,
+    OpenaiChat,
+    OpenaiResponses,
+    Gemini,
 }
 
 impl RuntimeAdapter {
@@ -243,7 +253,11 @@ impl RuntimeAdapter {
                     Method::GET,
                     format!(
                         "{}?pageSize=100&listAllVersions=true",
-                        vertex_ai::publisher_models_url(&self.config.base_url, &vertex.location, "google")
+                        vertex_ai::publisher_models_url(
+                            &self.config.base_url,
+                            &vertex.location,
+                            "google"
+                        )
                     ),
                     None,
                 )
@@ -390,7 +404,7 @@ impl ProviderAdapter for RuntimeAdapter {
             }
         };
         let mut body = merge_custom_parameters(body, &request.custom_parameters)?;
-        apply_request_overrides(&mut body, self.config.protocol, request);
+        apply_request_overrides(&mut body, &self.config, request);
         Ok((url, body))
     }
 
@@ -665,11 +679,124 @@ fn merge_custom_parameters(mut body: Value, custom_parameters: &Value) -> Result
 
 fn apply_request_overrides(
     body: &mut Value,
-    protocol: ProviderProtocol,
+    config: &ProviderRuntimeConfig,
     request: &UnifiedChatRequest,
 ) {
-    if protocol == ProviderProtocol::OpenaiChat && request.logprobs {
-        body["logprobs"] = json!(true);
+    if !request.logprobs {
+        disable_logprobs_request_params(body, config.protocol);
+        return;
+    }
+
+    match logprobs_request_spec(config.protocol, &config.base_url) {
+        LogprobsRequestSpec::OpenaiChat => {
+            body["logprobs"] = json!(true);
+        }
+        LogprobsRequestSpec::OpenaiResponses => enable_openai_response_logprobs(body),
+        LogprobsRequestSpec::Gemini => enable_gemini_logprobs(body),
+        LogprobsRequestSpec::None => disable_logprobs_request_params(body, config.protocol),
+    }
+}
+
+fn logprobs_request_spec(protocol: ProviderProtocol, base_url: &str) -> LogprobsRequestSpec {
+    match protocol {
+        ProviderProtocol::OpenaiChat => {
+            if openai_chat_logprobs_supported(base_url) {
+                LogprobsRequestSpec::OpenaiChat
+            } else {
+                LogprobsRequestSpec::None
+            }
+        }
+        ProviderProtocol::OpenaiResponses => LogprobsRequestSpec::OpenaiResponses,
+        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => LogprobsRequestSpec::Gemini,
+        ProviderProtocol::Anthropic | ProviderProtocol::Ollama => LogprobsRequestSpec::None,
+    }
+}
+
+fn openai_chat_logprobs_supported(base_url: &str) -> bool {
+    let host = provider_host(base_url);
+    if host.is_empty() {
+        return true;
+    }
+    !(host.contains("dashscope") && host.ends_with("aliyuncs.com"))
+        && !host.ends_with("modelscope.cn")
+        && !host.contains(".modelscope.cn")
+}
+
+fn provider_host(base_url: &str) -> String {
+    url::Url::parse(endpoint_base_url(base_url))
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+fn enable_openai_response_logprobs(body: &mut Value) {
+    const INCLUDE: &str = "message.output_text.logprobs";
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    match object.get_mut("include") {
+        Some(Value::Array(items)) => {
+            if !items.iter().any(|item| item.as_str() == Some(INCLUDE)) {
+                items.push(json!(INCLUDE));
+            }
+        }
+        Some(value @ Value::String(_)) => {
+            let existing = value.as_str().unwrap_or_default().to_string();
+            if existing == INCLUDE {
+                return;
+            }
+            *value = json!([existing, INCLUDE]);
+        }
+        Some(value) if value.is_null() => {
+            *value = json!([INCLUDE]);
+        }
+        Some(_) => {}
+        None => {
+            object.insert("include".into(), json!([INCLUDE]));
+        }
+    }
+}
+
+fn enable_gemini_logprobs(body: &mut Value) {
+    if !body.get("generationConfig").is_some_and(Value::is_object) {
+        body["generationConfig"] = json!({});
+    }
+    if let Some(generation) = body
+        .get_mut("generationConfig")
+        .and_then(Value::as_object_mut)
+    {
+        generation.insert("responseLogprobs".into(), json!(true));
+    }
+}
+
+fn disable_logprobs_request_params(body: &mut Value, protocol: ProviderProtocol) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    object.remove("logprobs");
+    object.remove("top_logprobs");
+    if protocol == ProviderProtocol::OpenaiResponses {
+        let remove_include = if let Some(Value::Array(items)) = object.get_mut("include") {
+            items.retain(|item| item.as_str() != Some("message.output_text.logprobs"));
+            items.is_empty()
+        } else {
+            false
+        };
+        if remove_include {
+            object.remove("include");
+        }
+    }
+    if matches!(
+        protocol,
+        ProviderProtocol::Gemini | ProviderProtocol::VertexAi
+    ) {
+        if let Some(generation) = object
+            .get_mut("generationConfig")
+            .and_then(Value::as_object_mut)
+        {
+            generation.remove("responseLogprobs");
+            generation.remove("logprobs");
+        }
     }
 }
 
@@ -875,7 +1002,7 @@ pub fn build_openai_chat_body(base_url: &str, request: &UnifiedChatRequest) -> V
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
     }
-    if request.logprobs {
+    if request.logprobs && openai_chat_logprobs_supported(base_url) {
         body["logprobs"] = json!(true);
     }
     let mut tools: Vec<Value> = request
@@ -1134,6 +1261,9 @@ pub fn build_openai_responses_body(base_url: &str, request: &UnifiedChatRequest)
             UnifiedToolChoice::Auto => "auto",
         });
     }
+    if request.logprobs {
+        enable_openai_response_logprobs(&mut body);
+    }
     body
 }
 
@@ -1316,6 +1446,9 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
             "includeThoughts": enabled,
             "thinkingBudget": if enabled { thinking.budget_tokens.map(Value::from).unwrap_or(json!(-1)) } else { json!(0) }
         });
+    }
+    if request.logprobs {
+        generation["responseLogprobs"] = json!(true);
     }
     let mut body = json!({"contents": contents, "generationConfig": generation});
     if !system_parts.is_empty() {
@@ -1858,20 +1991,22 @@ pub fn normalize_response(
 }
 
 fn logprob_stats_from_raw(protocol: ProviderProtocol, raw: &Value) -> Option<LogprobStats> {
-    if protocol != ProviderProtocol::OpenaiChat {
-        return None;
-    }
+    let logprobs = match protocol {
+        ProviderProtocol::OpenaiChat => openai_chat_logprobs(raw),
+        ProviderProtocol::OpenaiResponses => openai_responses_logprobs(raw),
+        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => gemini_logprobs(raw),
+        ProviderProtocol::Anthropic | ProviderProtocol::Ollama => Vec::new(),
+    };
+    confidence_index(&logprobs)
+}
+
+fn openai_chat_logprobs(raw: &Value) -> Vec<f64> {
     let mut logprobs = Vec::new();
     if let Some(content) = raw
         .pointer("/choices/0/logprobs/content")
         .and_then(Value::as_array)
     {
-        logprobs.extend(
-            content
-                .iter()
-                .filter_map(|item| item.get("logprob").and_then(Value::as_f64))
-                .filter(|value| value.is_finite()),
-        );
+        logprobs.extend(filtered_token_logprobs(content, "logprob"));
     }
     if logprobs.is_empty() {
         if let Some(token_logprobs) = raw
@@ -1886,7 +2021,110 @@ fn logprob_stats_from_raw(protocol: ProviderProtocol, raw: &Value) -> Option<Log
             );
         }
     }
-    confidence_index(&logprobs)
+    logprobs
+}
+
+fn openai_responses_logprobs(raw: &Value) -> Vec<f64> {
+    let mut logprobs = Vec::new();
+    collect_response_logprob_arrays(raw.pointer("/output"), &mut logprobs);
+    if logprobs.is_empty() {
+        collect_response_logprob_arrays(raw.pointer("/response/output"), &mut logprobs);
+    }
+    logprobs
+}
+
+fn collect_response_logprob_arrays(value: Option<&Value>, output: &mut Vec<f64>) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_response_logprob_arrays(Some(item), output);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(items) = object.get("logprobs").and_then(Value::as_array) {
+                output.extend(filtered_token_logprobs(items, "logprob"));
+            }
+            for key in ["content", "output"] {
+                if let Some(child) = object.get(key) {
+                    collect_response_logprob_arrays(Some(child), output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn gemini_logprobs(raw: &Value) -> Vec<f64> {
+    raw.pointer("/candidates/0/logprobsResult/chosenCandidates")
+        .or_else(|| raw.pointer("/candidates/0/logprobs_result/chosen_candidates"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            let mut values = filtered_token_logprobs(items, "logProbability");
+            if values.is_empty() {
+                values = filtered_token_logprobs(items, "log_probability");
+            }
+            values
+        })
+        .unwrap_or_default()
+}
+
+fn filtered_token_logprobs(content: &[Value], logprob_field: &str) -> Vec<f64> {
+    let mut output = Vec::new();
+    let mut skipping_placeholder = false;
+    for item in content {
+        let token = item
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let trimmed = token.trim();
+        let placeholder_piece = placeholder_tag_piece(trimmed);
+        if skipping_placeholder || placeholder_piece {
+            skipping_placeholder = !trimmed.contains('>');
+            continue;
+        }
+        if !meaningful_confidence_token(trimmed) {
+            continue;
+        }
+        if let Some(logprob) = item.get(logprob_field).and_then(Value::as_f64) {
+            if logprob.is_finite() {
+                output.push(logprob);
+            }
+        }
+    }
+    output
+}
+
+fn placeholder_tag_piece(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    if placeholder_tag_regex().is_match(token) {
+        return true;
+    }
+    let lower = token.to_ascii_lowercase();
+    lower == "<"
+        || lower == "</"
+        || lower == "/"
+        || lower == ">"
+        || lower.starts_with("<t")
+        || lower.starts_with("</t")
+}
+
+fn meaningful_confidence_token(token: &str) -> bool {
+    !token.is_empty() && !punctuation_regex().is_match(token)
+}
+
+fn placeholder_tag_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)^</?t\d+>$").expect("static placeholder regex"))
+}
+
+fn punctuation_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"^\p{P}+$").expect("static punctuation regex"))
 }
 
 fn confidence_index(logprobs: &[f64]) -> Option<LogprobStats> {
@@ -1895,7 +2133,7 @@ fn confidence_index(logprobs: &[f64]) -> Option<LogprobStats> {
     }
     let probabilities: Vec<f64> = logprobs
         .iter()
-        .map(|value| value.exp())
+        .map(|value| value.exp().clamp(0.0, 1.0))
         .filter(|value| value.is_finite())
         .collect();
     if probabilities.is_empty() {
@@ -1997,6 +2235,39 @@ mod tests {
     }
 
     #[test]
+    fn suppresses_known_unsupported_openai_chat_logprobs() {
+        let mut request = request();
+        request.stream = false;
+        request.logprobs = true;
+        let body = build_openai_chat_body(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            &request,
+        );
+        assert!(body.get("logprobs").is_none());
+    }
+
+    #[test]
+    fn builds_responses_and_gemini_logprobs_requests() {
+        let mut request = request();
+        request.stream = false;
+        request.logprobs = true;
+
+        let responses = build_openai_responses_body("https://api.openai.com", &request);
+        assert!(responses
+            .get("include")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item.as_str() == Some("message.output_text.logprobs"))));
+
+        let gemini = build_gemini_body(&request);
+        assert_eq!(
+            gemini.pointer("/generationConfig/responseLogprobs"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
     fn requested_logprobs_override_custom_parameters() {
         let adapter = RuntimeAdapter::new(
             Client::new(),
@@ -2020,6 +2291,30 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_provider_removes_custom_logprobs_parameters() {
+        let adapter = RuntimeAdapter::new(
+            Client::new(),
+            ProviderRuntimeConfig {
+                protocol: ProviderProtocol::OpenaiChat,
+                base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
+                use_raw_base_url: false,
+                config: json!({}),
+                auth_type: "none".into(),
+                auth_header: "Authorization".into(),
+                credential: None,
+                custom_headers: Vec::new(),
+            },
+        );
+        let mut request = request();
+        request.stream = false;
+        request.logprobs = true;
+        request.custom_parameters = json!({"logprobs": true, "top_logprobs": 3});
+        let (_, body) = adapter.build_chat_request(&request).expect("request");
+        assert!(body.get("logprobs").is_none());
+        assert!(body.get("top_logprobs").is_none());
+    }
+
+    #[test]
     fn anthropic_alternates_and_forces_auto_tool_choice() {
         let mut request = request();
         request.messages.insert(
@@ -2034,6 +2329,14 @@ mod tests {
         let body = build_anthropic_body(&request);
         assert_eq!(body.pointer("/messages/0/role"), Some(&json!("user")));
         assert_eq!(body.pointer("/tool_choice/type"), Some(&json!("auto")));
+    }
+
+    #[test]
+    fn anthropic_body_ignores_logprobs_request_flag() {
+        let mut request = request();
+        request.logprobs = true;
+        let body = build_anthropic_body(&request);
+        assert!(body.get("logprobs").is_none());
     }
 
     #[test]
@@ -2142,8 +2445,13 @@ mod tests {
                     "message": {"content": "ok"},
                     "logprobs": {
                         "content": [
+                            {"token": "<t1>", "logprob": 0.0},
                             {"token": "o", "logprob": 0.0},
-                            {"token": "k", "logprob": -1.3862943611198906}
+                            {"token": "，", "logprob": 0.0},
+                            {"token": "k", "logprob": -1.3862943611198906},
+                            {"token": "</", "logprob": 0.0},
+                            {"token": "t1", "logprob": 0.0},
+                            {"token": ">", "logprob": 0.0}
                         ]
                     }
                 }]
@@ -2156,6 +2464,55 @@ mod tests {
         assert!((stats.average_probability - 0.625).abs() < 0.000001);
         assert!((stats.standard_deviation - 0.375).abs() < 0.000001);
         assert!((stats.confidence - 0.4375).abs() < 0.000001);
+    }
+
+    #[test]
+    fn normalizes_responses_and_gemini_logprob_stats() {
+        let responses = normalize_response(
+            ProviderProtocol::OpenaiResponses,
+            json!({
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "ok",
+                        "logprobs": [
+                            {"token": "<", "logprob": 0.0},
+                            {"token": "t1", "logprob": 0.0},
+                            {"token": ">", "logprob": 0.0},
+                            {"token": "ok", "logprob": -0.6931471805599453},
+                            {"token": "。", "logprob": 0.0}
+                        ]
+                    }]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 2}
+            }),
+        )
+        .expect("responses");
+        let stats = responses.logprob_stats.expect("responses stats");
+        assert_eq!(responses.text, "ok");
+        assert_eq!(stats.token_count, 1);
+        assert!((stats.confidence - 0.5).abs() < 0.000001);
+
+        let gemini = normalize_response(
+            ProviderProtocol::Gemini,
+            json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "ok"}]},
+                    "logprobsResult": {
+                        "chosenCandidates": [
+                            {"token": "ok", "logProbability": -0.6931471805599453},
+                            {"token": "!", "logProbability": 0.0}
+                        ]
+                    }
+                }]
+            }),
+        )
+        .expect("gemini");
+        let stats = gemini.logprob_stats.expect("gemini stats");
+        assert_eq!(gemini.text, "ok");
+        assert_eq!(stats.token_count, 1);
+        assert!((stats.confidence - 0.5).abs() < 0.000001);
     }
 
     #[test]

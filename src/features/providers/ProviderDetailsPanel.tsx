@@ -1,5 +1,4 @@
 import { Braces, KeyRound, Network } from "lucide-react";
-import { motion } from "motion/react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,6 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { SECONDARY_PAGE_FADE_UP_STYLE } from "@/lib/motion";
 
 import {
   getMinerUConfig,
@@ -45,7 +45,6 @@ interface ProviderDetailsPanelProps {
   onError: (message: string) => void;
 }
 
-const panelTransition = { duration: 0.28, ease: [0.03, 0.59, 0.19, 1] as const };
 const BASE_URL_HELP_TEXT = "在末尾添加“#”会以当前输入为完整路径";
 const GEMINI_KEY_TYPE_HELP_TEXT =
   "Google 正在从标准 API 密钥切换到授权 (auth) 密钥，2026 年 9 月起将拒绝任何标准密钥的请求，InsituTranslate 已经适配。详情参考 Gemini API 文档。";
@@ -168,12 +167,10 @@ export function ProviderDetailsPanel({
     mineruConfig.mode === "flash" ? mineruConfig.flashBaseUrl : draft.baseUrl;
 
   return (
-    <motion.div
+    <div
       key={provider.id}
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={panelTransition}
-      className="flex min-h-0 flex-1 flex-col"
+      style={SECONDARY_PAGE_FADE_UP_STYLE}
+      className="app-fade-up-enter flex min-h-0 flex-1 flex-col"
     >
       <div className="flex shrink-0 items-start justify-between gap-3 border-b p-3">
         <div className="flex min-w-0 items-center gap-3">
@@ -197,12 +194,7 @@ export function ProviderDetailsPanel({
 
       <ScrollArea className="min-h-0 flex-1">
         <div className="grid gap-3 p-3">
-          <motion.section
-            initial={{ opacity: 0, y: 12 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={panelTransition}
-            className="grid min-w-0 gap-2 rounded-[6px] border p-3"
-          >
+          <section className="grid min-w-0 gap-2 rounded-[6px] border p-3">
             {isMinerU ? (
               <>
                 <div className="grid grid-cols-[minmax(9rem,11.25rem)_minmax(0,1fr)] items-start gap-3 max-[820px]:grid-cols-1">
@@ -325,7 +317,7 @@ export function ProviderDetailsPanel({
                 </div>
               </>
             )}
-          </motion.section>
+          </section>
 
           <ProviderModelList
             models={provider.models}
@@ -338,6 +330,6 @@ export function ProviderDetailsPanel({
           />
         </div>
       </ScrollArea>
-    </motion.div>
+    </div>
   );
 }

@@ -4,106 +4,54 @@ import {
   useMemo,
   useRef,
   useState,
-  type Dispatch,
   type DragEvent,
-  type SetStateAction,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
-  Check,
-  ChevronDown,
-  FileCheck2,
   FileText,
-  Gauge,
-  BookOpen,
   LayoutDashboard,
   PlayCircle,
   Save,
-  SlidersHorizontal,
   UploadCloud,
   X,
-  type LucideIcon,
 } from "lucide-react";
 import { motion } from "motion/react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { HelpTooltip } from "@/components/ui/help-tooltip";
 import {
   Card,
   CardContent,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
-import { Separator } from "@/components/ui/separator";
-import { Skeleton } from "@/components/ui/skeleton";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/components/ui/toast-stack";
 import type { AssistantView } from "@/features/assistants/types";
 import { listGlossaries } from "@/features/glossary/api";
-import { displayLanguagePair } from "@/features/glossary/languages";
+import type { GlossaryView } from "@/features/glossary/types";
 import {
   AUTO_LANGUAGE_CODE,
-  displayLanguage,
   normalizeLanguageCode,
 } from "@/features/languages/languageOptions";
-import type { GlossaryView } from "@/features/glossary/types";
 import type { ProviderView } from "@/features/providers/types";
 import {
   createTranslationTask,
   getTranslationConfig,
   updateTranslationConfig,
 } from "@/features/translation/api";
-import { LanguageSettingsCard } from "@/features/translation/LanguageSettingsCard";
-import { ModelAssistantSettingsCard } from "@/features/translation/ModelAssistantSettingsCard";
-import type {
-  ConfidenceMode,
-  RateLimitStrategy,
-  TranslationConfigView,
-} from "@/features/translation/types";
-import { cn } from "@/lib/utils";
+import {
+  StartSettingsPanel,
+  StartSettingsSkeleton,
+  type StartSettingsNumberKey,
+} from "@/features/translation/StartSettingsPanel";
+import type { TranslationConfigView } from "@/features/translation/types";
 import { appSessionCache } from "@/lib/session-cache";
+import { cn } from "@/lib/utils";
 
 interface StartPageProps {
   onTaskCreated: () => void;
 }
-
-interface RateLimitOption {
-  value: RateLimitStrategy;
-  label: string;
-  description: string;
-  icon: LucideIcon;
-}
-
-interface ConfidenceOption {
-  value: Extract<ConfidenceMode, "confidence-index">;
-  label: string;
-  description: string;
-}
-
-type NumericConfigKey =
-  | "chunkTokenLimit"
-  | "maxConcurrency"
-  | "maxRetries"
-  | "maxRequestsPerMinute"
-  | "maxTokensPerMinute";
 
 const DEFAULT_CONFIG: TranslationConfigView = {
   sourceLanguage: AUTO_LANGUAGE_CODE,
@@ -124,29 +72,6 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   glossaryId: null,
   confidenceMode: "off",
 };
-
-const CONFIDENCE_OPTIONS: ConfidenceOption[] = [
-  {
-    value: "confidence-index",
-    label: "综合置信度检测",
-    description: "综合置信度检测视提供商的支持情况而定，提供商不支持时会默认忽略。",
-  },
-];
-
-const RATE_LIMIT_OPTIONS: RateLimitOption[] = [
-  {
-    value: "dynamic",
-    label: "动态限流策略",
-    description: "根据响应头与请求结果自动调整速率",
-    icon: Gauge,
-  },
-  {
-    value: "manual",
-    label: "手动设置",
-    description: "使用固定的每分钟请求数与 Token 数",
-    icon: SlidersHorizontal,
-  },
-];
 
 const START_GLOSSARY_ALL_VALUE = "__all__";
 const START_GLOSSARY_WIDTHS = [320, 84, 220, 260];
@@ -215,13 +140,12 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   const cachedGlossaryIndex = appSessionCache.glossaryIndex.read();
   const cachedGlossaries = cachedGlossaryIndex?.filterSeed;
   const cachedConfig = cachedDraft?.config ?? appSessionCache.translationConfig.read();
-  const initialConfig =
-    cachedConfig
-      ? normalizeStartConfig(cachedConfig, cachedGlossaries)
-      : normalizeStartConfig(cachedDraft?.config ?? DEFAULT_CONFIG);
+  const initialConfig = cachedConfig
+    ? normalizeStartConfig(cachedConfig, cachedGlossaries)
+    : normalizeStartConfig(cachedDraft?.config ?? DEFAULT_CONFIG);
   const hasCachedOptions = Boolean(
-    cachedDraft ||
-      (cachedProviderOptions && cachedAssistantOptions && cachedGlossaries && cachedConfig),
+    cachedDraft
+      || (cachedProviderOptions && cachedAssistantOptions && cachedGlossaries && cachedConfig),
   );
 
   const [filePaths, setFilePaths] = useState<string[]>(cachedDraft?.filePaths ?? []);
@@ -262,10 +186,6 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     [providerId, providers],
   );
   const models = selectedProvider?.models ?? [];
-  const selectedRateLimitOption = RATE_LIMIT_OPTIONS.find(
-    (option) => option.value === config.rateLimitStrategy,
-  ) ?? RATE_LIMIT_OPTIONS[0];
-  const SelectedRateLimitIcon = selectedRateLimitOption.icon;
 
   const addFilePaths = useCallback((paths: string[]): void => {
     const supported = paths.filter(supportedFile);
@@ -470,7 +390,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     if (paths.length > 0) addFilePaths(paths);
   }
 
-  function updateNumber(key: NumericConfigKey, value: string): void {
+  function updateNumber(key: StartSettingsNumberKey, value: string): void {
     const parsed = Number(value);
     setConfig((current) => ({
       ...current,
@@ -559,7 +479,10 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   }
 
   return (
-    <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden p-3">
+    <main
+      data-layout="start-settings-v2"
+      className="relative flex min-w-0 flex-1 flex-col overflow-hidden p-3"
+    >
       <header className="mb-3 shrink-0">
         <div className="flex items-center gap-2">
           <LayoutDashboard className="size-5 text-primary" />
@@ -570,8 +493,8 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
         </p>
       </header>
 
-      <div className="scrollbar-hidden min-h-0 flex-1 overflow-y-auto pb-16">
-        <div className="grid max-w-5xl gap-3">
+      <div className="scrollbar-hidden min-h-0 flex-1 overflow-y-auto pb-28">
+        <div className="grid w-full gap-3">
           <Card size="sm" className="rounded-[6px] py-3">
             <CardHeader className="px-3">
               <div className="flex items-center gap-2">
@@ -643,187 +566,27 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
           {loading ? (
             <StartSettingsSkeleton />
           ) : (
-            <>
-          <div className="grid items-stretch gap-3 lg:grid-cols-2">
-              <LanguageSettingsCard
-                sourceLanguage={sourceLanguage}
-                detectedSourceLanguage={detectedSourceLanguage}
-                targetLanguage={targetLanguage}
-                onSourceLanguageChange={setSourceLanguage}
-                onTargetLanguageChange={setTargetLanguage}
-              />
-
-            <ModelAssistantSettingsCard
+            <StartSettingsPanel
+              sourceLanguage={sourceLanguage}
+              detectedSourceLanguage={detectedSourceLanguage}
+              targetLanguage={targetLanguage}
               providers={providers}
               models={models}
               assistants={assistants}
+              glossaries={glossaries}
               providerId={providerId}
               modelId={modelId}
               assistantId={assistantId}
+              config={config}
               loading={loading}
+              onSourceLanguageChange={setSourceLanguage}
+              onTargetLanguageChange={setTargetLanguage}
               onProviderChange={setProviderId}
               onModelChange={setModelId}
               onAssistantChange={setAssistantId}
+              onConfigChange={setConfig}
+              onNumberChange={updateNumber}
             />
-          </div>
-
-          <GlossarySettingsCard
-            glossaries={glossaries}
-            config={config}
-            loading={loading}
-            onConfigChange={setConfig}
-          />
-
-          <Card size="sm" className="rounded-[6px] py-3">
-            <CardHeader className="px-3">
-              <div className="flex items-center gap-2">
-                <SlidersHorizontal className="size-4 text-primary" />
-                <CardTitle>翻译配置</CardTitle>
-              </div>
-            </CardHeader>
-            <CardContent className="grid gap-3 px-3">
-              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                <section className="grid content-start gap-3 rounded-[6px] border bg-muted/15 p-3">
-                  <div>
-                    <div className="text-xs font-medium">基础参数</div>
-                    <p className="mt-0.5 text-2xs text-muted-foreground">
-                      控制分块大小、并发处理与失败重试。
-                    </p>
-                  </div>
-                  <NumberField
-                    label="单块 Token 数"
-                    value={config.chunkTokenLimit}
-                    min={200}
-                    max={8000}
-                    disabled={loading}
-                    onChange={(value) => updateNumber("chunkTokenLimit", value)}
-                  />
-                  <NumberField
-                    label="最大并发数"
-                    value={config.maxConcurrency}
-                    min={1}
-                    max={32}
-                    disabled={loading}
-                    onChange={(value) => updateNumber("maxConcurrency", value)}
-                  />
-                  <NumberField
-                    label="最大重试次数"
-                    value={config.maxRetries}
-                    min={0}
-                    max={10}
-                    disabled={loading}
-                    onChange={(value) => updateNumber("maxRetries", value)}
-                  />
-                </section>
-
-                <section className="grid content-start gap-3 rounded-[6px] border bg-muted/15 p-3">
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild disabled={loading}>
-                      <button
-                        type="button"
-                        className="flex w-full items-center gap-3 rounded-[6px] border bg-background/60 px-3 py-2 text-left outline-none transition-colors duration-150 hover:bg-accent/40 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/30"
-                      >
-                        <SelectedRateLimitIcon className="size-4 shrink-0 text-primary" />
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-sm font-medium">
-                            {selectedRateLimitOption.label}
-                          </span>
-                          <span className="mt-0.5 block truncate text-2xs text-muted-foreground">
-                            {selectedRateLimitOption.description}
-                          </span>
-                        </span>
-                        <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
-                      </button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent
-                      align="start"
-                      className="w-[var(--radix-dropdown-menu-trigger-width)] py-1"
-                    >
-                      {RATE_LIMIT_OPTIONS.map((option) => {
-                        const Icon = option.icon;
-                        const selected = option.value === config.rateLimitStrategy;
-                        return (
-                          <DropdownMenuItem
-                            key={option.value}
-                            className={cn(
-                              "h-auto min-h-14 items-start gap-3 rounded-none px-3 py-2",
-                              selected && "bg-accent",
-                            )}
-                            onSelect={() => setConfig((current) => ({
-                              ...current,
-                              rateLimitStrategy: option.value,
-                            }))}
-                          >
-                            <Icon className="mt-0.5 size-4 shrink-0 text-primary" />
-                            <span className="min-w-0 flex-1">
-                              <span className="block text-sm font-medium">{option.label}</span>
-                              <span className="mt-0.5 block text-2xs leading-snug text-muted-foreground">
-                                {option.description}
-                              </span>
-                            </span>
-                            {selected && <Check className="mt-0.5 size-4 shrink-0 text-primary" />}
-                          </DropdownMenuItem>
-                        );
-                      })}
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-
-                  {config.rateLimitStrategy === "manual" && (
-                    <div className="grid gap-3">
-                      <NumberField
-                        label="每分钟最大请求数"
-                        value={config.maxRequestsPerMinute}
-                        min={1}
-                        max={1_000_000}
-                        disabled={loading}
-                        onChange={(value) => updateNumber("maxRequestsPerMinute", value)}
-                      />
-                      <NumberField
-                        label="每分钟 Token 数"
-                        value={config.maxTokensPerMinute}
-                        min={1}
-                        max={100_000_000}
-                        disabled={loading}
-                        onChange={(value) => updateNumber("maxTokensPerMinute", value)}
-                      />
-                    </div>
-                  )}
-                </section>
-
-                <section className="grid content-start gap-3 rounded-[6px] border bg-muted/15 p-3">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <FileCheck2 className="size-4 text-primary" />
-                      <div className="text-sm font-medium">校对</div>
-                      <HelpTooltip contentClassName="max-w-80">
-                        具体支持情况根据提供商而定。
-                      </HelpTooltip>
-                    </div>
-                  </div>
-                  <div className="grid gap-1">
-                    {CONFIDENCE_OPTIONS.map((option) => {
-                      const selected = config.confidenceMode === option.value;
-                      return (
-                        <SelectableOptionButton
-                          key={option.value}
-                          label={option.label}
-                          description={option.description}
-                          selected={selected}
-                          disabled={loading}
-                          onClick={() => setConfig((current) => ({
-                            ...current,
-                            confidenceMode:
-                              current.confidenceMode === option.value ? "off" : option.value,
-                          }))}
-                        />
-                      );
-                    })}
-                  </div>
-                </section>
-              </div>
-            </CardContent>
-          </Card>
-            </>
           )}
         </div>
       </div>
@@ -850,206 +613,5 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
         </Button>
       </div>
     </main>
-  );
-}
-
-function StartSettingsSkeleton() {
-  return (
-    <>
-      <div className="grid items-stretch gap-3 lg:grid-cols-2">
-        <Card size="sm" className="flex h-full flex-col rounded-[6px] py-3">
-          <CardHeader className="px-3">
-            <Skeleton className="h-5 w-32" />
-          </CardHeader>
-          <CardContent className="grid flex-1 content-start gap-3 px-3">
-            <SkeletonField />
-            <SkeletonField />
-          </CardContent>
-        </Card>
-        <Card size="sm" className="flex h-full flex-col rounded-[6px] py-3">
-          <CardHeader className="px-3">
-            <Skeleton className="h-5 w-32" />
-          </CardHeader>
-          <CardContent className="grid flex-1 content-start gap-3 px-3">
-            <SkeletonField />
-            <SkeletonField />
-            <SkeletonField />
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card size="sm" className="rounded-[6px] py-3">
-        <CardHeader className="px-3">
-          <Skeleton className="h-5 w-28" />
-        </CardHeader>
-        <CardContent className="px-3">
-          <Skeleton className="h-10 w-full" />
-        </CardContent>
-      </Card>
-
-      <Card size="sm" className="rounded-[6px] py-3">
-        <CardHeader className="px-3">
-          <Skeleton className="h-5 w-32" />
-        </CardHeader>
-        <CardContent className="grid gap-3 px-3 md:grid-cols-2">
-          <div className="grid gap-3 rounded-[6px] border bg-muted/15 p-3">
-            <Skeleton className="h-4 w-28" />
-            <SkeletonField />
-            <SkeletonField />
-            <SkeletonField />
-          </div>
-          <div className="grid content-start gap-3 rounded-[6px] border bg-muted/15 p-3">
-            <Skeleton className="h-10 w-full" />
-            <SkeletonField />
-            <SkeletonField />
-          </div>
-        </CardContent>
-      </Card>
-    </>
-  );
-}
-
-function SkeletonField() {
-  return (
-    <div className="grid gap-2">
-      <Skeleton className="h-4 w-24" />
-      <Skeleton className="h-10 w-full" />
-    </div>
-  );
-}
-
-interface NumberFieldProps {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  disabled: boolean;
-  onChange: (value: string) => void;
-}
-
-function NumberField({
-  label,
-  value,
-  min,
-  max,
-  disabled,
-  onChange,
-}: NumberFieldProps) {
-  return (
-    <div className="grid gap-2">
-      <Label>{label}</Label>
-      <Input
-        type="number"
-        min={min}
-        max={max}
-        value={value}
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </div>
-  );
-}
-
-interface GlossarySettingsCardProps {
-  glossaries: GlossaryView[];
-  config: TranslationConfigView;
-  loading: boolean;
-  onConfigChange: Dispatch<SetStateAction<TranslationConfigView>>;
-}
-
-function GlossarySettingsCard({
-  glossaries,
-  config,
-  loading,
-  onConfigChange,
-}: GlossarySettingsCardProps) {
-  const hasSelectedGlossary = Boolean(
-    config.glossaryId
-      && glossaries.some((glossary) => glossary.id === config.glossaryId),
-  );
-  const selectedValue = config.glossaryMode === "existing" && hasSelectedGlossary
-    ? config.glossaryId!
-    : "auto";
-
-  function updateSelection(value: string): void {
-    if (value === "auto") {
-      onConfigChange((current) => ({
-        ...current,
-        glossaryMode: "auto",
-        glossaryId: null,
-      }));
-      return;
-    }
-    onConfigChange((current) => ({
-      ...current,
-      glossaryMode: "existing",
-      glossaryId: value,
-    }));
-  }
-
-  function updateEnabled(enabled: boolean): void {
-    onConfigChange((current) => {
-      if (
-        enabled
-        && current.glossaryMode === "existing"
-        && !current.glossaryId
-        && glossaries.length > 0
-      ) {
-        return { ...current, useGlossary: enabled, glossaryId: glossaries[0].id };
-      }
-      return { ...current, useGlossary: enabled };
-    });
-  }
-
-  return (
-    <Card size="sm" className="rounded-[6px] py-3">
-      <CardHeader className="px-3">
-        <div className="flex items-center gap-2">
-          <BookOpen className="size-4 text-primary" />
-          <CardTitle>术语表</CardTitle>
-          <div className="ml-auto flex items-center gap-2">
-            <Label className="text-xs text-muted-foreground">使用术语表</Label>
-            <Switch
-              size="sm"
-              checked={config.useGlossary}
-              disabled={loading}
-              onCheckedChange={updateEnabled}
-            />
-          </div>
-        </div>
-      </CardHeader>
-      <CardContent className="grid gap-2 px-3">
-        <Select
-          value={selectedValue}
-          disabled={loading || !config.useGlossary}
-          onValueChange={updateSelection}
-        >
-          <SelectTrigger>
-            <SelectValue placeholder="选择术语表" />
-          </SelectTrigger>
-          <SelectContent viewportClassName="max-h-72">
-            <SelectItem value="auto">自动建立术语表</SelectItem>
-            <div className="px-3 py-1.5">
-              <Separator />
-              <div className="pt-1.5 text-2xs text-muted-foreground">已有术语表</div>
-            </div>
-            {glossaries.length === 0 ? (
-              <div className="px-3 py-2 text-xs text-muted-foreground">暂无已有术语表</div>
-            ) : (
-              glossaries.map((glossary) => (
-                <SelectItem key={glossary.id} value={glossary.id}>
-                  <span className="flex min-w-0 items-center gap-2">
-                    <span className="truncate">{glossary.name}</span>
-                    <span className="shrink-0 text-2xs text-muted-foreground">
-                      {displayLanguagePair(glossary.sourceLanguage, glossary.targetLanguage)}
-                    </span>
-                  </span>
-                </SelectItem>
-              ))
-            )}
-          </SelectContent>
-        </Select>
-      </CardContent>
-    </Card>
   );
 }

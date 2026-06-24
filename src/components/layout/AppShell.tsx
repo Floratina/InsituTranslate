@@ -9,7 +9,6 @@ import {
   Settings,
   type LucideIcon,
 } from "lucide-react";
-import { motion } from "motion/react";
 
 import { WindowTitleBar } from "@/components/layout/WindowTitleBar";
 import { cn } from "@/lib/utils";
@@ -44,11 +43,6 @@ const navigationItems: NavigationItem[] = [
   { label: "助手", icon: Bot, page: "assistants" },
 ];
 
-const navigationTransition = {
-  duration: 0.20,
-  ease: [0.03, 0.59, 0.19, 1] as const,
-};
-
 interface SidebarNavigationButtonProps {
   label: string;
   icon: LucideIcon;
@@ -63,20 +57,19 @@ function SidebarNavigationButton({
   onClick,
 }: SidebarNavigationButtonProps) {
   return (
-    <motion.button
+    <button
       type="button"
-      whileHover={{ x: 2 }}
-      whileTap={{ scale: 0.99 }}
-      transition={navigationTransition}
       onClick={onClick}
+      aria-current={active ? "page" : undefined}
       className={cn(
-        "flex h-9 w-full items-center gap-2 rounded-[6px] px-2 text-left text-sm text-muted-foreground",
-        active && "bg-accent font-medium text-accent-foreground",
+        "flex h-9 w-full items-center gap-2 rounded-[6px] border-0 bg-transparent px-2 text-left text-sm text-muted-foreground outline-none transition-[background-color,color] duration-[80ms] ease-out hover:bg-[var(--button-ghost-hover-bg)] hover:text-foreground active:bg-[var(--button-ghost-pressed-bg)] active:text-foreground active:duration-[60ms] focus-visible:ring-3 focus-visible:ring-ring/40",
+        active &&
+          "bg-accent font-medium text-accent-foreground hover:bg-[color-mix(in_oklch,var(--accent),var(--foreground)_8%)] hover:text-accent-foreground active:bg-[color-mix(in_oklch,var(--accent),black_10%)] active:text-accent-foreground",
       )}
     >
       <Icon className="size-4" strokeWidth={1.8} />
       {label}
-    </motion.button>
+    </button>
   );
 }
 

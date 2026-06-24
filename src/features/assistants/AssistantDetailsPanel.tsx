@@ -31,6 +31,7 @@ import {
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { SECONDARY_PAGE_FADE_UP_STYLE } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 import { PURPOSES as PROVIDER_PURPOSES } from "@/features/providers/constants";
 
@@ -200,12 +201,10 @@ export function AssistantDetailsPanel({
   }
 
   return (
-    <motion.div
+    <div
       key={assistant.id}
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={sectionTransition}
-      className="flex min-h-0 flex-1 flex-col"
+      style={SECONDARY_PAGE_FADE_UP_STYLE}
+      className="app-fade-up-enter flex min-h-0 flex-1 flex-col"
     >
       <div className="flex shrink-0 items-start justify-between gap-3 border-b p-3">
         <div className="flex min-w-0 items-center gap-3">
@@ -450,6 +449,6 @@ export function AssistantDetailsPanel({
         onOpenChange={setPromptOpen}
         onSave={onSavePrompt}
       />
-    </motion.div>
+    </div>
   );
 }

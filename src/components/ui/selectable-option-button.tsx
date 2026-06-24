@@ -31,26 +31,29 @@ function SelectableOptionButton({
       transition={transition ?? { duration: 0.12, ease: [0.03, 0.59, 0.19, 1] }}
       disabled={disabled}
       className={cn(
-        "grid min-h-14 grid-cols-[1fr_auto] items-start gap-3 rounded-[6px] border bg-background/60 px-3 py-2 text-left outline-none transition-colors duration-150 hover:bg-accent/40 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/30 disabled:pointer-events-none disabled:opacity-60",
-        selected && "border-primary/45 bg-accent text-accent-foreground hover:bg-accent/90",
+        "relative flex min-h-14 w-full min-w-0 items-center gap-3 rounded-[6px] border bg-background px-3 py-2 text-left outline-none transition-[background-color,border-color,box-shadow] duration-150 hover:bg-muted/60 focus-visible:ring-3 focus-visible:ring-ring/40 disabled:pointer-events-none disabled:opacity-60",
+        selected && "border-primary bg-background ring-1 ring-primary/35",
         className,
       )}
       {...props}
     >
-      <span className="min-w-0">
+      <span className="min-w-0 flex-1">
         <span className="block text-sm font-medium">{label}</span>
         {description && (
           <span
             className={cn(
-              "mt-0.5 block text-2xs leading-snug",
-              selected ? "text-accent-foreground/75" : "text-muted-foreground",
+              "mt-0.5 block text-xs leading-snug text-muted-foreground",
             )}
           >
             {description}
           </span>
         )}
       </span>
-      {selected && <Check className="mt-0.5 size-4 shrink-0 text-primary" />}
+      {selected && (
+        <span className="ml-auto flex size-5 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground">
+          <Check className="size-3" />
+        </span>
+      )}
     </motion.button>
   );
 }

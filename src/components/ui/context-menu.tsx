@@ -1,7 +1,6 @@
 import * as React from "react"
 import { Check, ChevronRight } from "lucide-react"
 import { ContextMenu as ContextMenuPrimitive } from "radix-ui"
-import { motion } from "motion/react"
 
 import { cn } from "@/lib/utils"
 
@@ -21,17 +20,17 @@ function ContextMenuContent({
         className="z-[70] min-w-40"
         {...props}
       >
-        <motion.div
-          initial={{ opacity: 0, scale: 0.985 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 0.15, ease: [0.03, 0.59, 0.19, 1] }}
+        <div
+          style={{
+            transformOrigin: "var(--radix-context-menu-content-transform-origin)",
+          }}
           className={cn(
-            "origin-[var(--radix-context-menu-content-transform-origin)] overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
+            "floating-menu-enter-y overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
             className,
           )}
         >
           {children}
-        </motion.div>
+        </div>
       </ContextMenuPrimitive.Content>
     </ContextMenuPrimitive.Portal>
   )
@@ -49,17 +48,17 @@ function ContextMenuSubContent({
         sideOffset={4}
         {...props}
       >
-        <motion.div
-          initial={{ opacity: 0, x: -3 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ duration: 0.12, ease: [0.03, 0.59, 0.19, 1] }}
+        <div
+          style={{
+            transformOrigin: "var(--radix-context-menu-content-transform-origin)",
+          }}
           className={cn(
-            "origin-[var(--radix-context-menu-content-transform-origin)] overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
+            "floating-menu-enter-y overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
             className,
           )}
         >
           {children}
-        </motion.div>
+        </div>
       </ContextMenuPrimitive.SubContent>
     </ContextMenuPrimitive.Portal>
   )

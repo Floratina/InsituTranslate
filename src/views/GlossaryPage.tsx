@@ -99,6 +99,7 @@ import type {
   GlossaryView,
   SortMode,
 } from "@/features/glossary/types";
+import { SECONDARY_PAGE_FADE_UP_STYLE } from "@/lib/motion";
 import { appSessionCache } from "@/lib/session-cache";
 import { cn } from "@/lib/utils";
 
@@ -107,7 +108,6 @@ const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
 const LOADING_INDICATOR_DELAY_MS = 120;
 const TABLE_REFRESH_TRANSITION = { duration: 0.1, ease: [0.03, 0.59, 0.19, 1] as const };
-const GLOSSARY_VIEW_TRANSITION = { duration: 0.20, ease: [0.03, 0.59, 0.19, 1] as const };
 
 const SORT_LABELS: Record<SortMode, string> = {
   "created-desc": "添加时间倒序",
@@ -324,6 +324,7 @@ export default function GlossaryPage() {
   const [selectedGlossary, setSelectedGlossary] = useState<GlossaryView | null>(
     cachedSelectedGlossary,
   );
+  const [animateSecondaryView, setAnimateSecondaryView] = useState(false);
   const [search, setSearch] = useState(cachedIndex?.search ?? "");
   const [tagFilter, setTagFilter] = useState(cachedIndex?.tagFilter ?? ALL_VALUE);
   const [sourceFilter, setSourceFilter] = useState(cachedIndex?.sourceFilter ?? ALL_VALUE);
@@ -775,11 +776,22 @@ export default function GlossaryPage() {
     }
   }
 
+  function openGlossaryDetail(glossary: GlossaryView): void {
+    setAnimateSecondaryView(true);
+    setSelectedGlossary(glossary);
+  }
+
+  function closeGlossaryDetail(): void {
+    setAnimateSecondaryView(true);
+    setSelectedGlossary(null);
+  }
+
   return (
     <main className="flex min-w-0 flex-1 flex-col overflow-hidden p-3">
         {!selectedGlossary ? (
           <GlossaryListView
             key="glossary-index"
+            animateEnter={animateSecondaryView}
             glossaries={pagedGlossaries}
             filterSeed={filterSeed}
             totalCount={glossaries.length}
@@ -800,7 +812,7 @@ export default function GlossaryPage() {
             onSourceFilterChange={setSourceFilter}
             onTargetFilterChange={setTargetFilter}
             onUpload={() => setUploadOpen(true)}
-            onOpen={setSelectedGlossary}
+            onOpen={openGlossaryDetail}
             onEditInfo={openGlossaryEditor}
             onOpenFolder={(glossary) => {
               void openGlossaryFolder(glossary.id).catch((error: unknown) => {
@@ -826,7 +838,8 @@ export default function GlossaryPage() {
             entrySortLoading={entrySortLoading}
             widths={detailWidths}
             totalPages={selectedEntryTotalPages}
-            onBack={() => setSelectedGlossary(null)}
+            animateEnter={animateSecondaryView}
+            onBack={closeGlossaryDetail}
             onSearchChange={setEntrySearch}
             onAdd={() => openEntryEditor(null)}
             onEdit={openEntryEditor}
@@ -913,6 +926,7 @@ export default function GlossaryPage() {
 }
 
 interface GlossaryListViewProps {
+  animateEnter: boolean;
   glossaries: GlossaryView[];
   filterSeed: GlossaryView[];
   totalCount: number;
@@ -946,6 +960,7 @@ interface GlossaryListViewProps {
 }
 
 function GlossaryListView({
+  animateEnter,
   glossaries,
   filterSeed,
   totalCount,
@@ -992,11 +1007,12 @@ function GlossaryListView({
   }, [filterSeed]);
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={GLOSSARY_VIEW_TRANSITION}
-      className="flex min-h-0 flex-1 flex-col"
+    <div
+      style={animateEnter ? SECONDARY_PAGE_FADE_UP_STYLE : undefined}
+      className={cn(
+        "flex min-h-0 flex-1 flex-col",
+        animateEnter && "app-fade-up-enter",
+      )}
     >
       <header className="mb-3 shrink-0">
         <div className="flex items-center gap-2">
@@ -1081,7 +1097,7 @@ function GlossaryListView({
         onResize={onResize}
         onAutoFit={onAutoFit}
       />
-    </motion.div>
+    </div>
   );
 }
 
@@ -1160,12 +1176,7 @@ function GlossaryListTable({
     ].join("-");
 
   return (
-      <motion.section
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={GLOSSARY_VIEW_TRANSITION}
-        className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card"
-      >
+      <section className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card">
         <div
           ref={tableViewportRef}
           className={cn(
@@ -1250,7 +1261,7 @@ function GlossaryListTable({
                 glossaries.map((glossary) => (
                   <ContextMenu key={glossary.id}>
                     <ContextMenuTrigger asChild>
-                      <motion.tr
+                      <tr
                         className="cursor-pointer border-b align-top transition-colors duration-100 hover:bg-accent/35 active:bg-accent/60"
                         onDoubleClick={() => onOpen(glossary)}
                       >
@@ -1278,7 +1289,7 @@ function GlossaryListTable({
                             onDelete={onDelete}
                           />
                         </td>
-                      </motion.tr>
+                      </tr>
                     </ContextMenuTrigger>
                     <GlossaryListContextMenuContent
                       glossary={glossary}
@@ -1302,7 +1313,7 @@ function GlossaryListTable({
           onPageChange={onPageChange}
           onPageSizeChange={onPageSizeChange}
         />
-      </motion.section>
+      </section>
   );
 }
 
@@ -1381,7 +1392,7 @@ function GlossaryListActionDropdown({
           type="button"
           variant="ghost"
           size="icon-sm"
-          className="mx-auto size-7 border-0 bg-transparent text-muted-foreground shadow-none hover:bg-muted/60 hover:text-foreground active:bg-muted/80 focus-visible:border-transparent focus-visible:ring-0 aria-expanded:bg-muted/60 aria-expanded:text-foreground"
+          className="mx-auto size-7 border-0 bg-transparent text-muted-foreground shadow-none hover:bg-[var(--button-ghost-hover-bg)] hover:text-foreground active:bg-[var(--button-ghost-pressed-bg)] active:text-foreground active:duration-[60ms] focus-visible:border-transparent focus-visible:ring-0 aria-expanded:bg-[var(--button-ghost-hover-bg)] aria-expanded:text-foreground"
           aria-label={`${glossary.name} 操作`}
           title="操作"
           onClick={(event) => event.stopPropagation()}
@@ -1434,6 +1445,7 @@ function GlossaryListActionDropdown({
 }
 
 interface GlossaryDetailViewProps {
+  animateEnter: boolean;
   glossary: GlossaryView;
   entryPage: {
     entries: GlossaryEntryView[];
@@ -1460,6 +1472,7 @@ interface GlossaryDetailViewProps {
 }
 
 function GlossaryDetailView({
+  animateEnter,
   glossary,
   entryPage,
   entrySearch,
@@ -1500,11 +1513,12 @@ function GlossaryDetailView({
     ].join("-");
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={GLOSSARY_VIEW_TRANSITION}
-      className="flex min-h-0 flex-1 flex-col"
+    <div
+      style={animateEnter ? SECONDARY_PAGE_FADE_UP_STYLE : undefined}
+      className={cn(
+        "flex min-h-0 flex-1 flex-col",
+        animateEnter && "app-fade-up-enter",
+      )}
     >
       <header className="mb-3 shrink-0">
         <div className="flex items-center gap-2">
@@ -1534,12 +1548,7 @@ function GlossaryDetailView({
         />
       </div>
 
-      <motion.section
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={GLOSSARY_VIEW_TRANSITION}
-        className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card"
-      >
+      <section className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card">
         <div
           ref={tableViewportRef}
           className={cn(
@@ -1604,7 +1613,7 @@ function GlossaryDetailView({
                 entryPage.entries.map((entry) => (
                   <ContextMenu key={entry.id}>
                     <ContextMenuTrigger asChild>
-                      <motion.tr
+                      <tr
                         className="cursor-pointer border-b transition-colors duration-100 hover:bg-accent/35 active:bg-accent/60"
                       >
                         <td className="h-9 min-w-0 truncate px-3 py-2" title={entry.src}>
@@ -1620,7 +1629,7 @@ function GlossaryDetailView({
                             onDelete={onDelete}
                           />
                         </td>
-                      </motion.tr>
+                      </tr>
                     </ContextMenuTrigger>
                     <GlossaryEntryContextMenuContent
                       entry={entry}
@@ -1641,8 +1650,8 @@ function GlossaryDetailView({
           onPageChange={onPageChange}
           onPageSizeChange={onPageSizeChange}
         />
-      </motion.section>
-    </motion.div>
+      </section>
+    </div>
   );
 }
 
@@ -1687,7 +1696,7 @@ function GlossaryEntryActionDropdown({
           type="button"
           variant="ghost"
           size="icon-sm"
-          className="mx-auto size-7 border-0 bg-transparent text-muted-foreground shadow-none hover:bg-muted/60 hover:text-foreground active:bg-muted/80 focus-visible:border-transparent focus-visible:ring-0 aria-expanded:bg-muted/60 aria-expanded:text-foreground"
+          className="mx-auto size-7 border-0 bg-transparent text-muted-foreground shadow-none hover:bg-[var(--button-ghost-hover-bg)] hover:text-foreground active:bg-[var(--button-ghost-pressed-bg)] active:text-foreground active:duration-[60ms] focus-visible:border-transparent focus-visible:ring-0 aria-expanded:bg-[var(--button-ghost-hover-bg)] aria-expanded:text-foreground"
           aria-label={`${entry.src} 操作`}
           title="操作"
           onClick={(event) => event.stopPropagation()}
@@ -1843,7 +1852,7 @@ function PaginationBar({
         <div className="flex items-center gap-2">
           <span>每页显示</span>
           <Select value={String(pageSize)} onValueChange={changePageSize}>
-            <SelectTrigger className="h-7 w-20 bg-background hover:bg-muted">
+            <SelectTrigger className="h-7 w-20 bg-background">
               <SelectValue />
             </SelectTrigger>
             <SelectContent side="top" align="center" viewportClassName="max-h-56">

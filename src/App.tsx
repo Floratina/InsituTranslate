@@ -1,9 +1,10 @@
 import { useCallback, useRef, useState } from "react";
-import { motion, MotionConfig } from "motion/react";
+import { MotionConfig } from "motion/react";
 
 import { AppShell, type AppPage } from "@/components/layout/AppShell";
 import { ToastProvider } from "@/components/ui/toast-stack";
 import { AppearanceProvider } from "@/features/appearance/AppearanceProvider";
+import { PRIMARY_PAGE_FADE_UP_STYLE } from "@/lib/motion";
 import { appSessionCache } from "@/lib/session-cache";
 import ProviderSettingsPage from "@/views/ProviderSettingsPage";
 import AppearanceSettingsPage from "@/views/AppearanceSettingsPage";
@@ -14,11 +15,6 @@ import GlossaryPage from "@/views/GlossaryPage";
 import ProofreadingPage from "@/views/ProofreadingPage";
 import StartPage from "@/views/StartPage";
 import TranslationTasksPage from "@/views/TranslationTasksPage";
-
-const pageTransition = {
-  duration: 0.20,
-  ease: [0.03, 0.59, 0.19, 1] as const,
-};
 
 function App() {
   const [activePage, setActivePage] = useState<AppPage>("start");
@@ -65,22 +61,17 @@ function App() {
     );
 
   return (
-    <MotionConfig
-      reducedMotion="user"
-      transition={{ duration: 0.20, ease: [0.03, 0.59, 0.19, 1] }}
-    >
+    <MotionConfig reducedMotion="user">
       <AppearanceProvider>
         <ToastProvider>
           <AppShell activePage={activePage} onNavigate={navigate}>
-            <motion.div
+            <div
               key={activePage}
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={pageTransition}
-              className="flex min-h-0 min-w-0 flex-1 overflow-hidden"
+              style={PRIMARY_PAGE_FADE_UP_STYLE}
+              className="app-fade-up-enter flex min-h-0 min-w-0 flex-1 overflow-hidden"
             >
               {pageContent}
-            </motion.div>
+            </div>
           </AppShell>
         </ToastProvider>
       </AppearanceProvider>

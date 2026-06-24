@@ -1,12 +1,147 @@
 import * as React from "react"
 import { ChevronRight } from "lucide-react"
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui"
-import { motion } from "motion/react"
 
 import { cn } from "@/lib/utils"
 
-const DropdownMenu = DropdownMenuPrimitive.Root
-const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger
+interface DropdownMenuControlContextValue {
+  open: boolean
+  setOpen: (open: boolean) => void
+}
+
+const DropdownMenuControlContext =
+  React.createContext<DropdownMenuControlContextValue | null>(null)
+
+function DropdownMenu({
+  open: openProp,
+  defaultOpen,
+  onOpenChange,
+  ...props
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Root>) {
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(defaultOpen ?? false)
+  const open = openProp ?? uncontrolledOpen
+
+  const setOpen = React.useCallback(
+    (nextOpen: boolean) => {
+      if (openProp === undefined) {
+        setUncontrolledOpen(nextOpen)
+      }
+      onOpenChange?.(nextOpen)
+    },
+    [onOpenChange, openProp],
+  )
+
+  return (
+    <DropdownMenuControlContext.Provider value={{ open, setOpen }}>
+      <DropdownMenuPrimitive.Root open={open} onOpenChange={setOpen} {...props} />
+    </DropdownMenuControlContext.Provider>
+  )
+}
+
+const DropdownMenuTrigger = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.Trigger>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Trigger>
+>(
+  (
+    {
+      disabled,
+      onClick,
+      onPointerCancel,
+      onPointerDown,
+      onPointerUp,
+      ...props
+    },
+    ref,
+  ) => {
+    const control = React.useContext(DropdownMenuControlContext)
+    const pendingPointerRef = React.useRef(false)
+    const pendingPointerIdRef = React.useRef<number | null>(null)
+    const suppressNextClickRef = React.useRef(false)
+
+    const clearPendingPointer = React.useCallback((target?: HTMLButtonElement) => {
+      if (
+        target &&
+        pendingPointerIdRef.current !== null &&
+        target.hasPointerCapture(pendingPointerIdRef.current)
+      ) {
+        target.releasePointerCapture(pendingPointerIdRef.current)
+      }
+      pendingPointerRef.current = false
+      pendingPointerIdRef.current = null
+    }, [])
+
+    const handlePointerDown: React.PointerEventHandler<HTMLButtonElement> = (event) => {
+      onPointerDown?.(event)
+
+      if (
+        event.defaultPrevented ||
+        disabled ||
+        control === null ||
+        event.button !== 0 ||
+        event.ctrlKey
+      ) {
+        return
+      }
+
+      pendingPointerRef.current = true
+      pendingPointerIdRef.current = event.pointerId
+      suppressNextClickRef.current = true
+      event.currentTarget.setPointerCapture(event.pointerId)
+      event.preventDefault()
+    }
+
+    const handlePointerUp: React.PointerEventHandler<HTMLButtonElement> = (event) => {
+      onPointerUp?.(event)
+
+      if (event.defaultPrevented || disabled || control === null || !pendingPointerRef.current) {
+        return
+      }
+
+      const rect = event.currentTarget.getBoundingClientRect()
+      const releasedInside =
+        event.clientX >= rect.left &&
+        event.clientX <= rect.right &&
+        event.clientY >= rect.top &&
+        event.clientY <= rect.bottom
+
+      clearPendingPointer(event.currentTarget)
+      if (releasedInside) {
+        control.setOpen(!control.open)
+      }
+    }
+
+    const handlePointerCancel: React.PointerEventHandler<HTMLButtonElement> = (event) => {
+      clearPendingPointer(event.currentTarget)
+      onPointerCancel?.(event)
+    }
+
+    const handleClick: React.MouseEventHandler<HTMLButtonElement> = (event) => {
+      onClick?.(event)
+
+      if (!suppressNextClickRef.current) {
+        return
+      }
+
+      suppressNextClickRef.current = false
+      event.preventDefault()
+      event.stopPropagation()
+    }
+
+    return (
+      <DropdownMenuPrimitive.Trigger
+        {...props}
+        ref={ref}
+        disabled={disabled}
+        onClick={handleClick}
+        onPointerCancel={handlePointerCancel}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+      />
+    )
+  },
+)
+DropdownMenuTrigger.displayName = "DropdownMenuTrigger"
+
 const DropdownMenuSub = DropdownMenuPrimitive.Sub
 
 function DropdownMenuContent({
@@ -22,17 +157,17 @@ function DropdownMenuContent({
         className="z-[70] min-w-36"
         {...props}
       >
-        <motion.div
-          initial={{ opacity: 0, y: -4, scale: 0.985 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          transition={{ duration: 0.22, ease: [0.03, 0.59, 0.19, 1] }}
+        <div
+          style={{
+            transformOrigin: "var(--radix-dropdown-menu-content-transform-origin)",
+          }}
           className={cn(
-            "scrollbar-subtle max-h-[min(22rem,var(--radix-dropdown-menu-content-available-height))] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[6px] border bg-popover text-popover-foreground shadow-lg",
+            "floating-menu-enter scrollbar-subtle max-h-[min(22rem,var(--radix-dropdown-menu-content-available-height))] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[6px] border bg-popover text-popover-foreground shadow-2xl transform-gpu",
             className,
           )}
         >
           {children}
-        </motion.div>
+        </div>
       </DropdownMenuPrimitive.Content>
     </DropdownMenuPrimitive.Portal>
   )
@@ -51,17 +186,17 @@ function DropdownMenuSubContent({
         className="z-[80] min-w-36"
         {...props}
       >
-        <motion.div
-          initial={{ opacity: 0, x: -3 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ duration: 0.12, ease: [0.03, 0.59, 0.19, 1] }}
+        <div
+          style={{
+            transformOrigin: "var(--radix-dropdown-menu-content-transform-origin)",
+          }}
           className={cn(
-            "origin-[var(--radix-dropdown-menu-content-transform-origin)] overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
+            "floating-menu-enter overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-2xl transform-gpu",
             className,
           )}
         >
           {children}
-        </motion.div>
+        </div>
       </DropdownMenuPrimitive.SubContent>
     </DropdownMenuPrimitive.Portal>
   )

@@ -205,13 +205,9 @@ function CapabilityBadge({
     <Button
       type="button"
       size="xs"
-      variant="outline"
+      variant={active ? "accent" : "outline"}
       aria-pressed={active}
-      className={cn(
-        "rounded-[6px] text-2xs",
-        active &&
-          "!border-enabled-accent !bg-enabled-accent !text-white hover:!border-enabled-accent hover:!bg-enabled-accent/90 hover:!text-white focus-visible:!border-enabled-accent focus-visible:!ring-enabled-accent/35",
-      )}
+      className="text-2xs"
       onClick={onClick}
     >
       <Icon name={icon} className="text-sm" />

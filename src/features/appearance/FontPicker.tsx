@@ -25,8 +25,35 @@ const PREVIEW_FONTS = [
   "SimSun",
   "Times New Roman",
 ];
+const COMMON_UI_FONT_CANDIDATES = [
+  "Segoe UI Variable Text",
+  "Segoe UI Variable Display",
+  "Segoe UI Variable",
+  "Segoe UI",
+  "Microsoft YaHei UI",
+  "Microsoft YaHei",
+  "DengXian",
+  "Aptos",
+  "Calibri",
+  "Arial",
+  "Verdana",
+  "Tahoma",
+  "SimSun",
+  "NSimSun",
+  "PingFang SC",
+  "Hiragino Sans GB",
+  "Noto Sans CJK SC",
+  "Noto Sans SC",
+  "Source Han Sans SC",
+  "Source Han Sans CN",
+  "HarmonyOS Sans SC",
+  "MiSans",
+  "Yu Gothic UI",
+  "Meiryo",
+  "Malgun Gothic",
+  "Apple SD Gothic Neo",
+] as const;
 const FONT_CACHE_KEY = "insitu-system-fonts-v1";
-const FONT_RENDER_BATCH_SIZE = 80;
 
 interface FontCache {
   version: 1;
@@ -111,7 +138,32 @@ function displayName(value: string): string {
 }
 
 function normalizeFontName(value: string): string {
-  return value.toLocaleLowerCase();
+  return value.trim().toLocaleLowerCase();
+}
+
+function buildFontLookup(fonts: string[]): Map<string, string> {
+  const lookup = new Map<string, string>();
+  fonts.forEach((font) => {
+    const normalized = normalizeFontName(font);
+    if (normalized && !lookup.has(normalized)) {
+      lookup.set(normalized, font);
+    }
+  });
+  return lookup;
+}
+
+function commonInstalledFonts(fontLookup: Map<string, string>): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  COMMON_UI_FONT_CANDIDATES.forEach((font) => {
+    const installedFont = fontLookup.get(normalizeFontName(font));
+    if (!installedFont) return;
+    const normalized = normalizeFontName(installedFont);
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    result.push(installedFont);
+  });
+  return result;
 }
 
 function fontStyle(value: string): string {
@@ -126,13 +178,11 @@ export function FontPicker({ value, onValueChange }: FontPickerProps) {
   const [open, setOpen] = useState<boolean>(false);
   const [query, setQuery] = useState<string>("");
   const [refreshing, setRefreshing] = useState<boolean>(false);
-  const [listReady, setListReady] = useState<boolean>(false);
-  const [visibleCount, setVisibleCount] = useState<number>(FONT_RENDER_BATCH_SIZE);
   const deferredQuery = useDeferredValue(query);
   const fonts = fontState.fonts;
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || fontState.cached) return;
     let disposed = false;
     setRefreshing(isTauriRuntime());
     void refreshSystemFonts()
@@ -158,61 +208,29 @@ export function FontPicker({ value, onValueChange }: FontPickerProps) {
     return () => {
       disposed = true;
     };
-  }, [open]);
+  }, [fontState.cached, open]);
 
-  useEffect(() => {
-    if (!open) {
-      setListReady(false);
-      setVisibleCount(FONT_RENDER_BATCH_SIZE);
-      return;
-    }
-    setListReady(false);
-    setVisibleCount(FONT_RENDER_BATCH_SIZE);
-    let secondFrame = 0;
-    const firstFrame = window.requestAnimationFrame(() => {
-      secondFrame = window.requestAnimationFrame(() => setListReady(true));
-    });
-    return () => {
-      window.cancelAnimationFrame(firstFrame);
-      if (secondFrame) window.cancelAnimationFrame(secondFrame);
-    };
-  }, [open]);
-
-  const availableFonts = useMemo(
-    () => new Set(fonts.map(normalizeFontName)),
-    [fonts],
-  );
+  const availableFonts = useMemo(() => buildFontLookup(fonts), [fonts]);
   const options = useMemo(() => {
-    const selected = value !== SYSTEM_FONT_VALUE && !fonts.includes(value) ? [value] : [];
-    return [SYSTEM_FONT_VALUE, ...selected, ...fonts];
-  }, [fonts, value]);
+    const commonFonts = commonInstalledFonts(availableFonts);
+    const commonFontNames = new Set(commonFonts.map(normalizeFontName));
+    const selectedFontName = normalizeFontName(value);
+    const selectedFont =
+      value !== SYSTEM_FONT_VALUE &&
+      !commonFontNames.has(selectedFontName) &&
+      availableFonts.has(selectedFontName)
+        ? [availableFonts.get(selectedFontName) ?? value]
+        : [];
+    return [SYSTEM_FONT_VALUE, ...selectedFont, ...commonFonts];
+  }, [availableFonts, value]);
   const filtered = useMemo(() => {
     const normalized = normalizeFontName(deferredQuery.trim());
     return normalized
       ? options.filter((font) => normalizeFontName(displayName(font)).includes(normalized))
       : options;
   }, [options, deferredQuery]);
-  const visibleOptions = useMemo(
-    () => filtered.slice(0, visibleCount),
-    [filtered, visibleCount],
-  );
-  const loadingLabel = fonts.length === 0 ? "正在加载系统字体" : "正在准备字体列表";
-  const showLoadingState = !listReady || (fonts.length === 0 && refreshing);
-
-  useEffect(() => {
-    if (!open || !listReady) return;
-    setVisibleCount(FONT_RENDER_BATCH_SIZE);
-  }, [deferredQuery, fonts, listReady, open]);
-
-  useEffect(() => {
-    if (!open || !listReady || visibleCount >= filtered.length) return;
-    const timer = window.setTimeout(() => {
-      setVisibleCount((current) =>
-        Math.min(current + FONT_RENDER_BATCH_SIZE, filtered.length),
-      );
-    }, 16);
-    return () => window.clearTimeout(timer);
-  }, [filtered.length, listReady, open, visibleCount]);
+  const showLoadingState = fonts.length === 0 && refreshing;
+  const selectedFontName = normalizeFontName(value);
 
   const handleSelectFont = useCallback(
     (font: string) => {
@@ -270,35 +288,30 @@ export function FontPicker({ value, onValueChange }: FontPickerProps) {
         <ScrollArea className="h-64">
           <div>
             {showLoadingState ? (
-              <LoadingState label={loadingLabel} />
+              <LoadingState label="正在加载可用界面字体" />
             ) : filtered.length === 0 ? (
               <div className="px-2 py-4 text-center text-xs text-muted-foreground">
                 没有匹配的字体
               </div>
             ) : (
-              <>
-                {visibleOptions.map((font) => (
-                  <button
-                    key={font}
-                    type="button"
-                    className={cn(selectItemClassName, "font-normal")}
-                    onClick={() => handleSelectFont(font)}
-                  >
-                    <span className="truncate" style={{ fontFamily: fontStyle(font) }}>
-                      {displayName(font)}
-                    </span>
-                    <Check
-                      className={cn(
-                        "absolute right-3 size-3.5",
-                        value === font ? "opacity-100" : "opacity-0",
-                      )}
-                    />
-                  </button>
-                ))}
-                {visibleOptions.length < filtered.length && (
-                  <LoadingState compact label="继续加载字体" className="border-t" />
-                )}
-              </>
+              filtered.map((font) => (
+                <button
+                  key={font}
+                  type="button"
+                  className={cn(selectItemClassName, "font-normal")}
+                  onClick={() => handleSelectFont(font)}
+                >
+                  <span className="truncate" style={{ fontFamily: fontStyle(font) }}>
+                    {displayName(font)}
+                  </span>
+                  <Check
+                    className={cn(
+                      "absolute right-3 size-3.5",
+                      selectedFontName === normalizeFontName(font) ? "opacity-100" : "opacity-0",
+                    )}
+                  />
+                </button>
+              ))
             )}
           </div>
         </ScrollArea>

@@ -61,6 +61,20 @@
   --accent: oklch(0.955 0.03 255);
   --accent-foreground: oklch(0.36 0.13 255);
   --enabled-accent: oklch(0.62 0.18 255);
+  --button-standard-bg: color-mix(in oklch, var(--background), var(--foreground) 3%);
+  --button-standard-border: color-mix(in oklch, var(--foreground) 12%, transparent);
+  --button-standard-hover-bg: color-mix(in oklch, var(--background), var(--foreground) 5.5%);
+  --button-standard-hover-border: color-mix(in oklch, var(--foreground) 17%, transparent);
+  --button-standard-pressed-bg: color-mix(in oklch, var(--background), var(--foreground) 10%);
+  --button-standard-pressed-border: color-mix(in oklch, var(--foreground) 14%, transparent);
+  --button-accent-bg: var(--enabled-accent);
+  --button-accent-hover-bg: color-mix(in oklch, var(--enabled-accent), white 8%);
+  --button-accent-pressed-bg: color-mix(in oklch, var(--enabled-accent), black 16%);
+  --button-accent-border: color-mix(in oklch, var(--enabled-accent), black 8%);
+  --button-accent-hover-border: color-mix(in oklch, var(--enabled-accent), white 10%);
+  --button-accent-pressed-border: color-mix(in oklch, var(--enabled-accent), black 18%);
+  --button-ghost-hover-bg: oklch(0 0 0 / 0.04);
+  --button-ghost-pressed-bg: oklch(0 0 0 / 0.10);
   --latency-good: oklch(50.902% 0.11227 161.646);
   --latency-warning: oklch(76.841% 0.15268 80.036);
   --latency-danger: oklch(60.527% 0.1991 27.653);
@@ -120,6 +134,20 @@
   --accent: oklch(0.29 0.045 255);
   --accent-foreground: oklch(0.88 0.045 245);
   --enabled-accent: oklch(0.72 0.13 235);
+  --button-standard-bg: color-mix(in oklch, var(--background), var(--foreground) 8%);
+  --button-standard-border: color-mix(in oklch, var(--foreground) 9%, transparent);
+  --button-standard-hover-bg: color-mix(in oklch, var(--background), var(--foreground) 12%);
+  --button-standard-hover-border: color-mix(in oklch, var(--foreground) 13%, transparent);
+  --button-standard-pressed-bg: color-mix(in oklch, var(--background), var(--foreground) 4.5%);
+  --button-standard-pressed-border: color-mix(in oklch, var(--foreground) 7%, transparent);
+  --button-accent-bg: var(--enabled-accent);
+  --button-accent-hover-bg: color-mix(in oklch, var(--enabled-accent), white 7%);
+  --button-accent-pressed-bg: color-mix(in oklch, var(--enabled-accent), black 14%);
+  --button-accent-border: color-mix(in oklch, var(--enabled-accent), white 8%);
+  --button-accent-hover-border: color-mix(in oklch, var(--enabled-accent), white 16%);
+  --button-accent-pressed-border: color-mix(in oklch, var(--enabled-accent), black 10%);
+  --button-ghost-hover-bg: oklch(1 0 0 / 0.08);
+  --button-ghost-pressed-bg: oklch(0 0 0 / 0.16);
   --latency-good: oklch(84.598% 0.12533 156.097);
   --latency-warning: oklch(88.39% 0.16341 94.184);
   --latency-danger: oklch(73.802% 0.14266 27.706);
@@ -200,6 +228,129 @@ body {
   min-width: 0;
   min-height: 0;
   background: var(--background);
+}
+
+@keyframes app-fade-up-enter {
+  from {
+    opacity: 0;
+    transform: translate3d(0, var(--app-fade-up-y, 12px), 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.app-fade-up-enter {
+  animation: app-fade-up-enter var(--app-fade-up-duration, 300ms) var(--app-fade-up-ease, cubic-bezier(0.03, 0.59, 0.19, 1)) both;
+  will-change: transform, opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-fade-up-enter {
+    animation: none;
+  }
+}
+
+@keyframes floating-menu-enter-bottom {
+  from {
+    opacity: 0.25;
+    transform: translate3d(0, -10px, 0) scale(0.965);
+    clip-path: inset(0 0 90% 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    clip-path: inset(-30px -30px -30px -30px);
+  }
+}
+
+@keyframes floating-menu-enter-top {
+  from {
+    opacity: 0.25;
+    transform: translate3d(0, 10px, 0) scale(0.965);
+    clip-path: inset(90% 0 0 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    clip-path: inset(-30px -30px -30px -30px);
+  }
+}
+
+@keyframes floating-menu-enter-right {
+  from {
+    opacity: 0.25;
+    transform: translate3d(-10px, 0, 0) scale(0.965);
+    clip-path: inset(0 90% 0 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    clip-path: inset(-30px -30px -30px -30px);
+  }
+}
+
+@keyframes floating-menu-enter-left {
+  from {
+    opacity: 0.25;
+    transform: translate3d(10px, 0, 0) scale(0.965);
+    clip-path: inset(0 0 0 90%);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    clip-path: inset(-30px -30px -30px -30px);
+  }
+}
+
+.floating-menu-enter {
+  animation: floating-menu-enter-bottom 145ms cubic-bezier(0.22, 0.61, 0.36, 0.99) both;
+  will-change: transform, opacity, clip-path;
+}
+
+.floating-menu-enter-y {
+  animation: floating-menu-enter-bottom 145ms cubic-bezier(0.22, 0.61, 0.36, 0.99) both;
+  will-change: transform, opacity, clip-path;
+}
+
+.floating-menu-enter[data-side="bottom"],
+[data-side="bottom"] > .floating-menu-enter {
+  animation-name: floating-menu-enter-bottom;
+}
+
+.floating-menu-enter[data-side="top"],
+[data-side="top"] > .floating-menu-enter {
+  animation-name: floating-menu-enter-top;
+}
+
+.floating-menu-enter-y[data-side="top"],
+[data-side="top"] > .floating-menu-enter-y {
+  animation-name: floating-menu-enter-top;
+}
+
+.floating-menu-enter-y[data-side="bottom"],
+[data-side="bottom"] > .floating-menu-enter-y,
+.floating-menu-enter-y[data-side="left"],
+[data-side="left"] > .floating-menu-enter-y,
+.floating-menu-enter-y[data-side="right"],
+[data-side="right"] > .floating-menu-enter-y {
+  animation-name: floating-menu-enter-bottom;
+}
+
+.floating-menu-enter[data-side="right"],
+[data-side="right"] > .floating-menu-enter {
+  animation-name: floating-menu-enter-right;
+}
+
+.floating-menu-enter[data-side="left"],
+[data-side="left"] > .floating-menu-enter {
+  animation-name: floating-menu-enter-left;
 }
 
 .scrollbar-hidden {

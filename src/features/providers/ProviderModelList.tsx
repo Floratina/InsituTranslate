@@ -9,7 +9,6 @@ import {
   Wrench,
   type LucideIcon,
 } from "lucide-react";
-import { motion } from "motion/react";
 
 import { Button } from "@/components/ui/button";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
@@ -40,8 +39,6 @@ interface CapabilityPillProps {
   label: string;
   active: boolean;
 }
-
-const sectionTransition = { duration: 0.28, ease: [0.03, 0.59, 0.19, 1] as const };
 
 function latencyClassName(latencyMs: number | null): string {
   if (latencyMs === null) return "text-muted-foreground";
@@ -76,12 +73,7 @@ export function ProviderModelList({
   const isMinerU = variant === "mineru";
 
   return (
-    <motion.section
-      initial={{ opacity: 0, y: 4 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={sectionTransition}
-      className="min-h-64 overflow-hidden rounded-[6px] border"
-    >
+    <section className="min-h-64 overflow-hidden rounded-[6px] border">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b p-2">
         <div className="flex min-w-0 items-center gap-1.5">
           <div className="text-sm font-semibold">模型列表</div>
@@ -178,6 +170,6 @@ export function ProviderModelList({
           )}
         </TableBody>
       </Table>
-    </motion.section>
+    </section>
   );
 }

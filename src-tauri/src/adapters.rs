@@ -660,6 +660,33 @@ fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+const PROTECTED_CUSTOM_PARAMETER_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "message",
+    "input",
+    "instructions",
+    "contents",
+    "system",
+    "systemInstruction",
+    "system_instruction",
+    "system_prompt",
+    "systemPrompt",
+    "prompt",
+    "tools",
+    "tool_choice",
+    "toolChoice",
+    "toolConfig",
+    "tool_config",
+    "stream",
+    "stream_options",
+    "streamOptions",
+];
+
+fn is_protected_custom_parameter_key(key: &str) -> bool {
+    PROTECTED_CUSTOM_PARAMETER_KEYS.contains(&key)
+}
+
 fn merge_custom_parameters(mut body: Value, custom_parameters: &Value) -> Result<Value, String> {
     if custom_parameters.is_null() {
         return Ok(body);
@@ -673,7 +700,15 @@ fn merge_custom_parameters(mut body: Value, custom_parameters: &Value) -> Result
     let Some(body_object) = body.as_object_mut() else {
         return Err("Provider request body must be a JSON object".into());
     };
-    deep_merge_object(body_object, custom);
+    let sanitized = custom
+        .iter()
+        .filter(|(key, _)| !is_protected_custom_parameter_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if sanitized.is_empty() {
+        return Ok(body);
+    }
+    deep_merge_object(body_object, &sanitized);
     Ok(body)
 }
 
@@ -2186,6 +2221,9 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    const SYSTEM_TEXT: &str = "Always translate formally.";
+    const USER_TEXT: &str = "Hello.";
+
     fn request() -> UnifiedChatRequest {
         UnifiedChatRequest {
             model: "deepseek-v4".into(),
@@ -2212,6 +2250,105 @@ mod tests {
             stream: true,
             logprobs: false,
             custom_parameters: json!({}),
+        }
+    }
+
+    fn prompt_request() -> UnifiedChatRequest {
+        UnifiedChatRequest {
+            model: "stable-model".into(),
+            messages: vec![
+                UnifiedMessage {
+                    role: "system".into(),
+                    content: vec![UnifiedContent::Text {
+                        text: SYSTEM_TEXT.into(),
+                    }],
+                },
+                UnifiedMessage {
+                    role: "user".into(),
+                    content: vec![UnifiedContent::Text {
+                        text: USER_TEXT.into(),
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            tool_choice: UnifiedToolChoice::None,
+            thinking: None,
+            max_output_tokens: None,
+            temperature: Some(0.0),
+            stream: false,
+            logprobs: false,
+            custom_parameters: json!({}),
+        }
+    }
+
+    fn adapter_for(protocol: ProviderProtocol, base_url: &str) -> RuntimeAdapter {
+        RuntimeAdapter::new(
+            Client::new(),
+            ProviderRuntimeConfig {
+                protocol,
+                base_url: base_url.into(),
+                use_raw_base_url: false,
+                config: if protocol == ProviderProtocol::VertexAi {
+                    json!({
+                        "vertexAi": {
+                            "projectId": "project-1",
+                            "location": "global",
+                            "clientEmail": "svc@project-1.iam.gserviceaccount.com"
+                        }
+                    })
+                } else {
+                    json!({})
+                },
+                auth_type: "none".into(),
+                auth_header: "Authorization".into(),
+                credential: if protocol == ProviderProtocol::VertexAi {
+                    Some("private-key".into())
+                } else {
+                    None
+                },
+                custom_headers: Vec::new(),
+            },
+        )
+    }
+
+    fn protected_custom_parameters() -> Value {
+        json!({
+            "model": "custom-model",
+            "messages": [{"role": "user", "content": "custom messages"}],
+            "message": {"role": "user", "content": "custom message"},
+            "input": "custom input",
+            "instructions": "custom instructions",
+            "contents": [{"role": "user", "parts": [{"text": "custom contents"}]}],
+            "system": "custom system",
+            "systemInstruction": {"parts": [{"text": "custom system instruction"}]},
+            "system_instruction": "custom system instruction",
+            "system_prompt": "custom system prompt",
+            "systemPrompt": "custom system prompt",
+            "prompt": "custom prompt",
+            "tools": [{"type": "function", "function": {"name": "custom_tool"}}],
+            "tool_choice": "required",
+            "toolChoice": {"functionCallingConfig": {"mode": "ANY"}},
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+            "tool_config": {"functionCallingConfig": {"mode": "ANY"}},
+            "stream": true,
+            "stream_options": {"include_usage": false},
+            "streamOptions": {"includeUsage": false}
+        })
+    }
+
+    fn assert_protected_top_level_absent(body: &Value) {
+        for key in [
+            "message",
+            "instructions",
+            "system_instruction",
+            "system_prompt",
+            "systemPrompt",
+            "prompt",
+            "toolChoice",
+            "tool_config",
+            "streamOptions",
+        ] {
+            assert!(body.get(key).is_none(), "{key} should be ignored");
         }
     }
 
@@ -2312,6 +2449,194 @@ mod tests {
         let (_, body) = adapter.build_chat_request(&request).expect("request");
         assert!(body.get("logprobs").is_none());
         assert!(body.get("top_logprobs").is_none());
+    }
+
+    #[test]
+    fn custom_parameters_cannot_override_openai_chat_prompt_fields() {
+        let adapter = adapter_for(ProviderProtocol::OpenaiChat, "https://api.deepseek.com");
+        let mut request = prompt_request();
+        request.custom_parameters = protected_custom_parameters();
+
+        let (_, body) = adapter.build_chat_request(&request).expect("request");
+
+        assert_eq!(body.get("model"), Some(&json!("stable-model")));
+        assert_eq!(body.get("stream"), Some(&json!(false)));
+        assert_eq!(body.pointer("/messages/0/role"), Some(&json!("system")));
+        assert_eq!(
+            body.pointer("/messages/0/content"),
+            Some(&json!(SYSTEM_TEXT))
+        );
+        assert_eq!(body.pointer("/messages/1/role"), Some(&json!("user")));
+        assert_eq!(body.pointer("/messages/1/content"), Some(&json!(USER_TEXT)));
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("stream_options").is_none());
+        assert_protected_top_level_absent(&body);
+    }
+
+    #[test]
+    fn custom_parameters_cannot_override_openai_responses_prompt_fields() {
+        let adapter = adapter_for(ProviderProtocol::OpenaiResponses, "https://api.openai.com");
+        let mut request = prompt_request();
+        request.custom_parameters = protected_custom_parameters();
+
+        let (_, body) = adapter.build_chat_request(&request).expect("request");
+
+        assert_eq!(body.get("model"), Some(&json!("stable-model")));
+        assert_eq!(body.get("stream"), Some(&json!(false)));
+        assert_eq!(body.pointer("/input/0/role"), Some(&json!("system")));
+        assert_eq!(
+            body.pointer("/input/0/content/0/text"),
+            Some(&json!(SYSTEM_TEXT))
+        );
+        assert_eq!(body.pointer("/input/1/role"), Some(&json!("user")));
+        assert_eq!(
+            body.pointer("/input/1/content/0/text"),
+            Some(&json!(USER_TEXT))
+        );
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert_protected_top_level_absent(&body);
+    }
+
+    #[test]
+    fn custom_parameters_cannot_override_anthropic_prompt_fields() {
+        let adapter = adapter_for(ProviderProtocol::Anthropic, "https://api.anthropic.com");
+        let mut request = prompt_request();
+        request.custom_parameters = protected_custom_parameters();
+
+        let (_, body) = adapter.build_chat_request(&request).expect("request");
+
+        assert_eq!(body.get("model"), Some(&json!("stable-model")));
+        assert_eq!(body.pointer("/system/0/text"), Some(&json!(SYSTEM_TEXT)));
+        assert_eq!(
+            body.pointer("/messages/0/content/0/text"),
+            Some(&json!(USER_TEXT))
+        );
+        assert!(body.get("contents").is_none());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert_protected_top_level_absent(&body);
+    }
+
+    #[test]
+    fn custom_parameters_cannot_override_gemini_prompt_fields() {
+        for protocol in [ProviderProtocol::Gemini, ProviderProtocol::VertexAi] {
+            let adapter = adapter_for(
+                protocol,
+                if protocol == ProviderProtocol::VertexAi {
+                    "https://aiplatform.googleapis.com"
+                } else {
+                    "https://generativelanguage.googleapis.com"
+                },
+            );
+            let mut request = prompt_request();
+            request.custom_parameters = protected_custom_parameters();
+
+            let (_, body) = adapter.build_chat_request(&request).expect("request");
+
+            assert_eq!(
+                body.pointer("/systemInstruction/parts/0/text"),
+                Some(&json!(SYSTEM_TEXT))
+            );
+            assert_eq!(body.pointer("/contents/0/role"), Some(&json!("user")));
+            assert_eq!(
+                body.pointer("/contents/0/parts/0/text"),
+                Some(&json!(USER_TEXT))
+            );
+            assert_eq!(
+                body.pointer("/generationConfig/temperature"),
+                Some(&json!(0.0))
+            );
+            assert!(body.get("tools").is_none());
+            assert!(body.get("toolConfig").is_none());
+            assert_protected_top_level_absent(&body);
+        }
+    }
+
+    #[test]
+    fn custom_parameters_cannot_override_ollama_prompt_fields() {
+        let adapter = adapter_for(ProviderProtocol::Ollama, "http://localhost:11434/api");
+        let mut request = prompt_request();
+        request.custom_parameters = protected_custom_parameters();
+
+        let (_, body) = adapter.build_chat_request(&request).expect("request");
+
+        assert_eq!(body.get("model"), Some(&json!("stable-model")));
+        assert_eq!(body.get("stream"), Some(&json!(false)));
+        assert_eq!(body.pointer("/messages/0/role"), Some(&json!("system")));
+        assert_eq!(
+            body.pointer("/messages/0/content"),
+            Some(&json!(SYSTEM_TEXT))
+        );
+        assert_eq!(body.pointer("/messages/1/role"), Some(&json!("user")));
+        assert_eq!(body.pointer("/messages/1/content"), Some(&json!(USER_TEXT)));
+        assert!(body.get("tools").is_none());
+        assert_protected_top_level_absent(&body);
+    }
+
+    #[test]
+    fn allowed_custom_parameters_still_merge_deeply() {
+        let mut request = prompt_request();
+        request.custom_parameters = json!({
+            "response_format": {"type": "json_object"},
+            "top_p": 0.9,
+            "generationConfig": {
+                "candidateCount": 1,
+                "responseMimeType": "application/json"
+            },
+            "safetySettings": [{
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+            }]
+        });
+
+        let (_, openai) = adapter_for(ProviderProtocol::OpenaiChat, "https://api.openai.com")
+            .build_chat_request(&request)
+            .expect("openai request");
+        assert_eq!(
+            openai.pointer("/response_format/type"),
+            Some(&json!("json_object"))
+        );
+        assert_eq!(openai.get("top_p"), Some(&json!(0.9)));
+
+        let (_, gemini) = adapter_for(
+            ProviderProtocol::Gemini,
+            "https://generativelanguage.googleapis.com",
+        )
+        .build_chat_request(&request)
+        .expect("gemini request");
+        assert_eq!(
+            gemini.pointer("/generationConfig/temperature"),
+            Some(&json!(0.0))
+        );
+        assert_eq!(
+            gemini.pointer("/generationConfig/candidateCount"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            gemini.pointer("/generationConfig/responseMimeType"),
+            Some(&json!("application/json"))
+        );
+        assert_eq!(
+            gemini.pointer("/safetySettings/0/category"),
+            Some(&json!("HARM_CATEGORY_HARASSMENT"))
+        );
+    }
+
+    #[test]
+    fn empty_custom_parameters_match_null_custom_parameters() {
+        let adapter = adapter_for(ProviderProtocol::OpenaiChat, "https://api.openai.com");
+        let mut empty = prompt_request();
+        empty.custom_parameters = json!({});
+        let mut null = prompt_request();
+        null.custom_parameters = Value::Null;
+
+        let (_, empty_body) = adapter.build_chat_request(&empty).expect("empty request");
+        let (_, null_body) = adapter.build_chat_request(&null).expect("null request");
+
+        assert_eq!(empty_body, null_body);
     }
 
     #[test]

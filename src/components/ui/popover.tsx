@@ -155,7 +155,7 @@ function PopoverContent({
             transformOrigin: "var(--radix-popover-content-transform-origin)",
           }}
           className={cn(
-            "floating-menu-enter z-[70] w-80 overflow-hidden rounded-[6px] border bg-popover p-2 text-popover-foreground shadow-xl outline-none transform-gpu",
+            "floating-menu-enter z-[70] w-80 overflow-hidden rounded-[6px] border bg-popover p-2 text-popover-foreground shadow-lg outline-none transform-gpu",
             className,
           )}
         >

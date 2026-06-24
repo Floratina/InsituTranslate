@@ -162,7 +162,7 @@ function DropdownMenuContent({
             transformOrigin: "var(--radix-dropdown-menu-content-transform-origin)",
           }}
           className={cn(
-            "floating-menu-enter scrollbar-subtle max-h-[min(22rem,var(--radix-dropdown-menu-content-available-height))] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[6px] border bg-popover text-popover-foreground shadow-2xl transform-gpu",
+            "floating-menu-enter scrollbar-subtle max-h-[min(22rem,var(--radix-dropdown-menu-content-available-height))] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
             className,
           )}
         >
@@ -191,7 +191,7 @@ function DropdownMenuSubContent({
             transformOrigin: "var(--radix-dropdown-menu-content-transform-origin)",
           }}
           className={cn(
-            "floating-menu-enter overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-2xl transform-gpu",
+            "floating-menu-enter overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
             className,
           )}
         >

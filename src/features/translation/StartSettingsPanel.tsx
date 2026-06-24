@@ -2,7 +2,6 @@ import {
   BookOpen,
   Bot,
   FileCheck2,
-  Gauge,
   Languages,
   SlidersHorizontal,
   type LucideIcon,
@@ -17,6 +16,7 @@ import {
 
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { AssistantIcon } from "@/features/assistants/AssistantIcon";
@@ -38,6 +38,7 @@ export type StartSettingsNumberKey =
   | "maxTokensPerMinute";
 
 type SettingsTab = "translation" | "glossary" | "task" | "proofreading";
+type ProofreadingOptionId = "rule" | "confidence" | "assistant";
 
 interface StartSettingsPanelProps {
   sourceLanguage: string;
@@ -61,16 +62,22 @@ interface StartSettingsPanelProps {
   onNumberChange: (key: StartSettingsNumberKey, value: string) => void;
 }
 
-interface SettingRowProps {
+interface FieldBlockProps {
   label: string;
-  description?: string;
   children: ReactNode;
+  className?: string;
 }
 
 interface NavItem {
   value: SettingsTab;
   label: string;
   icon: LucideIcon;
+}
+
+interface ProofreadingOption {
+  id: ProofreadingOptionId;
+  label: string;
+  description: string;
 }
 
 const NAV_ITEMS: NavItem[] = [
@@ -97,7 +104,26 @@ const RATE_LIMIT_OPTIONS: Array<{
   },
 ];
 
-const CONTROL_CLASS_NAME = "w-72 max-w-[42vw] shrink-0 max-[760px]:w-full max-[760px]:max-w-none";
+const PROOFREADING_OPTIONS: ProofreadingOption[] = [
+  {
+    id: "rule",
+    label: "规则校对",
+    description: "根据正则表达式等寻找错误",
+  },
+  {
+    id: "confidence",
+    label: "综合置信度检测",
+    description: "向模型请求 Logprobs，可能不被一些提供商支持",
+  },
+  {
+    id: "assistant",
+    label: "校对助手",
+    description: "使用另一个模型来校对",
+  },
+];
+
+const TWO_COLUMN_GRID_CLASS = "grid grid-cols-1 gap-3 min-[920px]:grid-cols-2";
+const THREE_COLUMN_GRID_CLASS = "grid grid-cols-1 gap-3 min-[1120px]:grid-cols-3";
 
 function autoLabel(detectedSourceLanguage: string | null): string {
   return detectedSourceLanguage
@@ -105,18 +131,11 @@ function autoLabel(detectedSourceLanguage: string | null): string {
     : "自动检测";
 }
 
-function SettingRow({ label, description, children }: SettingRowProps) {
+function FieldBlock({ label, children, className }: FieldBlockProps) {
   return (
-    <div className="flex items-center justify-between gap-6 border-b border-border py-5 max-[760px]:items-start max-[760px]:gap-3 max-[760px]:flex-col">
-      <div className="min-w-0">
-        <div className="text-sm font-semibold text-foreground">{label}</div>
-        {description && (
-          <div className="mt-1 text-xs leading-5 text-muted-foreground">
-            {description}
-          </div>
-        )}
-      </div>
-      <div className={CONTROL_CLASS_NAME}>{children}</div>
+    <div className={cn("grid min-w-0 content-start gap-1.5", className)}>
+      <div className="text-sm font-medium text-foreground">{label}</div>
+      {children}
     </div>
   );
 }
@@ -129,7 +148,7 @@ function SettingsNav({
   onTabChange: (tab: SettingsTab) => void;
 }) {
   return (
-    <nav className="grid content-start gap-1 border-r p-2 max-[900px]:border-r-0 max-[900px]:border-b max-[900px]:grid-cols-4 max-[620px]:grid-cols-2">
+    <nav className="grid content-start gap-1 rounded-[6px] bg-muted/20 p-2 max-[900px]:grid-cols-4 max-[620px]:grid-cols-2">
       {NAV_ITEMS.map((item) => {
         const Icon = item.icon;
         const selected = activeTab === item.value;
@@ -139,7 +158,7 @@ function SettingsNav({
             type="button"
             aria-pressed={selected}
             className={cn(
-              "flex h-9 min-w-0 items-center gap-2 rounded-[6px] px-2 text-left text-sm font-medium outline-none transition-[background-color,color] duration-150 hover:bg-[var(--button-ghost-hover-bg)] hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/40",
+              "flex h-9 min-w-0 items-center gap-2 rounded-[6px] px-2 text-left text-sm font-medium outline-none transition-[background-color,color] duration-150 hover:bg-[var(--button-ghost-hover-bg)] hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/40 active:bg-[var(--button-ghost-pressed-bg)]",
               selected
                 ? "bg-enabled-accent/16 text-enabled-accent"
                 : "text-muted-foreground",
@@ -190,27 +209,38 @@ function glossarySelectedValue(config: TranslationConfigView, glossaries: Glossa
     : "auto";
 }
 
+function selectedRateLimitLabel(strategy: RateLimitStrategy): string {
+  return RATE_LIMIT_OPTIONS.find((option) => option.value === strategy)?.label
+    ?? RATE_LIMIT_OPTIONS[0].label;
+}
+
 export function StartSettingsSkeleton() {
   return (
-    <div className="grid min-h-80 grid-cols-[13rem_minmax(0,1fr)] overflow-hidden rounded-[6px] border bg-card max-[900px]:grid-cols-1">
-      <div className="grid content-start gap-1 border-r p-2 max-[900px]:border-r-0 max-[900px]:border-b max-[900px]:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, index) => (
-          <Skeleton key={index} className="h-9 w-full rounded-[6px]" />
-        ))}
+    <div className="grid gap-3 rounded-[6px] border bg-card p-3">
+      <div className={TWO_COLUMN_GRID_CLASS}>
+        <div className="grid gap-1.5">
+          <Skeleton className="h-4 w-20 rounded-[6px]" />
+          <Skeleton className="h-8 w-full rounded-[6px]" />
+        </div>
+        <div className="grid gap-1.5">
+          <Skeleton className="h-4 w-20 rounded-[6px]" />
+          <Skeleton className="h-8 w-full rounded-[6px]" />
+        </div>
       </div>
-      <div className="px-4 pb-28">
-        {Array.from({ length: 5 }).map((_, index) => (
-          <div
-            key={index}
-            className="flex items-center justify-between gap-6 border-b py-5"
-          >
-            <div className="grid gap-2">
-              <Skeleton className="h-4 w-28" />
-              <Skeleton className="h-3 w-48" />
+      <div className="grid grid-cols-[12rem_minmax(0,1fr)] gap-3 max-[900px]:grid-cols-1">
+        <div className="grid content-start gap-1 rounded-[6px] bg-muted/20 p-2 max-[900px]:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, index) => (
+            <Skeleton key={index} className="h-9 w-full rounded-[6px]" />
+          ))}
+        </div>
+        <div className={THREE_COLUMN_GRID_CLASS}>
+          {Array.from({ length: 3 }).map((_, index) => (
+            <div key={index} className="grid gap-1.5">
+              <Skeleton className="h-4 w-24 rounded-[6px]" />
+              <Skeleton className="h-8 w-full rounded-[6px]" />
             </div>
-            <Skeleton className="h-8 w-72 rounded-[6px]" />
-          </div>
-        ))}
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -238,6 +268,10 @@ export function StartSettingsPanel({
   onNumberChange,
 }: StartSettingsPanelProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>("translation");
+  const [localProofreadingOptions, setLocalProofreadingOptions] = useState({
+    rule: false,
+    assistant: false,
+  });
   const selectedGlossaryValue = useMemo(
     () => glossarySelectedValue(config, glossaries),
     [config, glossaries],
@@ -273,265 +307,288 @@ export function StartSettingsPanel({
     }));
   }
 
+  function toggleProofreadingOption(optionId: ProofreadingOptionId): void {
+    if (optionId === "confidence") {
+      onConfigChange((current) => ({
+        ...current,
+        confidenceMode: current.confidenceMode === "confidence-index"
+          ? "off"
+          : "confidence-index",
+      }));
+      return;
+    }
+
+    setLocalProofreadingOptions((current) => ({
+      ...current,
+      [optionId]: !current[optionId],
+    }));
+  }
+
+  function isProofreadingOptionSelected(optionId: ProofreadingOptionId): boolean {
+    if (optionId === "confidence") {
+      return config.confidenceMode === "confidence-index";
+    }
+    return localProofreadingOptions[optionId];
+  }
+
   return (
-    <section className="grid min-h-80 grid-cols-[13rem_minmax(0,1fr)] overflow-hidden rounded-[6px] border bg-card max-[900px]:grid-cols-1">
-      <SettingsNav activeTab={activeTab} onTabChange={setActiveTab} />
-      <div className="min-w-0 px-4 pb-28">
-        {activeTab === "translation" && (
-          <>
-            <SettingRow
-              label="原始语言"
-              description="源语言将自动识别"
-            >
-              <LanguageCombobox
-                value={sourceLanguage}
-                includeAuto
-                autoLabel={autoLabel(detectedSourceLanguage)}
-                disabled={loading}
-                className="w-full"
-                onValueChange={onSourceLanguageChange}
-                placeholder="选择原始语言"
-                searchPlaceholder="搜索原始语言"
-              />
-            </SettingRow>
-            <SettingRow label="目标语言">
-              <LanguageCombobox
-                value={targetLanguage}
-                disabled={loading}
-                className="w-full"
-                onValueChange={onTargetLanguageChange}
-                placeholder="选择目标语言"
-                searchPlaceholder="搜索目标语言"
-              />
-            </SettingRow>
-            <SettingRow label="模型提供商">
-              <Select value={providerId} onValueChange={onProviderChange} disabled={loading}>
-                <SelectTrigger>
-                  <SelectValue placeholder="选择提供商" />
-                </SelectTrigger>
-                <SelectContent>
-                  {providers.map((provider) => (
-                    <SelectItem key={provider.id} value={provider.id}>
-                      <span className="flex items-center gap-2">
-                        <ProviderAvatar
-                          name={provider.name}
-                          avatar={provider.avatar}
-                          size="2xs"
-                        />
-                        <span>{provider.name}</span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </SettingRow>
-            <SettingRow label="翻译模型">
-              <Select
-                value={modelId}
-                onValueChange={onModelChange}
-                disabled={loading || models.length === 0}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="选择模型" />
-                </SelectTrigger>
-                <SelectContent>
-                  {models.map((model) => (
-                    <SelectItem key={model.id} value={model.id}>
-                      {model.alias || model.requestName}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </SettingRow>
-            <SettingRow label="助手配置">
-              <Select value={assistantId} onValueChange={onAssistantChange} disabled={loading}>
-                <SelectTrigger>
-                  <SelectValue placeholder="选择助手" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__none__">
-                    <span className="flex items-center gap-2">
-                      <Bot className="size-4 text-muted-foreground" />
-                      <span>不使用助手</span>
-                    </span>
-                  </SelectItem>
-                  {assistants.map((assistant) => (
-                    <SelectItem key={assistant.id} value={assistant.id}>
-                      <span className="flex items-center gap-2">
-                        <AssistantIcon
-                          kind={assistant.iconKind}
-                          value={assistant.iconValue}
-                          className="size-4 border-0 bg-transparent text-xs"
-                          glyphClassName="size-3.5"
-                        />
-                        <span>{assistant.name}</span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </SettingRow>
-          </>
-        )}
+    <section className="grid gap-3 rounded-[6px] border bg-card p-3">
+      <div className={TWO_COLUMN_GRID_CLASS}>
+        <FieldBlock label="原始语言">
+          <LanguageCombobox
+            value={sourceLanguage}
+            includeAuto
+            autoLabel={autoLabel(detectedSourceLanguage)}
+            disabled={loading}
+            className="w-full"
+            onValueChange={onSourceLanguageChange}
+            placeholder="选择原始语言"
+            searchPlaceholder="搜索原始语言"
+          />
+        </FieldBlock>
+        <FieldBlock label="目标语言">
+          <LanguageCombobox
+            value={targetLanguage}
+            disabled={loading}
+            className="w-full"
+            onValueChange={onTargetLanguageChange}
+            placeholder="选择目标语言"
+            searchPlaceholder="搜索目标语言"
+          />
+        </FieldBlock>
+      </div>
 
-        {activeTab === "glossary" && (
-          <>
-            <SettingRow
-              label="使用术语表"
-              description="开启后将应用自定义术语"
-            >
-              <div className="flex justify-end max-[760px]:justify-start">
-                <Switch
-                  size="sm"
-                  checked={config.useGlossary}
-                  disabled={loading}
-                  onCheckedChange={updateGlossaryEnabled}
-                />
-              </div>
-            </SettingRow>
-            <SettingRow label="选择或创建术语表">
-              <Select
-                value={selectedGlossaryValue}
-                disabled={loading || !config.useGlossary}
-                onValueChange={updateGlossarySelection}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="选择术语表" />
-                </SelectTrigger>
-                <SelectContent viewportClassName="max-h-72">
-                  <SelectItem value="auto">自动建立术语表</SelectItem>
-                  {glossaries.map((glossary) => (
-                    <SelectItem key={glossary.id} value={glossary.id}>
-                      <span className="flex min-w-0 items-center gap-2">
-                        <span className="truncate">{glossary.name}</span>
-                        <span className="shrink-0 text-2xs text-muted-foreground">
-                          {displayLanguagePair(glossary.sourceLanguage, glossary.targetLanguage)}
+      <div className="grid grid-cols-[12rem_minmax(0,1fr)] gap-3 max-[900px]:grid-cols-1">
+        <SettingsNav activeTab={activeTab} onTabChange={setActiveTab} />
+
+        <div className="min-w-0">
+          {activeTab === "translation" && (
+            <div className={THREE_COLUMN_GRID_CLASS}>
+              <FieldBlock label="模型提供商">
+                <Select value={providerId} onValueChange={onProviderChange} disabled={loading}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择提供商" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {providers.map((provider) => (
+                      <SelectItem key={provider.id} value={provider.id}>
+                        <span className="flex items-center gap-2">
+                          <ProviderAvatar
+                            name={provider.name}
+                            avatar={provider.avatar}
+                            size="2xs"
+                          />
+                          <span>{provider.name}</span>
                         </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldBlock>
+
+              <FieldBlock label="翻译模型">
+                <Select
+                  value={modelId}
+                  onValueChange={onModelChange}
+                  disabled={loading || models.length === 0}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择模型" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {models.map((model) => (
+                      <SelectItem key={model.id} value={model.id}>
+                        {model.alias || model.requestName}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldBlock>
+
+              <FieldBlock label="助手配置">
+                <Select value={assistantId} onValueChange={onAssistantChange} disabled={loading}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择助手" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">
+                      <span className="flex items-center gap-2">
+                        <Bot className="size-4 text-muted-foreground" />
+                        <span>不使用助手</span>
                       </span>
                     </SelectItem>
-                  ))}
-                  {glossaries.length === 0 && (
-                    <div className="px-3 py-2 text-xs text-muted-foreground">
-                      暂无已有术语表
-                    </div>
-                  )}
-                </SelectContent>
-              </Select>
-            </SettingRow>
-          </>
-        )}
-
-        {activeTab === "task" && (
-          <>
-            <SettingRow
-              label="单块 Token 数"
-              description="控制每次翻译分块的大小"
-            >
-              <NumberControl
-                value={config.chunkTokenLimit}
-                min={200}
-                max={8000}
-                disabled={loading}
-                onChange={(value) => onNumberChange("chunkTokenLimit", value)}
-              />
-            </SettingRow>
-            <SettingRow
-              label="最大并发数"
-              description="控制并发处理任务的数量"
-            >
-              <NumberControl
-                value={config.maxConcurrency}
-                min={1}
-                max={32}
-                disabled={loading}
-                onChange={(value) => onNumberChange("maxConcurrency", value)}
-              />
-            </SettingRow>
-            <SettingRow
-              label="最大重试次数"
-              description="失败后的重试策略"
-            >
-              <NumberControl
-                value={config.maxRetries}
-                min={0}
-                max={10}
-                disabled={loading}
-                onChange={(value) => onNumberChange("maxRetries", value)}
-              />
-            </SettingRow>
-            <SettingRow
-              label="动态限流策略"
-              description="根据响应头与请求结果自动调整速率"
-            >
-              <Select
-                value={config.rateLimitStrategy}
-                disabled={loading}
-                onValueChange={(value) => onConfigChange((current) => ({
-                  ...current,
-                  rateLimitStrategy: value as RateLimitStrategy,
-                }))}
-              >
-                <SelectTrigger>
-                  <Gauge className="size-3.5 text-primary" />
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {RATE_LIMIT_OPTIONS.map((option) => (
-                    <SelectItem key={option.value} value={option.value}>
-                      <span className="grid">
-                        <span>{option.label}</span>
-                        <span className="text-2xs text-muted-foreground">
-                          {option.description}
+                    {assistants.map((assistant) => (
+                      <SelectItem key={assistant.id} value={assistant.id}>
+                        <span className="flex items-center gap-2">
+                          <AssistantIcon
+                            kind={assistant.iconKind}
+                            value={assistant.iconValue}
+                            className="size-4 border-0 bg-transparent text-xs"
+                            glyphClassName="size-3.5"
+                          />
+                          <span>{assistant.name}</span>
                         </span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </SettingRow>
-            {config.rateLimitStrategy === "manual" && (
-              <>
-                <SettingRow label="每分钟最大请求数">
-                  <NumberControl
-                    value={config.maxRequestsPerMinute}
-                    min={1}
-                    max={1_000_000}
-                    disabled={loading}
-                    onChange={(value) => onNumberChange("maxRequestsPerMinute", value)}
-                  />
-                </SettingRow>
-                <SettingRow label="每分钟 Token 数">
-                  <NumberControl
-                    value={config.maxTokensPerMinute}
-                    min={1}
-                    max={100_000_000}
-                    disabled={loading}
-                    onChange={(value) => onNumberChange("maxTokensPerMinute", value)}
-                  />
-                </SettingRow>
-              </>
-            )}
-          </>
-        )}
-
-        {activeTab === "proofreading" && (
-          <SettingRow
-            label="综合置信度检测"
-            description="视提供商的支持情况而定，不支持时默认忽略"
-          >
-            <div className="flex justify-end max-[760px]:justify-start">
-              <Switch
-                size="sm"
-                checked={config.confidenceMode === "confidence-index"}
-                disabled={loading}
-                onCheckedChange={(checked) => onConfigChange((current) => ({
-                  ...current,
-                  confidenceMode: checked ? "confidence-index" : "off",
-                }))}
-              />
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldBlock>
             </div>
-          </SettingRow>
-        )}
+          )}
+
+          {activeTab === "glossary" && (
+            <div className={TWO_COLUMN_GRID_CLASS}>
+              <FieldBlock label="使用术语表">
+                <div className="flex h-8 items-center">
+                  <Switch
+                    size="sm"
+                    checked={config.useGlossary}
+                    disabled={loading}
+                    onCheckedChange={updateGlossaryEnabled}
+                  />
+                </div>
+              </FieldBlock>
+
+              <FieldBlock label="选择术语表">
+                <Select
+                  value={selectedGlossaryValue}
+                  disabled={loading || !config.useGlossary}
+                  onValueChange={updateGlossarySelection}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择术语表" />
+                  </SelectTrigger>
+                  <SelectContent viewportClassName="max-h-72">
+                    <SelectItem value="auto">自动建立术语表</SelectItem>
+                    {glossaries.map((glossary) => (
+                      <SelectItem key={glossary.id} value={glossary.id}>
+                        <span className="flex min-w-0 items-center gap-2">
+                          <span className="truncate">{glossary.name}</span>
+                          <span className="shrink-0 text-xs text-muted-foreground">
+                            {displayLanguagePair(glossary.sourceLanguage, glossary.targetLanguage)}
+                          </span>
+                        </span>
+                      </SelectItem>
+                    ))}
+                    {glossaries.length === 0 && (
+                      <div className="px-3 py-2 text-xs text-muted-foreground">
+                        暂无已有术语表
+                      </div>
+                    )}
+                  </SelectContent>
+                </Select>
+              </FieldBlock>
+            </div>
+          )}
+
+          {activeTab === "task" && (
+            <div className={TWO_COLUMN_GRID_CLASS}>
+              <FieldBlock label="单块 Token 数">
+                <NumberControl
+                  value={config.chunkTokenLimit}
+                  min={200}
+                  max={8000}
+                  disabled={loading}
+                  onChange={(value) => onNumberChange("chunkTokenLimit", value)}
+                />
+              </FieldBlock>
+
+              <FieldBlock label="最大并发数">
+                <NumberControl
+                  value={config.maxConcurrency}
+                  min={1}
+                  max={32}
+                  disabled={loading}
+                  onChange={(value) => onNumberChange("maxConcurrency", value)}
+                />
+              </FieldBlock>
+
+              <FieldBlock label="最大重试次数">
+                <NumberControl
+                  value={config.maxRetries}
+                  min={0}
+                  max={10}
+                  disabled={loading}
+                  onChange={(value) => onNumberChange("maxRetries", value)}
+                />
+              </FieldBlock>
+
+              <FieldBlock label="动态限流策略">
+                <Select
+                  value={config.rateLimitStrategy}
+                  disabled={loading}
+                  onValueChange={(value) => onConfigChange((current) => ({
+                    ...current,
+                    rateLimitStrategy: value as RateLimitStrategy,
+                  }))}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择限流策略">
+                      {selectedRateLimitLabel(config.rateLimitStrategy)}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {RATE_LIMIT_OPTIONS.map((option) => (
+                      <SelectItem
+                        key={option.value}
+                        value={option.value}
+                        textValue={option.label}
+                        className="h-auto py-2"
+                      >
+                        <span className="grid gap-0.5">
+                          <span>{option.label}</span>
+                          <span className="text-xs leading-4 text-muted-foreground">
+                            {option.description}
+                          </span>
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldBlock>
+
+              {config.rateLimitStrategy === "manual" && (
+                <>
+                  <FieldBlock label="每分钟请求数">
+                    <NumberControl
+                      value={config.maxRequestsPerMinute}
+                      min={1}
+                      max={1_000_000}
+                      disabled={loading}
+                      onChange={(value) => onNumberChange("maxRequestsPerMinute", value)}
+                    />
+                  </FieldBlock>
+
+                  <FieldBlock label="每分钟 Token 数">
+                    <NumberControl
+                      value={config.maxTokensPerMinute}
+                      min={1}
+                      max={100_000_000}
+                      disabled={loading}
+                      onChange={(value) => onNumberChange("maxTokensPerMinute", value)}
+                    />
+                  </FieldBlock>
+                </>
+              )}
+            </div>
+          )}
+
+          {activeTab === "proofreading" && (
+            <div className={THREE_COLUMN_GRID_CLASS}>
+              {PROOFREADING_OPTIONS.map((option) => (
+                <SelectableOptionButton
+                  key={option.id}
+                  label={option.label}
+                  description={option.description}
+                  selected={isProofreadingOptionSelected(option.id)}
+                  indicatorVariant="checkbox"
+                  disabled={loading}
+                  onClick={() => toggleProofreadingOption(option.id)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </section>
   );

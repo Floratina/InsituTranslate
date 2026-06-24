@@ -10,13 +10,17 @@ type SelectableOptionButtonProps = Omit<
 > & {
   label: React.ReactNode;
   description?: React.ReactNode;
+  leading?: React.ReactNode;
   selected?: boolean;
+  indicatorVariant?: "radio" | "checkbox";
 };
 
 function SelectableOptionButton({
   label,
   description,
+  leading,
   selected = false,
+  indicatorVariant = "radio",
   className,
   disabled,
   whileTap,
@@ -37,6 +41,11 @@ function SelectableOptionButton({
       )}
       {...props}
     >
+      {leading && (
+        <span className="shrink-0">
+          {leading}
+        </span>
+      )}
       <span className="min-w-0 flex-1">
         <span className="block text-sm font-medium">{label}</span>
         {description && (
@@ -49,11 +58,18 @@ function SelectableOptionButton({
           </span>
         )}
       </span>
-      {selected && (
-        <span className="ml-auto flex size-5 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground">
-          <Check className="size-3" />
-        </span>
-      )}
+      <span
+        className={cn(
+          "ml-auto flex size-5 shrink-0 items-center justify-center border transition-[background-color,border-color,color,opacity] duration-150",
+          indicatorVariant === "radio" ? "rounded-full" : "rounded-[6px]",
+          selected
+            ? "border-primary bg-primary text-primary-foreground"
+            : "border-muted-foreground/35 bg-transparent text-transparent opacity-60",
+        )}
+        aria-hidden="true"
+      >
+        <Check className="size-3" />
+      </span>
     </motion.button>
   );
 }

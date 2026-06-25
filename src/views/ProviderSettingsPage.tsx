@@ -1118,7 +1118,7 @@ function ProviderSettingsPage() {
             </div>
           )}
           <Textarea
-            className="min-h-40 font-mono text-xs"
+            className="min-h-40 font-mono font-medium text-xs"
             spellCheck={false}
             value={headersJson}
             placeholder={'{\n  "HTTP-Referer": "https://example.com",\n  "X-Title": "InsituTranslate"\n}'}
@@ -1157,7 +1157,7 @@ function ProviderSettingsPage() {
           </DialogHeader>
           <Textarea
             wrap="soft"
-            className="min-h-48 overflow-x-hidden overflow-y-auto break-all font-mono text-xs whitespace-pre-wrap"
+            className="min-h-48 overflow-x-hidden overflow-y-auto break-all font-mono font-medium text-xs whitespace-pre-wrap"
             spellCheck={false}
             value={serviceAccountJson}
             placeholder={'{\n  "type": "service_account",\n  "project_id": "my-project",\n  "private_key": "-----BEGIN PRIVATE KEY-----\\\\n...\\\\n-----END PRIVATE KEY-----\\\\n",\n  "client_email": "name@my-project.iam.gserviceaccount.com"\n}'}
@@ -1200,7 +1200,7 @@ function ProviderSettingsPage() {
           <Textarea
             rows={4}
             wrap="soft"
-            className="h-24 min-h-24 max-h-24 resize-none overflow-x-hidden overflow-y-auto break-all font-mono text-xs leading-5 whitespace-pre-wrap [field-sizing:fixed]"
+            className="h-24 min-h-24 max-h-24 resize-none overflow-x-hidden overflow-y-auto break-all font-mono font-medium text-xs leading-5 whitespace-pre-wrap [field-sizing:fixed]"
             spellCheck={false}
             value={privateKeyValue}
             placeholder={privateKeyLoading ? "正在读取已保存的私钥…" : "粘贴 private_key 字段"}
@@ -1316,7 +1316,7 @@ function ProviderSettingsPage() {
           <DialogField>
             <Label>模型请求名</Label>
             <Input
-              className="font-mono"
+              className="font-mono font-medium"
               value={modelForm.requestName}
               placeholder="custom-model-name"
               onChange={(event) =>
@@ -1368,7 +1368,7 @@ function ProviderSettingsPage() {
               <DialogField>
                 <Label>模型请求名</Label>
                 <Input
-                  className="font-mono"
+                  className="font-mono font-medium"
                   disabled
                   value={settingsModel.requestName}
                 />

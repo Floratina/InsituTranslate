@@ -2,6 +2,7 @@ import * as React from "react"
 import { Progress as ProgressPrimitive } from "radix-ui"
 import { motion } from "motion/react"
 
+import { CONTROLLED_STATE_MOTION_PROPS } from "@/lib/motion"
 import { cn } from "@/lib/utils"
 
 function Progress({
@@ -23,9 +24,9 @@ function Progress({
         asChild
       >
         <motion.div
+          {...CONTROLLED_STATE_MOTION_PROPS}
           className="size-full flex-1 origin-left bg-primary"
           animate={{ scaleX: Math.max(0, Math.min(100, value ?? 0)) / 100 }}
-          transition={{ type: "spring", stiffness: 300, damping: 30 }}
         />
       </ProgressPrimitive.Indicator>
     </ProgressPrimitive.Root>

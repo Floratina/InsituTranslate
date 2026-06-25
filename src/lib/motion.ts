@@ -8,6 +8,19 @@ export const PRIMARY_PAGE_FADE_UP_DISTANCE_PX = 14;
 export const SECONDARY_PAGE_FADE_UP_MS = 200;
 export const SECONDARY_PAGE_FADE_UP_DISTANCE_PX = 8;
 
+export const CONTROLLED_STATE_SPRING = {
+  type: "spring",
+  stiffness: 300,
+  damping: 30,
+} as const;
+
+// Visuals that directly mirror controlled data must not animate from a default
+// state during mount, refresh, or data hydration.
+export const CONTROLLED_STATE_MOTION_PROPS = {
+  initial: false,
+  transition: CONTROLLED_STATE_SPRING,
+} as const;
+
 type FadeUpStyle = CSSProperties & {
   "--app-fade-up-duration": string;
   "--app-fade-up-ease": string;

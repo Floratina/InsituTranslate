@@ -2,6 +2,7 @@ import * as React from "react"
 import { Switch as SwitchPrimitive } from "radix-ui"
 import { motion } from "motion/react"
 
+import { CONTROLLED_STATE_MOTION_PROPS } from "@/lib/motion"
 import { cn } from "@/lib/utils"
 
 function Switch({
@@ -38,9 +39,9 @@ function Switch({
     >
       <SwitchPrimitive.Thumb asChild>
         <motion.span
+          {...CONTROLLED_STATE_MOTION_PROPS}
           data-slot="switch-thumb"
           animate={{ x: resolvedChecked ? (size === "sm" ? 14 : 17) : 2 }}
-          transition={{ type: "spring", stiffness: 300, damping: 30 }}
           className="pointer-events-none block rounded-full bg-background ring-0 group-data-[size=default]/switch:size-4 group-data-[size=sm]/switch:size-3 dark:data-[state=checked]:bg-primary-foreground dark:data-[state=unchecked]:bg-foreground"
         />
       </SwitchPrimitive.Thumb>

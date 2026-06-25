@@ -169,12 +169,136 @@ interface SelectContentProps
   viewportClassName?: string
 }
 
+interface SelectScrollbarMetrics {
+  visible: boolean
+  thumbHeight: number
+  thumbTop: number
+}
+
+function SelectViewportScrollbar({
+  viewportRef,
+}: {
+  viewportRef: React.RefObject<HTMLDivElement | null>
+}) {
+  const [metrics, setMetrics] = React.useState<SelectScrollbarMetrics>({
+    visible: false,
+    thumbHeight: 0,
+    thumbTop: 0,
+  })
+  const dragStateRef = React.useRef<{
+    maxScrollTop: number
+    maxThumbTop: number
+    startScrollTop: number
+    startY: number
+  } | null>(null)
+
+  const updateMetrics = React.useCallback(() => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+
+    const { clientHeight, scrollHeight, scrollTop } = viewport
+    const visible = scrollHeight > clientHeight + 1
+    if (!visible) {
+      setMetrics((current) =>
+        current.visible ? { visible: false, thumbHeight: 0, thumbTop: 0 } : current,
+      )
+      return
+    }
+
+    const thumbHeight = Math.max(20, (clientHeight / scrollHeight) * clientHeight)
+    const maxThumbTop = clientHeight - thumbHeight
+    const maxScrollTop = scrollHeight - clientHeight
+    const thumbTop = maxScrollTop > 0 ? (scrollTop / maxScrollTop) * maxThumbTop : 0
+    setMetrics((current) => {
+      const next = { visible, thumbHeight, thumbTop }
+      return current.visible === next.visible &&
+        Math.abs(current.thumbHeight - next.thumbHeight) < 0.5 &&
+        Math.abs(current.thumbTop - next.thumbTop) < 0.5
+        ? current
+        : next
+    })
+  }, [viewportRef])
+
+  React.useLayoutEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+
+    updateMetrics()
+    viewport.addEventListener("scroll", updateMetrics, { passive: true })
+    window.addEventListener("resize", updateMetrics)
+
+    const resizeObserver = new ResizeObserver(updateMetrics)
+    resizeObserver.observe(viewport)
+    for (const child of Array.from(viewport.children)) {
+      resizeObserver.observe(child)
+    }
+
+    return () => {
+      viewport.removeEventListener("scroll", updateMetrics)
+      window.removeEventListener("resize", updateMetrics)
+      resizeObserver.disconnect()
+    }
+  }, [updateMetrics, viewportRef])
+
+  if (!metrics.visible) return null
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
+    const viewport = viewportRef.current
+    if (!viewport) return
+
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    dragStateRef.current = {
+      maxScrollTop: viewport.scrollHeight - viewport.clientHeight,
+      maxThumbTop: viewport.clientHeight - metrics.thumbHeight,
+      startScrollTop: viewport.scrollTop,
+      startY: event.clientY,
+    }
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>): void {
+    const viewport = viewportRef.current
+    const dragState = dragStateRef.current
+    if (!viewport || !dragState || dragState.maxThumbTop <= 0) return
+
+    const deltaY = event.clientY - dragState.startY
+    viewport.scrollTop =
+      dragState.startScrollTop +
+      (deltaY / dragState.maxThumbTop) * dragState.maxScrollTop
+  }
+
+  function handlePointerUp(event: React.PointerEvent<HTMLDivElement>): void {
+    dragStateRef.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  return (
+    <div className="pointer-events-none absolute top-0 right-0 bottom-0 z-10 w-1.5">
+      <div
+        className="pointer-events-auto absolute right-0 w-1.5 rounded-full bg-muted-foreground/45 transition-colors duration-150 hover:bg-ring/70"
+        style={{
+          height: metrics.thumbHeight,
+          transform: `translateY(${metrics.thumbTop}px)`,
+        }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+      />
+    </div>
+  )
+}
+
 function SelectContent({
   className,
   children,
   viewportClassName,
   ...props
 }: SelectContentProps) {
+  const viewportRef = React.useRef<HTMLDivElement | null>(null)
+
   return (
     <SelectPrimitive.Portal>
       <SelectPrimitive.Content
@@ -188,18 +312,20 @@ function SelectContent({
             transformOrigin: "var(--radix-select-content-transform-origin)",
           }}
           className={cn(
-            "floating-menu-enter overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
+            "floating-menu-enter relative overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
             className,
           )}
         >
           <SelectPrimitive.Viewport
+            ref={viewportRef}
             className={cn(
-              "scrollbar-subtle max-h-[min(22rem,var(--radix-select-content-available-height))] overflow-x-hidden overflow-y-auto overscroll-contain",
+              "scrollbar-hidden max-h-[min(22rem,var(--radix-select-content-available-height))] overflow-x-hidden overflow-y-auto overscroll-contain",
               viewportClassName,
             )}
           >
             {children}
           </SelectPrimitive.Viewport>
+          <SelectViewportScrollbar viewportRef={viewportRef} />
         </div>
       </SelectPrimitive.Content>
     </SelectPrimitive.Portal>

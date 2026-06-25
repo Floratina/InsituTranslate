@@ -27,7 +27,6 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import { motion } from "motion/react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -108,6 +107,26 @@ type TaskTab = "running" | "completed" | "unfinished";
 type SortMode = "created-desc" | "created-asc" | "az";
 type TaskSortField = "name" | "stats" | "tags" | "language";
 
+const compactAccentButtonClass = cn(
+  "!border-[var(--button-accent-border)] !bg-[var(--button-accent-bg)] !text-primary-foreground",
+  "hover:!border-[var(--button-accent-hover-border)] hover:!bg-[var(--button-accent-hover-bg)] hover:!text-primary-foreground",
+  "active:!border-[var(--button-accent-pressed-border)] active:!bg-[var(--button-accent-pressed-bg)]",
+);
+
+const compactStandardButtonClass = cn(
+  "!border-[var(--button-standard-border)] !bg-[var(--button-standard-bg)] !text-foreground",
+  "hover:!border-[var(--button-standard-hover-border)] hover:!bg-[var(--button-standard-hover-bg)] hover:!text-foreground",
+  "active:!border-[var(--button-standard-pressed-border)] active:!bg-[var(--button-standard-pressed-bg)]",
+);
+
+const compactDestructiveButtonClass = cn(
+  "!border-destructive/30 !bg-destructive/10 !text-destructive",
+  "hover:!border-destructive/40 hover:!bg-destructive/20 hover:!text-destructive",
+  "active:!border-destructive/35 active:!bg-destructive/25",
+  "focus-visible:!border-destructive/40 focus-visible:!ring-destructive/20",
+  "dark:!bg-destructive/20 dark:hover:!bg-destructive/30 dark:active:!bg-destructive/25 dark:focus-visible:!ring-destructive/40",
+);
+
 interface TaskSortState {
   field: TaskSortField;
   mode: SortMode;
@@ -135,7 +154,6 @@ const ALL_FILTER_VALUE = "__all__";
 const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
 const ACTION_COLUMN_WIDTH = 64;
-const TABLE_REFRESH_TRANSITION = { duration: 0.1, ease: [0.03, 0.59, 0.19, 1] as const };
 const TASK_MIN_WIDTHS = [156, 196, 128, 156];
 const TASK_INITIAL_WIDTHS = [340, 260, 220, 260];
 const TASK_MAX_WIDTHS = [720, 520, 480, 460];
@@ -673,7 +691,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
           </Button>
         </div>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          管理本地 INP 翻译任务，查看进度、统计和校对入口。
+          管理 INP 翻译任务和查看进度
         </p>
       </header>
 
@@ -726,13 +744,19 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
             <TabsTrigger value="unfinished">未完成 {grouped.unfinished.length}</TabsTrigger>
           </TabsList>
           <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Button size="sm" onClick={() => void startVisibleTasks()} disabled={batchBusy || sortedTasks.length === 0}>
+            <Button
+              size="sm"
+              className={compactAccentButtonClass}
+              onClick={() => void startVisibleTasks()}
+              disabled={batchBusy || sortedTasks.length === 0}
+            >
               <Play className="size-4" />
               全部开始
             </Button>
             <Button
               size="sm"
               variant="outline"
+              className={compactStandardButtonClass}
               onClick={() => void pauseVisibleTasks()}
               disabled={batchBusy || !tasks.some((task) => task.status === "running")}
             >
@@ -742,6 +766,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
             <Button
               size="sm"
               variant="destructive"
+              className={compactDestructiveButtonClass}
               onClick={() => setClearTargets(sortedTasks)}
               disabled={batchBusy || sortedTasks.length === 0}
             >
@@ -886,9 +911,6 @@ function TasksTable({
   );
   const tableWidth = sum(adaptiveWidths) + ACTION_COLUMN_WIDTH;
   const tableNeedsHorizontalScroll = tableWidth > tableViewportWidth + 1;
-  const bodyKey = loading
-    ? "loading"
-    : ["ready", page, pageSize, sort.field, sort.mode, tasks.map((task) => `${task.id}:${task.updatedAt}`).join("|")].join("-");
 
   return (
     <section className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card">
@@ -957,12 +979,7 @@ function TasksTable({
               <ActionHeader />
             </tr>
           </thead>
-          <motion.tbody
-            key={bodyKey}
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={TABLE_REFRESH_TRANSITION}
-          >
+          <tbody>
             {loading ? (
               <TableSkeletonRows columns={5} />
             ) : tasks.length === 0 ? (
@@ -1022,7 +1039,7 @@ function TasksTable({
                 </ContextMenu>
               ))
             )}
-          </motion.tbody>
+          </tbody>
         </table>
       </div>
       <PaginationBar

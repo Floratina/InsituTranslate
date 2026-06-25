@@ -2,6 +2,7 @@ import * as React from "react";
 import { Check } from "lucide-react";
 import { motion } from "motion/react";
 
+import { APP_MOTION_EASE } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 
 type SelectableOptionButtonProps = Omit<
@@ -14,6 +15,16 @@ type SelectableOptionButtonProps = Omit<
   selected?: boolean;
   indicatorVariant?: "radio" | "checkbox";
 };
+
+const SELECTABLE_OPTION_PRESS_SCALE = {
+  scaleX: 0.985,
+  scaleY: 0.982,
+} as const;
+
+const SELECTABLE_OPTION_PRESS_TRANSITION = {
+  duration: 0.12,
+  ease: APP_MOTION_EASE,
+} as const;
 
 function SelectableOptionButton({
   label,
@@ -31,11 +42,11 @@ function SelectableOptionButton({
     <motion.button
       type="button"
       aria-pressed={selected}
-      whileTap={whileTap ?? { scale: 0.99 }}
-      transition={transition ?? { duration: 0.12, ease: [0.03, 0.59, 0.19, 1] }}
+      whileTap={whileTap ?? SELECTABLE_OPTION_PRESS_SCALE}
+      transition={transition ?? SELECTABLE_OPTION_PRESS_TRANSITION}
       disabled={disabled}
       className={cn(
-        "relative flex min-h-14 w-full min-w-0 items-center gap-3 rounded-[6px] border bg-background px-3 py-2 text-left outline-none transition-[background-color,border-color,box-shadow] duration-150 hover:bg-muted/60 focus-visible:ring-3 focus-visible:ring-ring/40 disabled:pointer-events-none disabled:opacity-60",
+        "relative flex min-h-14 w-full min-w-0 origin-center transform-gpu items-center gap-3 rounded-[6px] border bg-background px-3 py-2 text-left outline-none transition-[background-color,border-color,box-shadow] duration-150 hover:bg-muted/60 focus-visible:ring-3 focus-visible:ring-ring/40 disabled:pointer-events-none disabled:opacity-60",
         selected && "border-primary bg-background ring-1 ring-primary/35",
         className,
       )}

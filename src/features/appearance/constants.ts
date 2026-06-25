@@ -3,10 +3,12 @@ import type { AppearancePreferences, ThemePreset } from "@/features/appearance/t
 export const APPEARANCE_STORAGE_KEY = "insitu-appearance-v1";
 export const SYSTEM_FONT_VALUE = "system";
 export const SYSTEM_FONT_STACK = 'Inter, "Segoe UI", sans-serif';
+export const DEFAULT_CUSTOM_THEME_COLOR = "#16b8c4";
 
 export const DEFAULT_APPEARANCE: AppearancePreferences = {
   colorMode: "system",
   themeId: "sky",
+  customThemeColor: DEFAULT_CUSTOM_THEME_COLOR,
   fontFamily: SYSTEM_FONT_VALUE,
 };
 
@@ -28,6 +30,12 @@ export const THEME_PRESETS: readonly ThemePreset[] = [
     name: "松针",
     description: "安静自然的青绿",
     swatches: ["oklch(0.53 0.12 165)", "oklch(0.70 0.10 180)", "oklch(0.95 0.025 165)", "oklch(0.984 0.004 165)"],
+  },
+  {
+    id: "lagoon",
+    name: "澄湾",
+    description: "清透柔和的蓝绿色",
+    swatches: ["oklch(0.55 0.14 205)", "oklch(0.74 0.11 205)", "oklch(0.952 0.028 205)", "oklch(0.984 0.004 205)"],
   },
   {
     id: "sand",

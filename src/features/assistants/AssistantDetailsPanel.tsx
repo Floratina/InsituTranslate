@@ -14,7 +14,9 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
@@ -204,9 +206,9 @@ export function AssistantDetailsPanel({
     <div
       key={assistant.id}
       style={SECONDARY_PAGE_FADE_UP_STYLE}
-      className="app-fade-up-enter flex min-h-0 flex-1 flex-col"
+      className="app-fade-up-enter flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
     >
-      <div className="flex shrink-0 items-start justify-between gap-3 border-b p-3">
+      <div className="flex min-w-0 shrink-0 items-start justify-between gap-3 border-b p-3">
         <div className="flex min-w-0 items-center gap-3">
           <AssistantIcon
             kind={settings.iconKind}
@@ -235,19 +237,19 @@ export function AssistantDetailsPanel({
         </Button>
       </div>
 
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="grid gap-3 p-3 [&_[data-slot=label]]:text-sm">
-          <section className="grid gap-1.5 rounded-[6px] border p-3">
+      <ScrollArea className="min-h-0 min-w-0 flex-1">
+        <div className="grid min-w-0 gap-3 p-3 [&_[data-slot=label]]:text-sm">
+          <section className="grid min-w-0 gap-1.5 rounded-[6px] border p-3">
             <Label>系统提示词</Label>
             <button
               type="button"
               className={cn(
-                "flex h-8 w-full items-center rounded-[6px] border border-input bg-transparent px-2.5 text-left text-sm outline-none transition-colors duration-150 hover:border-ring focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/40 dark:bg-input/30",
+                "flex h-8 w-full min-w-0 items-center overflow-hidden rounded-[6px] border border-input bg-transparent px-2.5 text-left text-sm outline-none transition-colors duration-150 hover:border-ring focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/40 dark:bg-input/30",
                 promptPreview ? "text-foreground" : "text-muted-foreground",
               )}
               onClick={() => setPromptOpen(true)}
             >
-              <span className="truncate">
+              <span className="min-w-0 flex-1 truncate">
                 {promptPreview || "点击编辑系统提示词"}
               </span>
             </button>
@@ -372,43 +374,30 @@ export function AssistantDetailsPanel({
                             插入预设
                           </Button>
                         </DropdownMenuTrigger>
-                        <DropdownMenuContent className="w-72 p-0">
-                          <div className="scrollbar-subtle max-h-80 overflow-x-hidden overflow-y-auto overscroll-contain">
-                            <div className="p-1">
-                              {presetGroups.map((group, groupIndex) => (
-                                <div
-                                  key={group}
-                                  className={cn(
-                                    groupIndex > 0 && "mt-0.5 border-t pt-0.5",
-                                  )}
-                                >
-                                  <div className="rounded-[6px] bg-muted/55 px-2 py-1 text-2xs font-semibold text-muted-foreground">
-                                    {group}
-                                  </div>
-                                  <div className="mt-0.5 grid">
-                                    {availablePresets
-                                      .filter((preset) => preset.group === group)
-                                      .map((preset) => (
-                                        <DropdownMenuItem
-                                          key={`${preset.group}-${preset.label}`}
-                                          className="h-auto items-start rounded-[6px] px-2 py-1.5"
-                                          onSelect={() => insertPreset(preset)}
-                                        >
-                                          <div className="min-w-0">
-                                            <div className="text-sm font-medium">
-                                              {preset.label}
-                                            </div>
-                                            <div className="whitespace-normal break-words text-2xs leading-4 text-muted-foreground">
-                                              {preset.description}
-                                            </div>
-                                          </div>
-                                        </DropdownMenuItem>
-                                      ))}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
+                        <DropdownMenuContent className="w-72">
+                          {presetGroups.map((group) => (
+                            <DropdownMenuGroup key={group}>
+                              <DropdownMenuLabel>{group}</DropdownMenuLabel>
+                              {availablePresets
+                                .filter((preset) => preset.group === group)
+                                .map((preset) => (
+                                  <DropdownMenuItem
+                                    key={`${preset.group}-${preset.label}`}
+                                    className="h-auto items-start px-3 py-2"
+                                    onSelect={() => insertPreset(preset)}
+                                  >
+                                    <div className="min-w-0">
+                                      <div className="text-sm font-medium">
+                                        {preset.label}
+                                      </div>
+                                      <div className="whitespace-normal break-words text-2xs leading-4 text-muted-foreground">
+                                        {preset.description}
+                                      </div>
+                                    </div>
+                                  </DropdownMenuItem>
+                                ))}
+                            </DropdownMenuGroup>
+                          ))}
                         </DropdownMenuContent>
                       </DropdownMenu>
                       <Button
@@ -424,7 +413,7 @@ export function AssistantDetailsPanel({
                     <Textarea
                       ref={customTextareaRef}
                       spellCheck={false}
-                      className="min-h-40 resize-y font-mono text-xs"
+                      className="min-h-40 resize-y font-mono font-medium text-xs"
                       value={customParametersDraft}
                       onChange={(event) => onCustomParametersChange(event.target.value)}
                     />

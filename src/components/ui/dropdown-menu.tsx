@@ -2,6 +2,7 @@ import * as React from "react"
 import { ChevronRight } from "lucide-react"
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui"
 
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 
 interface DropdownMenuControlContextValue {
@@ -143,13 +144,52 @@ const DropdownMenuTrigger = React.forwardRef<
 DropdownMenuTrigger.displayName = "DropdownMenuTrigger"
 
 const DropdownMenuSub = DropdownMenuPrimitive.Sub
+const DropdownMenuGroup = DropdownMenuPrimitive.Group
+
+interface DropdownMenuContentProps
+  extends React.ComponentProps<typeof DropdownMenuPrimitive.Content> {
+  viewportClassName?: string
+}
+
+function DropdownMenuSurface({
+  className,
+  children,
+  viewportClassName,
+}: {
+  className?: string
+  children: React.ReactNode
+  viewportClassName?: string
+}) {
+  return (
+    <div
+      style={{
+        transformOrigin: "var(--radix-dropdown-menu-content-transform-origin)",
+      }}
+      className={cn(
+        "floating-menu-enter-y overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
+        className,
+      )}
+    >
+      <ScrollArea
+        className="w-full max-h-[min(22rem,var(--radix-dropdown-menu-content-available-height))]"
+        viewportClassName={cn(
+          "h-auto max-h-[min(22rem,var(--radix-dropdown-menu-content-available-height))] overscroll-contain",
+          viewportClassName,
+        )}
+      >
+        {children}
+      </ScrollArea>
+    </div>
+  )
+}
 
 function DropdownMenuContent({
   className,
   children,
   sideOffset = 4,
+  viewportClassName,
   ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.Content>) {
+}: DropdownMenuContentProps) {
   return (
     <DropdownMenuPrimitive.Portal>
       <DropdownMenuPrimitive.Content
@@ -157,28 +197,29 @@ function DropdownMenuContent({
         className="z-[70] min-w-36"
         {...props}
       >
-        <div
-          style={{
-            transformOrigin: "var(--radix-dropdown-menu-content-transform-origin)",
-          }}
-          className={cn(
-            "floating-menu-enter scrollbar-subtle max-h-[min(22rem,var(--radix-dropdown-menu-content-available-height))] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
-            className,
-          )}
+        <DropdownMenuSurface
+          className={className}
+          viewportClassName={viewportClassName}
         >
           {children}
-        </div>
+        </DropdownMenuSurface>
       </DropdownMenuPrimitive.Content>
     </DropdownMenuPrimitive.Portal>
   )
+}
+
+interface DropdownMenuSubContentProps
+  extends React.ComponentProps<typeof DropdownMenuPrimitive.SubContent> {
+  viewportClassName?: string
 }
 
 function DropdownMenuSubContent({
   className,
   children,
   sideOffset = 4,
+  viewportClassName,
   ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.SubContent>) {
+}: DropdownMenuSubContentProps) {
   return (
     <DropdownMenuPrimitive.Portal>
       <DropdownMenuPrimitive.SubContent
@@ -186,17 +227,12 @@ function DropdownMenuSubContent({
         className="z-[80] min-w-36"
         {...props}
       >
-        <div
-          style={{
-            transformOrigin: "var(--radix-dropdown-menu-content-transform-origin)",
-          }}
-          className={cn(
-            "floating-menu-enter overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
-            className,
-          )}
+        <DropdownMenuSurface
+          className={className}
+          viewportClassName={viewportClassName}
         >
           {children}
-        </div>
+        </DropdownMenuSurface>
       </DropdownMenuPrimitive.SubContent>
     </DropdownMenuPrimitive.Portal>
   )
@@ -210,6 +246,21 @@ function DropdownMenuItem({
     <DropdownMenuPrimitive.Item
       className={cn(
         "flex h-8 cursor-default select-none items-center gap-2 px-3 text-sm outline-none focus:bg-accent data-disabled:pointer-events-none data-disabled:opacity-50",
+        className,
+      )}
+      {...props}
+    />
+  )
+}
+
+function DropdownMenuLabel({
+  className,
+  ...props
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Label>) {
+  return (
+    <DropdownMenuPrimitive.Label
+      className={cn(
+        "flex h-7 select-none items-center bg-muted/55 px-3 text-2xs font-semibold text-muted-foreground",
         className,
       )}
       {...props}
@@ -251,7 +302,9 @@ function DropdownMenuSeparator({
 export {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,

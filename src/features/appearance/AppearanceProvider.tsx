@@ -11,9 +11,15 @@ import {
 import {
   APPEARANCE_STORAGE_KEY,
   DEFAULT_APPEARANCE,
+  DEFAULT_CUSTOM_THEME_COLOR,
   SYSTEM_FONT_STACK,
   SYSTEM_FONT_VALUE,
 } from "@/features/appearance/constants";
+import {
+  applyCustomThemeVariables,
+  clearCustomThemeVariables,
+  normalizeHexColor,
+} from "@/features/appearance/theme-colors";
 import type {
   AppearancePreferences,
   ColorMode,
@@ -25,6 +31,7 @@ interface AppearanceContextValue {
   resolvedMode: Exclude<ColorMode, "system">;
   setColorMode: (colorMode: ColorMode) => void;
   setThemeId: (themeId: ThemeId) => void;
+  setCustomThemeColor: (customThemeColor: string) => void;
   setFontFamily: (fontFamily: string) => void;
 }
 
@@ -35,6 +42,10 @@ function readPreferences(): AppearancePreferences {
     const stored = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
     if (!stored) return DEFAULT_APPEARANCE;
     const value = JSON.parse(stored) as Partial<AppearancePreferences>;
+    const customThemeColor =
+      typeof value.customThemeColor === "string"
+        ? normalizeHexColor(value.customThemeColor)
+        : null;
     return {
       colorMode:
         value.colorMode === "light" ||
@@ -46,9 +57,12 @@ function readPreferences(): AppearancePreferences {
         value.themeId === "sky" ||
         value.themeId === "iris" ||
         value.themeId === "pine" ||
-        value.themeId === "sand"
+        value.themeId === "lagoon" ||
+        value.themeId === "sand" ||
+        value.themeId === "custom"
           ? value.themeId
           : DEFAULT_APPEARANCE.themeId,
+      customThemeColor: customThemeColor ?? DEFAULT_CUSTOM_THEME_COLOR,
       fontFamily:
         typeof value.fontFamily === "string" && value.fontFamily.trim()
           ? value.fontFamily
@@ -92,6 +106,15 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
     root.classList.toggle("dark", resolvedMode === "dark");
     root.dataset.theme = preferences.themeId;
     root.style.setProperty("--app-font-family", fontStack(preferences.fontFamily));
+    if (preferences.themeId === "custom") {
+      applyCustomThemeVariables(
+        root,
+        preferences.customThemeColor,
+        resolvedMode === "dark",
+      );
+    } else {
+      clearCustomThemeVariables(root);
+    }
     window.localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify(preferences));
   }, [preferences, resolvedMode]);
 
@@ -103,6 +126,12 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
     setPreferences((current) => ({ ...current, themeId }));
   }, []);
 
+  const setCustomThemeColor = useCallback((customThemeColor: string): void => {
+    const normalized = normalizeHexColor(customThemeColor);
+    if (!normalized) return;
+    setPreferences((current) => ({ ...current, customThemeColor: normalized }));
+  }, []);
+
   const setFontFamily = useCallback((fontFamily: string): void => {
     setPreferences((current) => ({ ...current, fontFamily }));
   }, []);
@@ -112,10 +141,11 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
       preferences,
       resolvedMode,
       setColorMode,
+      setCustomThemeColor,
       setThemeId,
       setFontFamily,
     }),
-    [preferences, resolvedMode, setColorMode, setFontFamily, setThemeId],
+    [preferences, resolvedMode, setColorMode, setCustomThemeColor, setFontFamily, setThemeId],
   );
 
   return <AppearanceContext.Provider value={value}>{children}</AppearanceContext.Provider>;

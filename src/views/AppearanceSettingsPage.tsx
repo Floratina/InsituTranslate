@@ -1,4 +1,5 @@
 import { Monitor, Moon, Palette, Settings, Sun, Type } from "lucide-react";
+import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -7,7 +8,13 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
+import { CustomThemeColorPicker } from "@/features/appearance/CustomThemeColorPicker";
 import { FontPicker } from "@/features/appearance/FontPicker";
 import { useAppearance } from "@/features/appearance/AppearanceProvider";
 import {
@@ -15,7 +22,9 @@ import {
   SYSTEM_FONT_VALUE,
   THEME_PRESETS,
 } from "@/features/appearance/constants";
-import type { ColorMode } from "@/features/appearance/types";
+import { getCustomThemeSwatches } from "@/features/appearance/theme-colors";
+import type { ColorMode, ThemeId } from "@/features/appearance/types";
+import { cn } from "@/lib/utils";
 
 const colorModes: readonly {
   value: ColorMode;
@@ -27,10 +36,90 @@ const colorModes: readonly {
   { value: "system", label: "跟随系统", icon: Monitor },
 ];
 
+function ThemeSwatches({ swatches }: { swatches: readonly [string, string, string, string] }) {
+  return (
+    <span className="grid shrink-0 grid-cols-2 overflow-hidden rounded-[6px] border">
+      {swatches.map((swatch) => (
+        <span
+          key={swatch}
+          className="size-5"
+          style={{ backgroundColor: swatch }}
+        />
+      ))}
+    </span>
+  );
+}
+
+function CustomThemeOption({
+  selected,
+  swatches,
+  value,
+  onSelect,
+  onColorChange,
+}: {
+  selected: boolean;
+  swatches: readonly [string, string, string, string];
+  value: string;
+  onSelect: (themeId: ThemeId) => void;
+  onColorChange: (value: string) => void;
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  function applyCustomTheme(): void {
+    onSelect("custom");
+  }
+
+  function applyCustomColor(nextValue: string): void {
+    onColorChange(nextValue);
+    onSelect("custom");
+    setPickerOpen(false);
+  }
+
+  return (
+    <div
+      className={cn(
+        "relative flex min-h-16 w-full min-w-0 items-center gap-3 rounded-[6px] border bg-background p-3 text-left outline-none transition-[background-color,border-color,box-shadow] duration-150 hover:bg-muted/60",
+        selected && "border-primary bg-background ring-1 ring-primary/35",
+      )}
+    >
+      <button
+        type="button"
+        aria-pressed={selected}
+        className="flex min-w-0 flex-1 items-center gap-3 text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/40"
+        onClick={applyCustomTheme}
+      >
+        <ThemeSwatches swatches={swatches} />
+        <span className="min-w-0 flex-1">
+          <span className="block text-sm font-medium">自定义</span>
+          <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+            点击修改主题色
+          </span>
+        </span>
+      </button>
+
+      <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            size="sm"
+            className="h-7 px-2"
+          >
+            编辑
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent align="end" className="w-80 p-3">
+          <CustomThemeColorPicker value={value} onApply={applyCustomColor} />
+        </PopoverContent>
+      </Popover>
+    </div>
+  );
+}
+
 export default function AppearanceSettingsPage() {
   const {
     preferences,
     setColorMode,
+    setCustomThemeColor,
     setFontFamily,
     setThemeId,
   } = useAppearance();
@@ -38,6 +127,7 @@ export default function AppearanceSettingsPage() {
     preferences.fontFamily === SYSTEM_FONT_VALUE
       ? SYSTEM_FONT_STACK
       : `"${preferences.fontFamily.replaceAll('"', '\\"')}", ${SYSTEM_FONT_STACK}`;
+  const customThemeSwatches = getCustomThemeSwatches(preferences.customThemeColor);
 
   return (
     <main className="flex min-w-0 flex-1 flex-col overflow-hidden p-3">
@@ -97,20 +187,19 @@ export default function AppearanceSettingsPage() {
                     selected={selected}
                     className="min-h-16 p-3"
                     leading={(
-                      <span className="grid shrink-0 grid-cols-2 overflow-hidden rounded-[6px] border">
-                        {theme.swatches.map((swatch) => (
-                          <span
-                            key={swatch}
-                            className="size-5"
-                            style={{ backgroundColor: swatch }}
-                          />
-                        ))}
-                      </span>
+                      <ThemeSwatches swatches={theme.swatches} />
                     )}
                     onClick={() => setThemeId(theme.id)}
                   />
                 );
               })}
+              <CustomThemeOption
+                selected={preferences.themeId === "custom"}
+                swatches={customThemeSwatches}
+                value={preferences.customThemeColor}
+                onSelect={setThemeId}
+                onColorChange={setCustomThemeColor}
+              />
             </CardContent>
           </Card>
 

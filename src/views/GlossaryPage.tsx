@@ -27,7 +27,6 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
-import { motion } from "motion/react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -107,7 +106,6 @@ const ALL_VALUE = "__all__";
 const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
 const LOADING_INDICATOR_DELAY_MS = 120;
-const TABLE_REFRESH_TRANSITION = { duration: 0.1, ease: [0.03, 0.59, 0.19, 1] as const };
 
 const SORT_LABELS: Record<SortMode, string> = {
   "created-desc": "添加时间倒序",
@@ -1027,7 +1025,7 @@ function GlossaryListView({
           </Button>
         </div>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          管理上传或后续自动建立的 InsituGlossary 文件。
+          管理上传或后续自动建立的术语表文件
         </p>
       </header>
 
@@ -1160,20 +1158,6 @@ function GlossaryListTable({
   );
   const tableWidth = sum(adaptiveWidths) + ACTION_COLUMN_WIDTH;
   const tableNeedsHorizontalScroll = tableWidth > tableViewportWidth + 1;
-  const bodyKey = listLoading
-    ? "loading"
-    : [
-      "ready",
-      page,
-      pageSize,
-      search,
-      tagFilter,
-      sourceFilter,
-      targetFilter,
-      listSort.field,
-      listSort.mode,
-      glossaries.map((glossary) => `${glossary.id}:${glossary.updatedAt}`).join("|"),
-    ].join("-");
 
   return (
       <section className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card">
@@ -1243,12 +1227,7 @@ function GlossaryListTable({
                 <ActionHeader />
               </tr>
             </thead>
-            <motion.tbody
-              key={bodyKey}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={TABLE_REFRESH_TRANSITION}
-            >
+            <tbody>
               {listLoading ? (
                 <TableSkeletonRows columns={5} />
               ) : listLoading ? (
@@ -1302,7 +1281,7 @@ function GlossaryListTable({
                   </ContextMenu>
                 ))
               )}
-            </motion.tbody>
+            </tbody>
           </table>
         </div>
         <PaginationBar
@@ -1500,17 +1479,6 @@ function GlossaryDetailView({
   );
   const tableWidth = sum(adaptiveWidths) + ACTION_COLUMN_WIDTH;
   const tableNeedsHorizontalScroll = tableWidth > tableViewportWidth + 1;
-  const bodyKey = entryLoading
-    ? "loading"
-    : [
-      "ready",
-      entryPage.page,
-      entryPage.pageSize,
-      entrySearch,
-      entrySort.field,
-      entrySort.mode,
-      entryPage.entries.map((entry) => `${entry.id}:${entry.updatedAt}`).join("|"),
-    ].join("-");
 
   return (
     <div
@@ -1597,12 +1565,7 @@ function GlossaryDetailView({
                 <ActionHeader />
               </tr>
             </thead>
-            <motion.tbody
-              key={bodyKey}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={TABLE_REFRESH_TRANSITION}
-            >
+            <tbody>
               {entryLoading ? (
                 <TableMessage colSpan={3} icon={<Loader2 className="size-4 animate-spin" />}>
                   正在加载术语条目
@@ -1639,7 +1602,7 @@ function GlossaryDetailView({
                   </ContextMenu>
                 ))
               )}
-            </motion.tbody>
+            </tbody>
           </table>
         </div>
         <PaginationBar

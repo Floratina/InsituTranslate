@@ -158,10 +158,10 @@ function SettingsNav({
             type="button"
             aria-pressed={selected}
             className={cn(
-              "flex h-9 min-w-0 items-center gap-2 rounded-[6px] px-2 text-left text-sm font-medium outline-none transition-[background-color,color] duration-150 hover:bg-[var(--button-ghost-hover-bg)] hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/40 active:bg-[var(--button-ghost-pressed-bg)]",
+              "flex h-9 min-w-0 items-center gap-2 rounded-[6px] px-2 text-left text-sm font-medium outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-3 focus-visible:ring-ring/40",
               selected
-                ? "bg-enabled-accent/16 text-enabled-accent"
-                : "text-muted-foreground",
+                ? "bg-enabled-accent/16 text-enabled-accent hover:bg-enabled-accent/24 hover:text-enabled-accent active:bg-enabled-accent/24 active:shadow-[inset_0_0_0_999px_rgb(0_0_0_/_0.12)] dark:bg-enabled-accent/22 dark:hover:bg-enabled-accent/30 dark:active:bg-enabled-accent/30 dark:active:shadow-[inset_0_0_0_999px_rgb(0_0_0_/_0.18)]"
+                : "text-muted-foreground hover:bg-[var(--button-ghost-hover-bg)] hover:text-foreground active:bg-[var(--button-ghost-pressed-bg)]",
             )}
             onClick={() => onTabChange(item.value)}
           >

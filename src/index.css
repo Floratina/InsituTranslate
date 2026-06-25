@@ -1,9 +1,12 @@
+@import "@fontsource/inconsolata/400.css";
+@import "@fontsource/inconsolata/500.css";
 @import "tailwindcss";
 
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme inline {
   --font-sans: var(--app-font-family);
+  --font-mono: var(--mono-font-family);
   --font-placeholder-mono: var(--placeholder-mono-family);
   --font-emoji: var(--emoji-font-family);
   --color-background: var(--background);
@@ -41,8 +44,9 @@
 
 :root {
   --app-font-family: Inter, "Segoe UI", sans-serif;
+  --mono-font-family: "Inconsolata", Consolas, "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Menlo, Monaco, var(--app-font-family), "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", sans-serif;
   --avatar-letter-font-family: "Aptos Display", "Segoe UI Variable Display", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", var(--app-font-family);
-  --placeholder-mono-family: Consolas, "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Menlo, Monaco, var(--app-font-family), "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", sans-serif;
+  --placeholder-mono-family: var(--mono-font-family);
   --emoji-font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
   font-family: var(--app-font-family);
   color-scheme: light;
@@ -105,6 +109,16 @@
   --enabled-accent: oklch(0.58 0.12 165);
   --ring: oklch(0.58 0.12 165);
   --sidebar: oklch(0.974 0.012 165);
+}
+
+:root[data-theme="lagoon"] {
+  --background: oklch(0.984 0.004 205);
+  --primary: oklch(0.55 0.14 205);
+  --accent: oklch(0.952 0.028 205);
+  --accent-foreground: oklch(0.34 0.10 205);
+  --enabled-accent: oklch(0.60 0.13 205);
+  --ring: oklch(0.60 0.13 205);
+  --sidebar: oklch(0.974 0.012 205);
 }
 
 :root[data-theme="sand"] {
@@ -194,6 +208,23 @@
   --ring: oklch(0.73 0.10 165);
 }
 
+:root.dark[data-theme="lagoon"] {
+  --background: oklch(0.17 0.015 205);
+  --card: oklch(0.205 0.017 205);
+  --popover: oklch(0.22 0.019 205);
+  --secondary: oklch(0.265 0.017 205);
+  --muted: oklch(0.255 0.016 205);
+  --border: oklch(0.34 0.018 205);
+  --input: oklch(0.34 0.018 205);
+  --sidebar: oklch(0.19 0.021 205);
+  --primary: oklch(0.74 0.11 205);
+  --primary-foreground: oklch(0.17 0.025 205);
+  --accent: oklch(0.30 0.04 205);
+  --accent-foreground: oklch(0.89 0.045 205);
+  --enabled-accent: oklch(0.74 0.11 205);
+  --ring: oklch(0.74 0.11 205);
+}
+
 :root.dark[data-theme="sand"] {
   --background: oklch(0.175 0.014 70);
   --card: oklch(0.21 0.016 70);
@@ -281,34 +312,6 @@ body {
   }
 }
 
-@keyframes floating-menu-enter-right {
-  from {
-    opacity: 0.25;
-    transform: translate3d(-10px, 0, 0) scale(0.965);
-    clip-path: inset(0 90% 0 0);
-  }
-
-  to {
-    opacity: 1;
-    transform: translate3d(0, 0, 0) scale(1);
-    clip-path: inset(-30px -30px -30px -30px);
-  }
-}
-
-@keyframes floating-menu-enter-left {
-  from {
-    opacity: 0.25;
-    transform: translate3d(10px, 0, 0) scale(0.965);
-    clip-path: inset(0 0 0 90%);
-  }
-
-  to {
-    opacity: 1;
-    transform: translate3d(0, 0, 0) scale(1);
-    clip-path: inset(-30px -30px -30px -30px);
-  }
-}
-
 .floating-menu-enter {
   animation: floating-menu-enter-bottom 145ms cubic-bezier(0.22, 0.61, 0.36, 0.99) both;
   will-change: transform, opacity, clip-path;
@@ -319,11 +322,6 @@ body {
   will-change: transform, opacity, clip-path;
 }
 
-.floating-menu-enter[data-side="bottom"],
-[data-side="bottom"] > .floating-menu-enter {
-  animation-name: floating-menu-enter-bottom;
-}
-
 .floating-menu-enter[data-side="top"],
 [data-side="top"] > .floating-menu-enter {
   animation-name: floating-menu-enter-top;
@@ -332,25 +330,6 @@ body {
 .floating-menu-enter-y[data-side="top"],
 [data-side="top"] > .floating-menu-enter-y {
   animation-name: floating-menu-enter-top;
-}
-
-.floating-menu-enter-y[data-side="bottom"],
-[data-side="bottom"] > .floating-menu-enter-y,
-.floating-menu-enter-y[data-side="left"],
-[data-side="left"] > .floating-menu-enter-y,
-.floating-menu-enter-y[data-side="right"],
-[data-side="right"] > .floating-menu-enter-y {
-  animation-name: floating-menu-enter-bottom;
-}
-
-.floating-menu-enter[data-side="right"],
-[data-side="right"] > .floating-menu-enter {
-  animation-name: floating-menu-enter-right;
-}
-
-.floating-menu-enter[data-side="left"],
-[data-side="left"] > .floating-menu-enter {
-  animation-name: floating-menu-enter-left;
 }
 
 .scrollbar-hidden {

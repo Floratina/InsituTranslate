@@ -489,7 +489,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
           <h1 className="text-xl font-medium tracking-tight">开始</h1>
         </div>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          添加文件、选择翻译执行方式并创建任务，源语言将自动识别。
+          添加文件和修改翻译配置
         </p>
       </header>
 

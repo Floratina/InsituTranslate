@@ -120,3 +120,12 @@
 ## 💡 TypeScript 指南
 - 为所有的 props 和状态变量声明明确的 TypeScript 接口（Interface）和类型（Type）。
 - 严格避免使用 `any`，以确保代码库在未来的模块化重构中保持可维护性。
+
+---
+
+## DOCX/XLSX Hybrid Parser Boundary
+- DOCX/XLSX parsing must follow a read/write split: use mature crates for safe reading and validation, but keep the original ZIP/XML package as the source of truth for write-back.
+- DOCX uses `docx-rs` for structured document validation/reading. Lossless render must patch only targeted `word/document.xml` text nodes and preserve runs, styles, relationships, media, and unknown XML.
+- XLSX uses `calamine` for workbook validation/reading. Because `calamine` is read-only, render must not regenerate workbooks through it.
+- XLSX v1 translation/write-back is intentionally limited to `xl/sharedStrings.xml`; worksheet XML files must remain untouched so formulas, cells, sheets, dimensions, and layout are preserved.
+- Do not add `path` dependencies pointing at `0_repo_references`; that directory remains read-only reference material only.

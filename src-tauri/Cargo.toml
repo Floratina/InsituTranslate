@@ -13,18 +13,27 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+calamine = "0.35.0"
+comrak = { version = "0.28", default-features = false }
+docx-rs = { version = "0.4.20", default-features = false }
 futures-util = "0.3"
 fontdb = "0.23"
 jsonwebtoken = "9"
+lrc = "0.1.8"
 pdf_oxide = { version = "0.3", default-features = false }
 quick-xml = "0.36"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
+scraper = "0.27.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+subparse = "0.7.0"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+text-splitter = { version = "0.32", features = ["tiktoken-rs"] }
+tiktoken-rs = "0.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
+unicode-segmentation = "1"
 url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }

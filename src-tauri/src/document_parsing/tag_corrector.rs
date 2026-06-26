@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use regex::{Captures, Regex};
 
+use super::placeholders::BLOCKQUOTE_PREFIX_KIND;
 use super::types::{PlaceholderEntry, PlaceholderMap};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,15 +13,16 @@ enum TagToken {
 
 pub fn correct_and_restore(translated: &str, map: &PlaceholderMap) -> String {
     let normalized = normalize_placeholder_tags(translated);
+    let normalized = restore_non_translatable_entries(map, &normalized);
     let entries = restorable_entries(map);
-    if entries.is_empty() {
-        return with_block_affixes(map, &normalized);
-    }
-    if validate_placeholder_tags(&normalized, &entries) {
-        with_block_affixes(map, &restore_native_tags(&normalized, &entries))
+    let restored = if entries.is_empty() {
+        normalized
+    } else if validate_placeholder_tags(&normalized, &entries) {
+        restore_native_tags(&normalized, &entries)
     } else {
-        with_block_affixes(map, &strip_placeholder_tags(&normalized))
-    }
+        strip_placeholder_tags(&normalized)
+    };
+    with_block_affixes(map, &restore_line_prefixes(map, &restored))
 }
 
 fn normalize_placeholder_tags(text: &str) -> String {
@@ -186,9 +188,71 @@ fn restore_native_tags(text: &str, entries: &[&PlaceholderEntry]) -> String {
     restored
 }
 
+fn restore_non_translatable_entries(map: &PlaceholderMap, text: &str) -> String {
+    let mut restored = text.to_string();
+    for entry in map
+        .entries
+        .iter()
+        .filter(|entry| !entry.translatable && !entry.original.is_empty())
+    {
+        let pattern = Regex::new(&format!(
+            r"(?is)<\s*{}\s*>\s*<\s*/\s*{}\s*>",
+            regex::escape(&entry.id),
+            regex::escape(&entry.id)
+        ))
+        .expect("escaped placeholder id should build a regex");
+        restored = pattern
+            .replace_all(&restored, entry.original.as_str())
+            .to_string();
+    }
+    restored
+}
+
 fn strip_placeholder_tags(text: &str) -> String {
     let pattern = Regex::new(r"</?t\d+>").expect("static placeholder strip regex");
     pattern.replace_all(text, "").to_string()
+}
+
+fn restore_line_prefixes(map: &PlaceholderMap, text: &str) -> String {
+    let line_prefixes = line_prefixes_by_index(map);
+    if line_prefixes.is_empty() {
+        return text.to_string();
+    }
+
+    if text.is_empty() {
+        return line_prefixes.get(&0).cloned().unwrap_or_default();
+    }
+
+    let mut restored = String::new();
+    for (line_index, line) in text.split_inclusive('\n').enumerate() {
+        if let Some(prefix) = line_prefixes.get(&line_index) {
+            restored.push_str(prefix);
+        }
+        restored.push_str(line);
+    }
+    restored
+}
+
+fn line_prefixes_by_index(map: &PlaceholderMap) -> HashMap<usize, String> {
+    let mut prefixes = HashMap::new();
+    for entry in &map.entries {
+        if entry.kind != BLOCKQUOTE_PREFIX_KIND {
+            continue;
+        }
+        let Some(line_index) = entry
+            .native_ref
+            .as_deref()
+            .and_then(|native_ref| native_ref.strip_prefix("line:"))
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        prefixes
+            .entry(line_index)
+            .or_insert_with(String::new)
+            .push_str(&entry.original);
+    }
+    prefixes
 }
 
 fn with_block_affixes(map: &PlaceholderMap, text: &str) -> String {

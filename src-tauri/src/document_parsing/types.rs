@@ -30,6 +30,7 @@ pub struct ParsedChunk {
 pub struct RenderedChunk {
     pub sequence: i64,
     pub source_text: String,
+    pub after_translate_text: String,
     pub translated_text: String,
     pub map_json: String,
 }

@@ -1443,7 +1443,7 @@ async fn rendered_task_document(
     source_path: &Path,
 ) -> Result<Vec<u8>, String> {
     let rows = sqlx::query(
-        "SELECT sequence, source_text, translated_text, map_json FROM chunks ORDER BY sequence",
+        "SELECT sequence, source_text, after_translate_text, translated_text, map_json FROM chunks ORDER BY sequence",
     )
     .fetch_all(inp_pool)
     .await
@@ -1453,9 +1453,15 @@ async fn rendered_task_document(
         .map(|row| {
             let translated_text: String = row.get("translated_text");
             let source_text: String = row.get("source_text");
+            let after_translate_text: String = row.get("after_translate_text");
             RenderedChunk {
                 sequence: row.get("sequence"),
                 source_text: source_text.clone(),
+                after_translate_text: if after_translate_text.is_empty() {
+                    source_text.clone()
+                } else {
+                    after_translate_text
+                },
                 translated_text: if translated_text.is_empty() {
                     source_text
                 } else {
@@ -2785,19 +2791,7 @@ fn push_raw_chunk(task_id: &str, chunks: &mut Vec<RawChunk>, source_text: String
 }
 
 fn estimate_tokens(text: &str) -> u64 {
-    if text.is_empty() {
-        return 0;
-    }
-    let mut ascii = 0_u64;
-    let mut non_ascii = 0_u64;
-    for character in text.chars() {
-        if character.is_ascii() {
-            ascii += 1;
-        } else {
-            non_ascii += 1;
-        }
-    }
-    ascii.div_ceil(4) + non_ascii.div_ceil(2)
+    document_parsing::count_tokens(text) as u64
 }
 
 async fn next_inp_path(workspace_root: &Path, display_name: &str) -> Result<PathBuf, String> {

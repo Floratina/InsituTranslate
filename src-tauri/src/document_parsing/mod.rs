@@ -12,8 +12,12 @@ pub mod types;
 mod xlsx;
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::task_prompt::{ContentFormat, DocumentFormat};
+use text_splitter::{ChunkConfig, TextSplitter};
+use tiktoken_rs::{cl100k_base, CoreBPE};
+use unicode_segmentation::UnicodeSegmentation;
 
 use self::docx::DocxParser;
 use self::epub::EpubParser;
@@ -26,6 +30,10 @@ use self::subtitle::SubtitleParser;
 use self::txt::TxtParser;
 use self::types::{ParsedChunk, ParserInput, PlaceholderMap, RenderInput, RenderedChunk};
 use self::xlsx::XlsxParser;
+
+pub const HARD_CHUNK_TOKEN_LIMIT: usize = 2000;
+
+static CL100K_TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
 
 pub trait DocumentParser {
     fn parse(&self, input: ParserInput<'_>) -> Result<Vec<ParsedChunk>, String>;
@@ -124,7 +132,8 @@ pub fn content_format_from_path(path: &Path) -> Result<ContentFormat, String> {
         "epub" => Ok(ContentFormat::Xhtml),
         "html" | "htm" => Ok(ContentFormat::Html),
         "json" => Ok(ContentFormat::Json),
-        "txt" | "docx" | "xlsx" => Ok(ContentFormat::PlainText),
+        "txt" => Ok(ContentFormat::PlainText),
+        "docx" | "xlsx" => Ok(ContentFormat::Xml),
         "srt" => Ok(ContentFormat::Srt),
         "ass" => Ok(ContentFormat::Ass),
         "lrc" => Ok(ContentFormat::Lrc),
@@ -174,64 +183,258 @@ pub fn source_extension(path: &str) -> Result<&'static str, String> {
     }
 }
 
-pub fn chunk_text(text: &str, token_limit: i64) -> Vec<String> {
-    let token_limit = token_limit.max(1) as u64;
-    let max_chars = (token_limit * 4).max(200) as usize;
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for segment in text.split_inclusive('\n') {
-        if !current.is_empty() && estimate_tokens(&current) + estimate_tokens(segment) > token_limit
-        {
-            chunks.push(std::mem::take(&mut current));
-        }
-        if estimate_tokens(segment) > token_limit {
-            for part in split_long_segment(segment, max_chars) {
-                if current.is_empty() {
-                    chunks.push(part);
-                } else {
-                    chunks.push(std::mem::take(&mut current));
-                    chunks.push(part);
-                }
-            }
-        } else {
-            current.push_str(segment);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawBlock {
+    pub text: String,
+    pub is_breakable: bool,
+}
+
+impl RawBlock {
+    pub fn new(text: impl Into<String>, is_breakable: bool) -> Self {
+        Self {
+            text: text.into(),
+            is_breakable,
         }
     }
-    if !current.is_empty() || chunks.is_empty() {
-        chunks.push(current);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawBlockRef<T> {
+    pub text: String,
+    pub is_breakable: bool,
+    pub metadata: T,
+}
+
+impl<T> RawBlockRef<T> {
+    pub fn new(text: impl Into<String>, is_breakable: bool, metadata: T) -> Self {
+        Self {
+            text: text.into(),
+            is_breakable,
+            metadata,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkedRawBlock<T> {
+    pub text: String,
+    pub metadata: T,
+    pub source_start: usize,
+    pub source_end: usize,
+}
+
+pub fn count_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    tokenizer().encode_ordinary(text).len()
+}
+
+pub fn chunk_text(text: &str, token_limit: i64) -> Vec<String> {
+    chunk_raw_blocks(
+        vec![RawBlock::new(text.to_string(), true)],
+        token_limit_usize(token_limit),
+    )
+}
+
+pub fn chunk_raw_blocks(blocks: Vec<RawBlock>, max_tokens: usize) -> Vec<String> {
+    chunk_raw_block_refs(
+        blocks
+            .into_iter()
+            .map(|block| RawBlockRef::new(block.text, block.is_breakable, ()))
+            .collect(),
+        max_tokens,
+    )
+    .into_iter()
+    .map(|chunk| {
+        chunk
+            .into_iter()
+            .map(|block| block.text)
+            .collect::<String>()
+    })
+    .collect()
+}
+
+pub fn chunk_raw_block_refs<T: Clone>(
+    blocks: Vec<RawBlockRef<T>>,
+    max_tokens: usize,
+) -> Vec<Vec<ChunkedRawBlock<T>>> {
+    let max_tokens = max_tokens.max(1);
+    let mut chunks = Vec::new();
+    let mut current = Vec::<ChunkedRawBlock<T>>::new();
+    let mut current_tokens = 0_usize;
+
+    for block in blocks {
+        let block_tokens = count_tokens(&block.text);
+        if block.is_breakable && block_tokens > max_tokens {
+            flush_chunk(&mut chunks, &mut current, &mut current_tokens);
+            for (part, start, end) in split_breakable_text(&block.text, max_tokens) {
+                push_chunked_block(
+                    &mut chunks,
+                    &mut current,
+                    &mut current_tokens,
+                    max_tokens,
+                    ChunkedRawBlock {
+                        text: part,
+                        metadata: block.metadata.clone(),
+                        source_start: start,
+                        source_end: end,
+                    },
+                    true,
+                );
+            }
+            continue;
+        }
+
+        let block_len = block.text.len();
+        if !block.is_breakable && block_tokens > HARD_CHUNK_TOKEN_LIMIT {
+            flush_chunk(&mut chunks, &mut current, &mut current_tokens);
+            current.push(ChunkedRawBlock {
+                text: block.text,
+                metadata: block.metadata,
+                source_start: 0,
+                source_end: block_len,
+            });
+            flush_chunk(&mut chunks, &mut current, &mut current_tokens);
+            continue;
+        }
+
+        let force_own_chunk = !block.is_breakable && block_tokens > max_tokens;
+        push_chunked_block(
+            &mut chunks,
+            &mut current,
+            &mut current_tokens,
+            max_tokens,
+            ChunkedRawBlock {
+                text: block.text,
+                metadata: block.metadata,
+                source_start: 0,
+                source_end: block_len,
+            },
+            force_own_chunk,
+        );
+        if force_own_chunk {
+            flush_chunk(&mut chunks, &mut current, &mut current_tokens);
+        }
+    }
+
+    flush_chunk(&mut chunks, &mut current, &mut current_tokens);
+    if chunks.is_empty() {
+        chunks.push(Vec::new());
     }
     chunks
 }
 
-fn split_long_segment(segment: &str, max_chars: usize) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    for character in segment.chars() {
-        current.push(character);
-        if current.len() >= max_chars {
-            parts.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
+pub fn token_limit_usize(token_limit: i64) -> usize {
+    token_limit.max(1) as usize
 }
 
-fn estimate_tokens(text: &str) -> u64 {
-    if text.is_empty() {
-        return 0;
+fn tokenizer() -> &'static CoreBPE {
+    CL100K_TOKENIZER.get_or_init(|| {
+        cl100k_base().expect("cl100k_base tokenizer should be available in tiktoken-rs")
+    })
+}
+
+fn push_chunked_block<T>(
+    chunks: &mut Vec<Vec<ChunkedRawBlock<T>>>,
+    current: &mut Vec<ChunkedRawBlock<T>>,
+    current_tokens: &mut usize,
+    max_tokens: usize,
+    block: ChunkedRawBlock<T>,
+    force_own_chunk: bool,
+) {
+    let block_tokens = count_tokens(&block.text);
+    if !current.is_empty() && (*current_tokens + block_tokens > max_tokens || force_own_chunk) {
+        flush_chunk(chunks, current, current_tokens);
     }
-    let mut ascii = 0_u64;
-    let mut non_ascii = 0_u64;
-    for character in text.chars() {
-        if character.is_ascii() {
-            ascii += 1;
-        } else {
-            non_ascii += 1;
+    *current_tokens += block_tokens;
+    current.push(block);
+}
+
+fn flush_chunk<T>(
+    chunks: &mut Vec<Vec<ChunkedRawBlock<T>>>,
+    current: &mut Vec<ChunkedRawBlock<T>>,
+    current_tokens: &mut usize,
+) {
+    if current.is_empty() {
+        return;
+    }
+    chunks.push(std::mem::take(current));
+    *current_tokens = 0;
+}
+
+fn split_breakable_text(text: &str, max_tokens: usize) -> Vec<(String, usize, usize)> {
+    let max_tokens = max_tokens.max(1);
+    let config = ChunkConfig::new(max_tokens).with_sizer(tokenizer().clone());
+    let splitter = TextSplitter::new(config);
+    let mut chunks = Vec::new();
+    let mut cursor = 0_usize;
+
+    for chunk in splitter.chunks(text) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let chunk_end = text[cursor..]
+            .find(chunk)
+            .map(|offset| cursor + offset + chunk.len())
+            .unwrap_or_else(|| cursor + chunk.len().min(text.len().saturating_sub(cursor)));
+        let preserved = &text[cursor..chunk_end];
+        if count_tokens(preserved) > max_tokens {
+            chunks.extend(split_grapheme_safe(preserved, max_tokens, cursor));
+        } else if !preserved.is_empty() {
+            chunks.push((preserved.to_string(), cursor, chunk_end));
+        }
+        cursor = chunk_end;
+    }
+
+    if cursor < text.len() {
+        let tail = &text[cursor..];
+        if count_tokens(tail) > max_tokens {
+            chunks.extend(split_grapheme_safe(tail, max_tokens, cursor));
+        } else if !tail.is_empty() {
+            chunks.push((tail.to_string(), cursor, text.len()));
         }
     }
-    (ascii + 3) / 4 + non_ascii
+
+    if chunks.is_empty() && !text.is_empty() {
+        chunks.push((text.to_string(), 0, text.len()));
+    }
+    chunks
+}
+
+fn split_grapheme_safe(
+    text: &str,
+    max_tokens: usize,
+    base_offset: usize,
+) -> Vec<(String, usize, usize)> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_start = 0_usize;
+    let mut current_end = 0_usize;
+
+    for (index, grapheme) in text.grapheme_indices(true) {
+        let next_end = index + grapheme.len();
+        let candidate_tokens = count_tokens(&current) + count_tokens(grapheme);
+        if !current.is_empty() && candidate_tokens > max_tokens {
+            chunks.push((
+                std::mem::take(&mut current),
+                base_offset + current_start,
+                base_offset + current_end,
+            ));
+            current_start = index;
+        }
+        current.push_str(grapheme);
+        current_end = next_end;
+    }
+
+    if !current.is_empty() {
+        chunks.push((
+            current,
+            base_offset + current_start,
+            base_offset + current_end,
+        ));
+    }
+    chunks
 }
 
 fn parser_for_path(path: &Path) -> Result<Box<dyn DocumentParser + Send + Sync>, String> {
@@ -287,4 +490,27 @@ fn extension(path: &Path) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_raw_blocks_splits_breakable_plain_text_with_tiktoken_sizer() {
+        let text = "Alpha beta gamma delta. ".repeat(40);
+        let chunks = chunk_raw_blocks(vec![RawBlock::new(text.clone(), true)], 12);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| count_tokens(chunk) <= 12));
+    }
+
+    #[test]
+    fn chunk_raw_blocks_keeps_format_sensitive_block_whole() {
+        let text = "**bold** ".repeat(80);
+        let chunks = chunk_raw_blocks(vec![RawBlock::new(text.clone(), false)], 5);
+
+        assert_eq!(chunks, vec![text]);
+    }
 }

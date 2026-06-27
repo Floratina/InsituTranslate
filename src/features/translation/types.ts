@@ -37,11 +37,13 @@ export interface TranslationConfigView {
   glossaryMode: GlossaryMode;
   glossaryId: string | null;
   confidenceMode: ConfidenceMode;
+  pdfParsingMode: PdfParsingMode;
 }
 
 export type RateLimitStrategy = "dynamic" | "manual";
 export type GlossaryMode = "auto" | "existing";
 export type ConfidenceMode = "off" | "confidence-index";
+export type PdfParsingMode = "local-first" | "mineru-first" | "local-only" | "mineru-only";
 
 export type UpdateTranslationConfigInput = TranslationConfigView;
 

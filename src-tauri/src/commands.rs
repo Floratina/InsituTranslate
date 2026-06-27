@@ -28,6 +28,7 @@ use crate::glossaries::{
     GlossaryEntriesQuery, GlossaryEntryPage, GlossaryEntryView, GlossaryListQuery, GlossaryView,
     ImportGlossaryInput, PrepareAutoGlossaryInput, UpdateGlossaryEntryInput, UpdateGlossaryInput,
 };
+use crate::settings::{AppearancePreferences, AppearancePreferencesState, FontCacheRefresh};
 use crate::translation_tasks::{
     self, CreateTranslationTaskInput, ExportTranslationTaskInput, ImportTranslationTaskInput,
     RunMode, TranslationConfigView, TranslationInterrupt, TranslationTaskDetail,
@@ -43,6 +44,7 @@ pub struct RunningTranslationTask {
 
 pub struct AppState {
     pub pool: SqlitePool,
+    pub settings_pool: SqlitePool,
     pub translation_config_pool: SqlitePool,
     pub translation_workspace_root: PathBuf,
     pub glossary_config_pool: SqlitePool,
@@ -50,6 +52,33 @@ pub struct AppState {
     pub running_translation_task: Arc<Mutex<Option<RunningTranslationTask>>>,
     pub translation_batch_cancel: Arc<AtomicBool>,
     pub client: Client,
+}
+
+#[tauri::command]
+pub async fn get_appearance_preferences(
+    state: State<'_, AppState>,
+) -> Result<AppearancePreferencesState, String> {
+    crate::settings::get_appearance_preferences(&state.settings_pool).await
+}
+
+#[tauri::command]
+pub async fn update_appearance_preferences(
+    state: State<'_, AppState>,
+    input: AppearancePreferences,
+) -> Result<AppearancePreferences, String> {
+    crate::settings::update_appearance_preferences(&state.settings_pool, input).await
+}
+
+#[tauri::command]
+pub async fn get_cached_system_fonts(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    crate::settings::get_cached_system_fonts(&state.settings_pool).await
+}
+
+#[tauri::command]
+pub async fn refresh_system_fonts_cache(
+    state: State<'_, AppState>,
+) -> Result<FontCacheRefresh, String> {
+    crate::settings::refresh_system_fonts_cache(&state.settings_pool).await
 }
 
 #[tauri::command]
@@ -357,6 +386,7 @@ pub async fn create_translation_task(
 ) -> Result<TranslationTaskView, String> {
     translation_tasks::create_translation_task(
         &state.pool,
+        &state.client,
         &state.translation_config_pool,
         &state.translation_workspace_root,
         input,
@@ -558,6 +588,8 @@ pub async fn start_translation_tasks_batch(
     let ids = input.ids;
     let provider_pool = state.pool.clone();
     let config_pool = state.translation_config_pool.clone();
+    let glossary_config_pool = state.glossary_config_pool.clone();
+    let glossary_workspace_root = state.glossary_workspace_root.clone();
     let workspace_root = state.translation_workspace_root.clone();
     let client = state.client.clone();
     let running = state.running_translation_task.clone();
@@ -593,6 +625,8 @@ pub async fn start_translation_tasks_batch(
                 });
             }
             let prepared = match translation_tasks::prepare_translation_run(
+                &provider_pool,
+                &client,
                 &config_pool,
                 &workspace_root,
                 &id,
@@ -614,6 +648,8 @@ pub async fn start_translation_tasks_batch(
                 app.clone(),
                 provider_pool.clone(),
                 config_pool.clone(),
+                glossary_config_pool.clone(),
+                glossary_workspace_root.clone(),
                 client.clone(),
                 prepared,
                 interrupt,
@@ -676,6 +712,8 @@ async fn start_translation_task_with_mode(
     }
 
     let prepared = match translation_tasks::prepare_translation_run(
+        &state.pool,
+        &state.client,
         &state.translation_config_pool,
         &state.translation_workspace_root,
         &id,
@@ -692,6 +730,8 @@ async fn start_translation_task_with_mode(
     let view = prepared.task.clone();
     let provider_pool = state.pool.clone();
     let config_pool = state.translation_config_pool.clone();
+    let glossary_config_pool = state.glossary_config_pool.clone();
+    let glossary_workspace_root = state.glossary_workspace_root.clone();
     let client = state.client.clone();
     let running = state.running_translation_task.clone();
     let task_id = view.id.clone();
@@ -701,6 +741,8 @@ async fn start_translation_task_with_mode(
             app,
             provider_pool,
             config_pool.clone(),
+            glossary_config_pool,
+            glossary_workspace_root,
             client,
             prepared,
             interrupt,
@@ -824,9 +866,21 @@ pub async fn delete_glossary_entry(
 
 #[tauri::command]
 pub async fn prepare_auto_glossary_for_task(
+    app: AppHandle,
+    state: State<'_, AppState>,
     input: PrepareAutoGlossaryInput,
 ) -> Result<Option<GlossaryView>, String> {
-    glossaries::prepare_auto_glossary_for_task(input).await
+    translation_tasks::prepare_auto_glossary_for_task(
+        &app,
+        &state.pool,
+        &state.glossary_config_pool,
+        &state.glossary_workspace_root,
+        &state.client,
+        &state.translation_config_pool,
+        &state.translation_workspace_root,
+        input,
+    )
+    .await
 }
 
 #[tauri::command]

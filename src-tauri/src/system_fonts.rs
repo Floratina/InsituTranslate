@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-fn collect_system_fonts() -> Vec<String> {
+pub(crate) fn collect_system_fonts() -> Vec<String> {
     let mut database = fontdb::Database::new();
     database.load_system_fonts();
 

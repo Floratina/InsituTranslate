@@ -81,6 +81,31 @@ pub fn parse_source_file(
     Ok(chunks)
 }
 
+pub fn parse_pdf_markdown_text(text: &str, token_limit: i64) -> Result<Vec<ParsedChunk>, String> {
+    let mut chunks = markdown::parse_markdown_text(text, token_limit)?;
+    for (index, chunk) in chunks.iter_mut().enumerate() {
+        chunk.sequence = index as i64;
+        let mut map = parse_map(&chunk.map_json)?;
+        map.format = DocumentFormat::Pdf;
+        map.content_format = ContentFormat::Markdown;
+        chunk.map_json = map.to_json()?;
+    }
+    if chunks.is_empty() {
+        let map = PlaceholderMap::empty(
+            DocumentFormat::Pdf,
+            ContentFormat::Markdown,
+            types::BlockRef::whole_document(),
+        );
+        chunks.push(ParsedChunk {
+            sequence: 0,
+            preprocessed_text: String::new(),
+            source_text: String::new(),
+            map_json: map.to_json()?,
+        });
+    }
+    Ok(chunks)
+}
+
 pub fn restore_chunk_for_map(map_json: &str, after_translate_text: &str) -> Result<String, String> {
     let map = parse_map(map_json)?;
     let parser = parser_for_format(map.format, map.content_format);

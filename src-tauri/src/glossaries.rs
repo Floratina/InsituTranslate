@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 
+use crate::glossary_prompt::{sanitize_and_flatten_glossary, GlossaryEntry};
 use crate::languages::{
     normalize_language_code, normalize_source_language, normalize_target_language,
 };
@@ -190,6 +190,14 @@ pub struct DeleteGlossaryEntryInput {
 #[serde(rename_all = "camelCase")]
 pub struct PrepareAutoGlossaryInput {
     pub task_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateAutoGlossaryInput {
+    pub name: String,
+    pub source_language: String,
+    pub target_language: String,
+    pub entries: Vec<GlossaryEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -374,7 +382,7 @@ pub async fn import_glossary(
         r#"INSERT INTO metadata (
             glossary_id, schema_version, name, source_language, target_language, tags_json,
             source_type, entry_count, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?)"#,
+        ) VALUES (?, ?, ?, ?, ?, ?, 'uploaded', 0, ?, ?)"#,
     )
     .bind(&id)
     .bind(ING_SCHEMA_VERSION)
@@ -382,22 +390,22 @@ pub async fn import_glossary(
     .bind(&source_language)
     .bind(&target_language)
     .bind(serialize_tags(&tags)?)
-    .bind(entries.len() as i64)
     .bind(&created_at)
     .bind(&created_at)
     .execute(&mut *transaction)
     .await
     .map_err(|error| error.to_string())?;
     for entry in entries {
-        insert_entry_query(&entry.src, &entry.dst, &created_at)
+        insert_entry_ignore_query(&entry.src, &entry.dst, &created_at)
             .execute(&mut *transaction)
             .await
-            .map_err(|error| entry_error(error))?;
+            .map_err(|error| error.to_string())?;
     }
     transaction
         .commit()
         .await
         .map_err(|error| error.to_string())?;
+    refresh_metadata_count(&ing_pool, &created_at).await?;
     let view = metadata_glossary(&ing_pool, &ing_path).await?;
     upsert_glossary_index(pool, &view).await?;
     ing_pool.close().await;
@@ -645,13 +653,78 @@ pub async fn delete_glossary_entry(
     Ok(())
 }
 
-pub async fn prepare_auto_glossary_for_task(
-    input: PrepareAutoGlossaryInput,
-) -> Result<Option<GlossaryView>, String> {
-    if input.task_id.trim().is_empty() {
-        return Err("Task id is required".into());
+pub async fn create_auto_glossary(
+    pool: &SqlitePool,
+    workspace_root: &Path,
+    input: CreateAutoGlossaryInput,
+) -> Result<GlossaryView, String> {
+    let name = normalize_name(&input.name)?;
+    let source_language = normalize_auto_glossary_source_language(&input.source_language)?;
+    let target_language = normalize_language(&input.target_language)?;
+    let entries = dedupe_entries(
+        input
+            .entries
+            .into_iter()
+            .map(|entry| normalize_entry(&entry.src, &entry.dst))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    let id = new_id("glossary");
+    let ing_path = next_ing_path(workspace_root, &name).await?;
+    let created_at = unix_timestamp();
+    let ing_pool = connect_ing(&ing_path).await?;
+    let mut transaction = ing_pool.begin().await.map_err(|error| error.to_string())?;
+    sqlx::query(
+        r#"INSERT INTO metadata (
+            glossary_id, schema_version, name, source_language, target_language, tags_json,
+            source_type, entry_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, '[]', 'auto', 0, ?, ?)"#,
+    )
+    .bind(&id)
+    .bind(ING_SCHEMA_VERSION)
+    .bind(&name)
+    .bind(&source_language)
+    .bind(&target_language)
+    .bind(&created_at)
+    .bind(&created_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    for entry in entries {
+        insert_entry_ignore_query(&entry.src, &entry.dst, &created_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?;
     }
-    Ok(None)
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    refresh_metadata_count(&ing_pool, &created_at).await?;
+    let view = metadata_glossary(&ing_pool, &ing_path).await?;
+    upsert_glossary_index(pool, &view).await?;
+    ing_pool.close().await;
+    Ok(view)
+}
+
+pub async fn load_glossary_entries(
+    pool: &SqlitePool,
+    glossary_id: &str,
+) -> Result<Vec<GlossaryEntry>, String> {
+    let glossary = get_glossary_from_index(pool, glossary_id).await?;
+    let ing_pool = connect_ing(Path::new(&glossary.ing_path)).await?;
+    let rows = sqlx::query("SELECT src, dst FROM entries ORDER BY created_at ASC, id ASC")
+        .fetch_all(&ing_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let entries = rows
+        .into_iter()
+        .map(|row| GlossaryEntry {
+            src: row.get("src"),
+            dst: row.get("dst"),
+        })
+        .collect();
+    ing_pool.close().await;
+    Ok(entries)
 }
 
 async fn refresh_metadata_count(pool: &SqlitePool, updated_at: &str) -> Result<(), String> {
@@ -675,6 +748,26 @@ fn insert_entry_query<'a>(
 ) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
     sqlx::query(
         r#"INSERT INTO entries (
+            id, src, dst, src_norm, src_sort_key, dst_sort_key, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(new_id("entry"))
+    .bind(src)
+    .bind(dst)
+    .bind(normalize_term(src))
+    .bind(sort_key(src))
+    .bind(sort_key(dst))
+    .bind(created_at)
+    .bind(created_at)
+}
+
+fn insert_entry_ignore_query<'a>(
+    src: &'a str,
+    dst: &'a str,
+    created_at: &'a str,
+) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO entries (
             id, src, dst, src_norm, src_sort_key, dst_sort_key, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
@@ -897,6 +990,10 @@ fn normalize_glossary_source_language(value: &str) -> Result<String, String> {
     Ok(language)
 }
 
+fn normalize_auto_glossary_source_language(value: &str) -> Result<String, String> {
+    normalize_source_language(value).map_err(|_| "Invalid glossary source language".to_string())
+}
+
 fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
     let mut normalized = Vec::new();
     for tag in tags {
@@ -1005,29 +1102,13 @@ fn trim_cr(value: String) -> String {
 }
 
 fn parse_json_entries(content: &str) -> Result<Vec<NormalizedEntry>, String> {
-    let value: Value = serde_json::from_str(content)
-        .map_err(|error| format!("文件格式不正确：JSON 无法解析：{error}"))?;
-    let array = value
-        .as_array()
-        .ok_or_else(|| "文件格式不正确：JSON 顶层必须是数组".to_string())?;
-    let mut entries = Vec::new();
-    for item in array {
-        let object = item
-            .as_object()
-            .ok_or_else(|| "文件格式不正确：JSON 条目必须是对象".to_string())?;
-        if object.len() != 2 || !object.contains_key("src") || !object.contains_key("dst") {
-            return Err("文件格式不正确：JSON 条目只能包含 src 和 dst 字段".into());
-        }
-        let src = object
-            .get("src")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "文件格式不正确：src 必须是字符串".to_string())?;
-        let dst = object
-            .get("dst")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "文件格式不正确：dst 必须是字符串".to_string())?;
-        entries.push(normalize_entry(src, dst)?);
-    }
+    let parsed = sanitize_and_flatten_glossary(content, None)
+        .map_err(|error| format!("Invalid glossary JSON: {error}"))?;
+    let entries = parsed
+        .entries
+        .into_iter()
+        .map(|entry| normalize_entry(&entry.src, &entry.dst))
+        .collect::<Result<Vec<_>, _>>()?;
     validate_entries(entries)
 }
 
@@ -1047,6 +1128,31 @@ fn normalize_entry(src: &str, dst: &str) -> Result<NormalizedEntry, String> {
 }
 
 fn validate_entries(entries: Vec<NormalizedEntry>) -> Result<Vec<NormalizedEntry>, String> {
+    if entries.is_empty() {
+        return Err("Glossary cannot be empty".into());
+    }
+    let deduped = dedupe_entries(entries);
+    if deduped.is_empty() {
+        return Err("Glossary cannot be empty".into());
+    }
+    Ok(deduped)
+}
+
+fn dedupe_entries(entries: Vec<NormalizedEntry>) -> Vec<NormalizedEntry> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for entry in entries {
+        if seen.insert(normalize_term(&entry.src)) {
+            deduped.push(entry);
+        }
+    }
+    deduped
+}
+
+#[allow(dead_code)]
+fn validate_entries_strict_unused(
+    entries: Vec<NormalizedEntry>,
+) -> Result<Vec<NormalizedEntry>, String> {
     if entries.is_empty() {
         return Err("文件格式不正确：术语表不能为空".into());
     }
@@ -1509,6 +1615,13 @@ fn open_folder_selecting_file(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn temp_workspace(label: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("insitu-glossaries-{label}-{}", new_id("test")));
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        root
+    }
+
     #[test]
     fn parses_valid_csv_and_rejects_extra_columns() {
         let entries = parse_csv_entries("dst,src\n苹果,Apple\n香蕉,Banana\n").expect("csv");
@@ -1518,19 +1631,169 @@ mod tests {
     }
 
     #[test]
-    fn parses_valid_json_and_rejects_extra_fields() {
+    fn parses_valid_json_with_legacy_fields_and_nested_arrays() {
         let entries =
-            parse_json_entries(r#"[{"src":"Apple","dst":"苹果"}]"#).expect("json entries");
+            parse_json_entries("```json\n[[{\"source\":\"Apple\",\"target\":\"Pingguo\"}]]\n```")
+                .expect("json entries");
         assert_eq!(entries[0].src, "Apple");
-        assert!(parse_json_entries(r#"[{"src":"Apple","dst":"苹果","note":"x"}]"#).is_err());
+        assert_eq!(entries[0].dst, "Pingguo");
+        assert!(parse_json_entries(r#"[{"src":"Apple","dst":"Pingguo"}]"#).is_ok());
+        assert!(parse_json_entries(r#"[{"src":"Apple","dst":}]"#).is_err());
     }
 
     #[test]
-    fn rejects_duplicate_sources() {
-        assert!(parse_json_entries(
-            r#"[{"src":"Apple","dst":"苹果"},{"src":" apple ","dst":"苹果"}]"#
+    fn dedupes_duplicate_sources() {
+        let entries = parse_json_entries(
+            r#"[{"src":"Apple","dst":"Pingguo"},{"src":" apple ","dst":"Pingguo2"}]"#,
         )
-        .is_err());
+        .expect("deduped entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].src, "Apple");
+        assert_eq!(entries[0].dst, "Pingguo");
+    }
+
+    #[tokio::test]
+    async fn imports_json_through_shared_sanitizer_and_refreshes_count() {
+        let root = temp_workspace("json-import");
+        let pool = connect_config_db(&root).await.expect("config db");
+        let source = root.join("terms.json");
+        tokio::fs::write(
+            &source,
+            r#"Here is the glossary:
+```json
+[
+  [{"source":"Apple","target":"Pingguo"}],
+  {"src":" apple ","dst":"Ignored"},
+  {"src":"Banana","dst":"Xiangjiao"}
+]
+```"#,
+        )
+        .await
+        .expect("write input");
+
+        let view = import_glossary(
+            &pool,
+            &root,
+            ImportGlossaryInput {
+                file_path: source.to_string_lossy().to_string(),
+                name: "JSON Terms".into(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                tags: vec!["Book".into()],
+            },
+        )
+        .await
+        .expect("import glossary");
+
+        assert_eq!(view.source_type, "uploaded");
+        assert_eq!(view.entry_count, 2);
+        let page = get_glossary_entries(
+            &pool,
+            GlossaryEntriesQuery {
+                id: view.id.clone(),
+                page: 0,
+                page_size: 10,
+                search: None,
+                sort: Some(GlossaryEntrySortInput {
+                    field: GlossaryEntrySortField::Src,
+                    mode: SortMode::CreatedAsc,
+                }),
+            },
+        )
+        .await
+        .expect("entries");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.entries[0].src, "Apple");
+        assert_eq!(page.entries[0].dst, "Pingguo");
+        assert_eq!(page.entries[1].src, "Banana");
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn imports_csv_with_first_duplicate_preserved() {
+        let root = temp_workspace("csv-import");
+        let pool = connect_config_db(&root).await.expect("config db");
+        let source = root.join("terms.csv");
+        tokio::fs::write(
+            &source,
+            "src,dst\nApple,Pingguo\n apple ,Ignored\nBanana,Xiangjiao\n",
+        )
+        .await
+        .expect("write input");
+
+        let view = import_glossary(
+            &pool,
+            &root,
+            ImportGlossaryInput {
+                file_path: source.to_string_lossy().to_string(),
+                name: "CSV Terms".into(),
+                source_language: "English".into(),
+                target_language: "Simplified Chinese".into(),
+                tags: Vec::new(),
+            },
+        )
+        .await
+        .expect("import glossary");
+
+        assert_eq!(view.entry_count, 2);
+        let entries = load_glossary_entries(&pool, &view.id)
+            .await
+            .expect("load entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].src, "Apple");
+        assert_eq!(entries[0].dst, "Pingguo");
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn creates_auto_glossary_with_empty_tags_and_actual_count() {
+        let root = temp_workspace("auto-create");
+        let pool = connect_config_db(&root).await.expect("config db");
+
+        let view = create_auto_glossary(
+            &pool,
+            &root,
+            CreateAutoGlossaryInput {
+                name: "Task Auto Glossary".into(),
+                source_language: "auto".into(),
+                target_language: "zh-CN".into(),
+                entries: vec![
+                    GlossaryEntry {
+                        src: "Apple".into(),
+                        dst: "Pingguo".into(),
+                    },
+                    GlossaryEntry {
+                        src: " apple ".into(),
+                        dst: "Ignored".into(),
+                    },
+                    GlossaryEntry {
+                        src: "Animation".into(),
+                        dst: "Donghua".into(),
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("create auto glossary");
+
+        assert_eq!(view.source_type, "auto");
+        assert!(view.tags.is_empty());
+        assert_eq!(view.source_language, "auto");
+        assert_eq!(view.entry_count, 2);
+
+        let entries = load_glossary_entries(&pool, &view.id)
+            .await
+            .expect("load entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].src, "Apple");
+        assert_eq!(entries[0].dst, "Pingguo");
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]

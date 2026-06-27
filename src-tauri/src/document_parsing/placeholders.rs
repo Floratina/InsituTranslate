@@ -500,6 +500,7 @@ fn markdown_replacement_for_node(
     let (start, end) = sourcepos_to_byte_range(text, line_index, data.sourcepos)?;
     let raw = text.get(start..end)?;
     let (kind, open, close, inner) = match &data.value {
+        NodeValue::Image(_) => markdown_image_parts(raw)?,
         NodeValue::Link(_) => markdown_link_parts(raw)?,
         NodeValue::Strong => markdown_delimited_parts(raw, "strong", &["**", "__"])?,
         NodeValue::Emph => markdown_delimited_parts(raw, "emphasis", &["*", "_"])?,
@@ -575,6 +576,19 @@ fn markdown_link_parts(raw: &str) -> Option<(String, String, String, String)> {
         "[".to_string(),
         raw[label_end..].to_string(),
         raw[1..label_end].to_string(),
+    ))
+}
+
+fn markdown_image_parts(raw: &str) -> Option<(String, String, String, String)> {
+    if !raw.starts_with("![") {
+        return None;
+    }
+    let label_end = markdown_link_label_end(&raw[1..])? + 1;
+    Some((
+        "image".to_string(),
+        "![".to_string(),
+        raw[label_end..].to_string(),
+        raw[2..label_end].to_string(),
     ))
 }
 
@@ -725,6 +739,22 @@ mod manager_tests {
         assert_eq!(line_index.line_col_to_byte_offset(text, 1, 3), None);
         assert_eq!(line_index.line_col_to_byte_offset(text, 2, 1), Some(10));
         assert_eq!(line_index.line_col_to_byte_offset(text, 0, 1), None);
+    }
+
+    #[test]
+    fn protects_markdown_image_paths_outside_translatable_text() {
+        let (source, map_json) = protect_markdown(
+            "Before ![Figure 1](assets/task/page1_1.png) after",
+            BlockRef::whole_document(),
+        )
+        .expect("protect markdown image");
+
+        assert_eq!(source, "Before <t1>Figure 1</t1> after");
+        assert!(!source.contains("assets/task/page1_1.png"));
+        assert_eq!(
+            restore_from_json(&map_json, "Before <t1>图 1</t1> after").expect("restore image"),
+            "Before ![图 1](assets/task/page1_1.png) after"
+        );
     }
 
     #[test]

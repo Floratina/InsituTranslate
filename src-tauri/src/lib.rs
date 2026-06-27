@@ -6,10 +6,12 @@ mod domain;
 mod features;
 mod glossaries;
 mod languages;
+mod pdf_parsing;
 // Reserved for the glossary extraction pipeline; intentionally not exposed through IPC yet.
 #[allow(dead_code)]
 mod glossary_prompt;
 mod secrets;
+mod settings;
 mod system_fonts;
 // Shared infrastructure for task-specific document prompt builders.
 #[allow(dead_code)]
@@ -36,6 +38,10 @@ pub fn run() {
             let pool =
                 tauri::async_runtime::block_on(db::connect(&app_data.join("providers.sqlite3")))
                     .map_err(|error| format!("Unable to initialize provider database: {error}"))?;
+            let settings_pool = tauri::async_runtime::block_on(settings::connect(
+                &app_data.join("settings.sqlite3"),
+            ))
+            .map_err(|error| format!("Unable to initialize settings database: {error}"))?;
             let legacy_workspace_root = translation_tasks::default_workspace_root();
             let workspace_root = app_data.join("translation-workspace");
             translation_tasks::migrate_legacy_workspace(&legacy_workspace_root, &workspace_root)
@@ -59,6 +65,7 @@ pub fn run() {
                 .map_err(|error| format!("Unable to initialize HTTP client: {error}"))?;
             app.manage(commands::AppState {
                 pool,
+                settings_pool,
                 translation_config_pool,
                 translation_workspace_root: workspace_root,
                 glossary_config_pool,
@@ -70,6 +77,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_appearance_preferences,
+            commands::update_appearance_preferences,
+            commands::get_cached_system_fonts,
+            commands::refresh_system_fonts_cache,
             commands::list_providers,
             commands::list_assistants,
             commands::create_assistant,

@@ -71,6 +71,7 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   glossaryMode: "auto",
   glossaryId: null,
   confidenceMode: "off",
+  pdfParsingMode: "local-first",
 };
 
 const START_GLOSSARY_ALL_VALUE = "__all__";
@@ -129,6 +130,7 @@ function normalizeStartConfig(
   const withDefaults: TranslationConfigView = {
     ...config,
     confidenceMode: config.confidenceMode ?? "off",
+    pdfParsingMode: config.pdfParsingMode ?? "local-first",
   };
   return glossaries ? normalizeGlossaryConfig(withDefaults, glossaries) : withDefaults;
 }

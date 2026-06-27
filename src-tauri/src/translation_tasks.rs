@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -21,11 +21,17 @@ use crate::adapters::{
 use crate::db;
 use crate::document_parsing::types::RenderedChunk;
 use crate::document_parsing::{self, restore_chunk_for_map};
-use crate::domain::{UnifiedChatRequest, UnifiedToolChoice};
+use crate::domain::{ProviderPurpose, UnifiedChatRequest, UnifiedToolChoice};
+use crate::glossaries::{self, CreateAutoGlossaryInput, GlossaryView, PrepareAutoGlossaryInput};
+use crate::glossary_prompt::{
+    build_glossary_prompt, sanitize_and_flatten_glossary, GlossaryEntry, GlossaryPromptBuildResult,
+    GlossaryPromptInput,
+};
 use crate::languages::{
     normalize_source_language, normalize_target_language, DEFAULT_SOURCE_LANGUAGE,
     DEFAULT_TARGET_LANGUAGE,
 };
+use crate::pdf_parsing::{self, PdfAsset, PdfParsingMode};
 use crate::task_prompt::{ContentFormat, DocumentFormat, TaskChunkInput};
 use crate::translation_prompt::{
     build_translation_prompt, TranslationPromptBuildResult, TranslationPromptInput,
@@ -38,13 +44,15 @@ const DEFAULT_MAX_CONCURRENCY: i64 = 5;
 const DEFAULT_MAX_RETRIES: i64 = 5;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: i64 = 60;
 const DEFAULT_MAX_TOKENS_PER_MINUTE: i64 = 60_000;
-const INP_SCHEMA_VERSION: i64 = 3;
+const INP_SCHEMA_VERSION: i64 = 6;
 const MAX_TASK_TAGS: usize = 12;
 const MAX_TASK_TAG_LENGTH: usize = 48;
 const MAX_TASK_NAME_LENGTH: usize = 120;
 const ERROR_RATE_FAILURE_THRESHOLD: f64 = 0.30;
+const AUTO_GLOSSARY_FAILURE_THRESHOLD: f64 = 0.40;
 const TRANSLATION_PROGRESS_EVENT: &str = "translation-progress";
 const INP_FILE_DAMAGED: &str = "INP_FILE_DAMAGED";
+const SOURCE_FILE_UNAVAILABLE: &str = "Source file is not embedded in this .inp and the original source path is no longer readable. Recreate the task from the original document to retranslate or export it.";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -146,6 +154,23 @@ pub enum GlossaryMode {
     Existing,
 }
 
+impl GlossaryMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Existing => "existing",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "existing" => Ok(Self::Existing),
+            _ => Err(format!("Unsupported glossary mode: {value}")),
+        }
+    }
+}
+
 impl Default for GlossaryMode {
     fn default() -> Self {
         Self::Auto
@@ -211,6 +236,7 @@ pub struct TranslationConfigView {
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
     pub confidence_mode: ConfidenceMode,
+    pub pdf_parsing_mode: PdfParsingMode,
 }
 
 impl Default for TranslationConfigView {
@@ -233,6 +259,7 @@ impl Default for TranslationConfigView {
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
             confidence_mode: ConfidenceMode::Off,
+            pdf_parsing_mode: PdfParsingMode::LocalFirst,
         }
     }
 }
@@ -258,6 +285,8 @@ pub struct UpdateTranslationConfigInput {
     pub glossary_id: Option<String>,
     #[serde(default)]
     pub confidence_mode: ConfidenceMode,
+    #[serde(default)]
+    pub pdf_parsing_mode: PdfParsingMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,8 +470,49 @@ pub struct PreparedRun {
 #[derive(Debug, Clone)]
 struct ChunkRecord {
     id: String,
+    sequence: i64,
     source_text: String,
     map_json: String,
+}
+
+#[derive(Debug, Clone)]
+struct TaskGlossaryConfig {
+    use_glossary: bool,
+    glossary_mode: GlossaryMode,
+    glossary_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct GlossaryRuntime {
+    adapter: Arc<RuntimeAdapter>,
+    model_request_name: String,
+    assistant_prompt: Option<String>,
+    assistant_custom_parameters: Value,
+}
+
+#[derive(Debug, Clone)]
+enum AutoGlossaryChunkOutcome {
+    Success {
+        sequence: i64,
+        entries: Vec<GlossaryEntry>,
+    },
+    Failed {
+        sequence: i64,
+        error: String,
+    },
+    Interrupted {
+        error: String,
+    },
+}
+
+enum TaskGlossaryPreparation {
+    Ready(Vec<GlossaryEntry>),
+    Interrupted,
+}
+
+enum AutoGlossaryGeneration {
+    Created(GlossaryView),
+    Interrupted(String),
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +527,12 @@ struct ChunkOutcome {
     token_stats: TokenStats,
     rate_limit_status: Option<String>,
     confidence: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTaskSource {
+    chunks: Vec<document_parsing::types::ParsedChunk>,
+    assets: Vec<PdfAsset>,
 }
 
 pub fn default_workspace_root() -> PathBuf {
@@ -735,6 +811,7 @@ async fn add_column_if_missing(
 async fn connect_inp(path: &Path) -> Result<SqlitePool, String> {
     let pool = connect_sqlite(path, 1).await?;
     migrate_inp_db(&pool).await?;
+    backfill_source_file_if_available(&pool).await?;
     Ok(pool)
 }
 
@@ -860,6 +937,44 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
         )
         .await?;
     }
+    if schema_version >= 4 {
+        require_columns(
+            pool,
+            "assets",
+            &[
+                "relative_path",
+                "media_type",
+                "bytes",
+                "source",
+                "created_at",
+            ],
+        )
+        .await?;
+    }
+    if schema_version >= 5 {
+        require_columns(
+            pool,
+            "source_file",
+            &["id", "file_name", "bytes", "created_at"],
+        )
+        .await?;
+        let invalid_source_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM source_file WHERE id != 1")
+                .fetch_one(pool)
+                .await
+                .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+        if invalid_source_rows > 0 {
+            return Err(INP_FILE_DAMAGED.into());
+        }
+    }
+    if schema_version >= 6 {
+        require_columns(
+            pool,
+            "metadata",
+            &["use_glossary", "glossary_mode", "glossary_id"],
+        )
+        .await?;
+    }
     TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     parse_tags_json(row.get("tags_json")).map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -958,6 +1073,9 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             assistant_id TEXT,
             assistant_system_prompt TEXT,
             assistant_custom_parameters_json TEXT NOT NULL DEFAULT '{}',
+            use_glossary INTEGER NOT NULL DEFAULT 0,
+            glossary_mode TEXT NOT NULL DEFAULT 'auto',
+            glossary_id TEXT,
             tags_json TEXT NOT NULL DEFAULT '[]',
             token_limit INTEGER NOT NULL,
             max_concurrency INTEGER NOT NULL,
@@ -997,6 +1115,19 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             total_tokens INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         )"#,
+        r#"CREATE TABLE IF NOT EXISTS assets (
+            relative_path TEXT PRIMARY KEY NOT NULL,
+            media_type TEXT NOT NULL,
+            bytes BLOB NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS source_file (
+            id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+            file_name TEXT NOT NULL,
+            bytes BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        )"#,
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_sequence ON chunks(sequence)",
         "CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status, sequence)",
     ];
@@ -1014,6 +1145,21 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
         "TEXT NOT NULL DEFAULT '{}'",
     )
     .await?;
+    add_column_if_missing(
+        pool,
+        "metadata",
+        "use_glossary",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "metadata",
+        "glossary_mode",
+        "TEXT NOT NULL DEFAULT 'auto'",
+    )
+    .await?;
+    add_column_if_missing(pool, "metadata", "glossary_id", "TEXT").await?;
     add_column_if_missing(pool, "chunks", "map_json", "TEXT NOT NULL DEFAULT '{}'").await?;
     add_column_if_missing(
         pool,
@@ -1037,6 +1183,166 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+struct MaterializedSourceFile {
+    root_dir: PathBuf,
+    path: PathBuf,
+}
+
+impl MaterializedSourceFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for MaterializedSourceFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root_dir);
+    }
+}
+
+enum ResolvedSourceFile {
+    Embedded(MaterializedSourceFile),
+    Original(PathBuf),
+}
+
+impl ResolvedSourceFile {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Embedded(file) => file.path(),
+            Self::Original(path) => path,
+        }
+    }
+}
+
+async fn backfill_source_file_if_available(pool: &SqlitePool) -> Result<(), String> {
+    let existing_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_file")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    if existing_count > 0 {
+        return Ok(());
+    }
+
+    let Some(row) = sqlx::query("SELECT source_path, created_at FROM metadata LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let source_path: String = row.get("source_path");
+    let bytes = match tokio::fs::read(&source_path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(()),
+    };
+    let file_name = source_file_name_from_path(Path::new(&source_path));
+    let created_at: String = row.get("created_at");
+    sqlx::query(
+        "INSERT OR REPLACE INTO source_file (id, file_name, bytes, created_at)
+         VALUES (1, ?, ?, ?)",
+    )
+    .bind(file_name)
+    .bind(bytes)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn resolve_source_file(
+    inp_pool: &SqlitePool,
+    fallback_source_path: &Path,
+) -> Result<ResolvedSourceFile, String> {
+    if let Some(row) = sqlx::query("SELECT file_name, bytes FROM source_file WHERE id = 1")
+        .fetch_optional(inp_pool)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let file_name: String = row.get("file_name");
+        let bytes: Vec<u8> = row.get("bytes");
+        return materialize_source_bytes(&file_name, &bytes, fallback_source_path)
+            .await
+            .map(ResolvedSourceFile::Embedded);
+    }
+
+    match tokio::fs::metadata(fallback_source_path).await {
+        Ok(metadata) if metadata.is_file() => Ok(ResolvedSourceFile::Original(
+            fallback_source_path.to_path_buf(),
+        )),
+        _ => Err(SOURCE_FILE_UNAVAILABLE.into()),
+    }
+}
+
+async fn materialize_source_bytes(
+    file_name: &str,
+    bytes: &[u8],
+    fallback_source_path: &Path,
+) -> Result<MaterializedSourceFile, String> {
+    let root_dir = std::env::temp_dir().join(format!("insitu-source-{}", db::new_id("src")));
+    tokio::fs::create_dir_all(&root_dir)
+        .await
+        .map_err(|error| format!("Unable to create temporary source directory: {error}"))?;
+    let path = root_dir.join(materialized_source_file_name(
+        file_name,
+        fallback_source_path,
+    ));
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|error| format!("Unable to write temporary source file: {error}"))?;
+    Ok(MaterializedSourceFile { root_dir, path })
+}
+
+async fn insert_source_file(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    file_name: &str,
+    bytes: &[u8],
+    created_at: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO source_file (id, file_name, bytes, created_at)
+         VALUES (1, ?, ?, ?)",
+    )
+    .bind(file_name)
+    .bind(bytes)
+    .bind(created_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn source_file_name_from_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("source")
+        .to_string()
+}
+
+fn materialized_source_file_name(file_name: &str, fallback_source_path: &Path) -> String {
+    let base = Path::new(file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(sanitize_file_stem)
+        .unwrap_or_else(|| sanitize_file_stem(&source_file_name_from_path(fallback_source_path)));
+    if Path::new(&base).extension().is_some() {
+        return base;
+    }
+    match fallback_source_path
+        .extension()
+        .and_then(|value| value.to_str())
+    {
+        Some(extension) if !extension.trim().is_empty() => {
+            format!("{base}.{}", sanitize_file_stem(extension))
+        }
+        _ => base,
+    }
 }
 
 pub async fn get_translation_config(
@@ -1160,6 +1466,7 @@ pub async fn update_translation_config(
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
         confidence_mode: input.confidence_mode,
+        pdf_parsing_mode: input.pdf_parsing_mode,
     };
     validate_translation_config(&config)?;
     let config_json = serde_json::to_string(&config).map_err(|error| error.to_string())?;
@@ -1184,8 +1491,67 @@ pub async fn update_translation_config(
     Ok(config)
 }
 
+async fn parse_source_file_for_task(
+    provider_pool: &SqlitePool,
+    client: &Client,
+    task_id: &str,
+    source_path: &Path,
+    token_limit: i64,
+    pdf_parsing_mode: PdfParsingMode,
+) -> Result<ParsedTaskSource, String> {
+    if source_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("pdf"))
+        == Some(true)
+    {
+        let parsed_pdf = pdf_parsing::parse_pdf_for_task(
+            provider_pool,
+            client,
+            task_id,
+            source_path,
+            pdf_parsing_mode,
+        )
+        .await?;
+        let chunks = document_parsing::parse_pdf_markdown_text(&parsed_pdf.markdown, token_limit)?;
+        return Ok(ParsedTaskSource {
+            chunks,
+            assets: parsed_pdf.assets,
+        });
+    }
+
+    Ok(ParsedTaskSource {
+        chunks: document_parsing::parse_source_file(task_id, source_path, token_limit)?,
+        assets: Vec::new(),
+    })
+}
+
+async fn insert_assets(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    assets: &[PdfAsset],
+    created_at: &str,
+) -> Result<(), String> {
+    for asset in assets {
+        validate_asset_relative_path(&asset.relative_path)?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO assets (relative_path, media_type, bytes, source, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&asset.relative_path)
+        .bind(&asset.media_type)
+        .bind(&asset.bytes)
+        .bind(&asset.source)
+        .bind(created_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 pub async fn create_translation_task(
     provider_pool: &SqlitePool,
+    client: &Client,
     config_pool: &SqlitePool,
     workspace_root: &Path,
     input: CreateTranslationTaskInput,
@@ -1196,6 +1562,12 @@ pub async fn create_translation_task(
     let tags_json = serialize_tags(&tags)?;
     let source_path = PathBuf::from(input.file_path.trim());
     validate_supported_source_file(&source_path)?;
+    let source_bytes = tokio::fs::read(&source_path)
+        .await
+        .map_err(|error| format!("Unable to read source document: {error}"))?;
+    let source_file_name = source_file_name_from_path(&source_path);
+    let materialized_source =
+        materialize_source_bytes(&source_file_name, &source_bytes, &source_path).await?;
     let model = db::get_model(provider_pool, &input.model_id).await?;
     if model.provider_id != input.provider_id {
         return Err("Selected model does not belong to the selected provider".into());
@@ -1215,8 +1587,15 @@ pub async fn create_translation_task(
     let task_id = db::new_id("task");
     let display_name = display_name_from_path(&source_path);
     let inp_path = next_inp_path(workspace_root, &display_name).await?;
-    let chunks =
-        document_parsing::parse_source_file(&task_id, &source_path, config.chunk_token_limit)?;
+    let parsed_source = parse_source_file_for_task(
+        provider_pool,
+        client,
+        &task_id,
+        materialized_source.path(),
+        config.chunk_token_limit,
+        config.pdf_parsing_mode,
+    )
+    .await?;
     let created_at = unix_timestamp();
     let inp_pool = connect_inp(&inp_path).await?;
     let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
@@ -1225,10 +1604,10 @@ pub async fn create_translation_task(
         "INSERT INTO metadata (
             task_id, schema_version, name, source_path, source_language, target_language, status,
             progress, provider_id, model_id, model_request_name, assistant_id, assistant_system_prompt,
-            assistant_custom_parameters_json, tags_json,
+            assistant_custom_parameters_json, use_glossary, glossary_mode, glossary_id, tags_json,
             token_limit, max_concurrency, max_retries, config_snapshot_json, total_chunks,
             created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&task_id)
     .bind(INP_SCHEMA_VERSION)
@@ -1243,19 +1622,31 @@ pub async fn create_translation_task(
     .bind(input.assistant_id.as_deref().filter(|value| !value.is_empty()))
     .bind(assistant_prompt.as_deref())
     .bind(assistant_custom_parameters.to_string())
+    .bind(config.use_glossary)
+    .bind(config.glossary_mode.as_str())
+    .bind(config.glossary_id.as_deref())
     .bind(tags_json)
     .bind(config.chunk_token_limit)
     .bind(config.max_concurrency)
     .bind(config.max_retries)
     .bind(config_snapshot)
-    .bind(chunks.len() as i64)
+    .bind(parsed_source.chunks.len() as i64)
     .bind(&created_at)
     .bind(&created_at)
     .execute(&mut *transaction)
     .await
     .map_err(|error| error.to_string())?;
 
-    for chunk in chunks {
+    insert_source_file(
+        &mut transaction,
+        &source_file_name,
+        &source_bytes,
+        &created_at,
+    )
+    .await?;
+    insert_assets(&mut transaction, &parsed_source.assets, &created_at).await?;
+
+    for chunk in parsed_source.chunks {
         sqlx::query(
             "INSERT INTO chunks (
                 id, sequence, map_json, preprocessed_text, source_text,
@@ -1430,10 +1821,13 @@ pub async fn export_translation_task(
         .map_err(|error| format!("Unable to resolve export path: {error}"))?;
     let inp_pool = connect_inp(Path::new(&task.inp_path)).await?;
     let output = rendered_task_document(&inp_pool, Path::new(&task.source_path)).await?;
-    inp_pool.close().await;
     tokio::fs::write(&save_path, output)
         .await
         .map_err(|error| format!("Unable to export task: {error}"))?;
+    if source_is_pdf(Path::new(&task.source_path)) {
+        release_assets_for_export(&inp_pool, &save_path).await?;
+    }
+    inp_pool.close().await;
     open_folder_selecting_file(&save_path)?;
     Ok(())
 }
@@ -1471,7 +1865,73 @@ async fn rendered_task_document(
             }
         })
         .collect::<Vec<_>>();
-    document_parsing::render_translated_document(source_path, &chunks)
+    let resolved_source = resolve_source_file(inp_pool, source_path).await?;
+    document_parsing::render_translated_document(resolved_source.path(), &chunks)
+}
+
+async fn release_assets_for_export(inp_pool: &SqlitePool, save_path: &Path) -> Result<(), String> {
+    let rows = sqlx::query("SELECT relative_path, bytes FROM assets ORDER BY relative_path")
+        .fetch_all(inp_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let base_dir = save_path.parent().unwrap_or_else(|| Path::new("."));
+    for row in rows {
+        let relative_path: String = row.get("relative_path");
+        validate_asset_relative_path(&relative_path)?;
+        let target_path = safe_export_asset_path(base_dir, &relative_path)?;
+        if let Some(parent) = target_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| format!("Unable to create export asset directory: {error}"))?;
+        }
+        let bytes: Vec<u8> = row.get("bytes");
+        tokio::fs::write(&target_path, bytes)
+            .await
+            .map_err(|error| format!("Unable to export PDF asset: {error}"))?;
+    }
+    Ok(())
+}
+
+fn safe_export_asset_path(base_dir: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    validate_asset_relative_path(relative_path)?;
+    let mut target = base_dir.to_path_buf();
+    let normalized = relative_path.replace('\\', "/");
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::Normal(part) => target.push(part),
+            Component::CurDir => {}
+            _ => return Err("PDF asset path must be relative".into()),
+        }
+    }
+    Ok(target)
+}
+
+fn validate_asset_relative_path(relative_path: &str) -> Result<(), String> {
+    let normalized = relative_path.replace('\\', "/");
+    if normalized.trim().is_empty() || normalized.starts_with('/') {
+        return Err("PDF asset path must be a non-empty relative path".into());
+    }
+    let mut has_component = false;
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::Normal(_) => has_component = true,
+            Component::CurDir => {}
+            _ => return Err("PDF asset path cannot be absolute or contain parent segments".into()),
+        }
+    }
+    if !has_component {
+        return Err("PDF asset path must contain a file name".into());
+    }
+    Ok(())
+}
+
+fn source_is_pdf(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("pdf"))
 }
 
 #[cfg(test)]
@@ -1551,6 +2011,8 @@ pub async fn delete_translation_tasks(
 }
 
 pub async fn prepare_translation_run(
+    provider_pool: &SqlitePool,
+    client: &Client,
     config_pool: &SqlitePool,
     workspace_root: &Path,
     id: &str,
@@ -1586,8 +2048,16 @@ pub async fn prepare_translation_run(
             .map_err(|error| error.to_string())?;
         }
         RunMode::Retranslate => {
-            rebuild_chunks_for_retranslate(&inp_pool, &indexed, config.chunk_token_limit, &now)
-                .await?;
+            rebuild_chunks_for_retranslate(
+                provider_pool,
+                client,
+                &inp_pool,
+                &indexed,
+                config.chunk_token_limit,
+                config.pdf_parsing_mode,
+                &now,
+            )
+            .await?;
         }
     }
     sqlx::query(
@@ -1619,20 +2089,108 @@ pub async fn prepare_translation_run(
     })
 }
 
+pub async fn prepare_auto_glossary_for_task(
+    app: &AppHandle,
+    provider_pool: &SqlitePool,
+    glossary_config_pool: &SqlitePool,
+    glossary_workspace_root: &Path,
+    client: &Client,
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    input: PrepareAutoGlossaryInput,
+) -> Result<Option<GlossaryView>, String> {
+    let task_id = input.task_id.trim();
+    if task_id.is_empty() {
+        return Err("Task id is required".into());
+    }
+    let indexed = get_task_from_index(config_pool, task_id).await?;
+    let inp_path = PathBuf::from(&indexed.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
+    let inp_pool = connect_inp(&inp_path).await?;
+    let task = metadata_task(&inp_pool, &inp_path).await?;
+    let glossary_config = task_glossary_config(&inp_pool).await?;
+    if !glossary_config.use_glossary
+        || glossary_config.glossary_mode != GlossaryMode::Auto
+        || glossary_config.glossary_id.is_some()
+    {
+        inp_pool.close().await;
+        return Ok(None);
+    }
+    let chunks = glossary_source_chunks(&inp_pool).await?;
+    let config = get_translation_config(config_pool).await?;
+    let interrupt = TranslationInterrupt::new();
+    let result = generate_auto_glossary(
+        provider_pool,
+        glossary_config_pool,
+        glossary_workspace_root,
+        client,
+        &task,
+        &chunks,
+        &config,
+        &interrupt,
+    )
+    .await?;
+    match result {
+        AutoGlossaryGeneration::Created(view) => {
+            set_task_glossary_id(&inp_pool, &view.id).await?;
+            let refreshed = refresh_task_stats(&inp_pool, config_pool, &inp_path, None).await?;
+            let _ = app.emit(
+                TRANSLATION_PROGRESS_EVENT,
+                TranslationProgressPayload { task: refreshed },
+            );
+            inp_pool.close().await;
+            Ok(Some(view))
+        }
+        AutoGlossaryGeneration::Interrupted(reason) => {
+            finalize_task(
+                app,
+                &inp_pool,
+                config_pool,
+                &inp_path,
+                TranslationTaskStatus::Interrupted,
+                Some(reason),
+                None,
+            )
+            .await?;
+            inp_pool.close().await;
+            Ok(None)
+        }
+    }
+}
+
 async fn rebuild_chunks_for_retranslate(
+    provider_pool: &SqlitePool,
+    client: &Client,
     inp_pool: &SqlitePool,
     indexed: &TranslationTaskView,
     token_limit: i64,
+    pdf_parsing_mode: PdfParsingMode,
     now: &str,
 ) -> Result<(), String> {
     let source_path = PathBuf::from(&indexed.source_path);
-    let chunks = document_parsing::parse_source_file(&indexed.id, &source_path, token_limit)?;
+    let resolved_source = resolve_source_file(inp_pool, &source_path).await?;
+    let parsed_source = parse_source_file_for_task(
+        provider_pool,
+        client,
+        &indexed.id,
+        resolved_source.path(),
+        token_limit,
+        pdf_parsing_mode,
+    )
+    .await?;
     let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query("DELETE FROM chunks")
         .execute(&mut *transaction)
         .await
         .map_err(|error| error.to_string())?;
-    for chunk in chunks {
+    sqlx::query("DELETE FROM assets")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+    insert_assets(&mut transaction, &parsed_source.assets, now).await?;
+    for chunk in parsed_source.chunks {
         sqlx::query(
             "INSERT INTO chunks (
                 id, sequence, map_json, preprocessed_text, source_text,
@@ -1662,6 +2220,8 @@ pub async fn run_translation_task(
     app: AppHandle,
     provider_pool: SqlitePool,
     config_pool: SqlitePool,
+    glossary_config_pool: SqlitePool,
+    glossary_workspace_root: PathBuf,
     client: Client,
     prepared: PreparedRun,
     interrupt: TranslationInterrupt,
@@ -1683,6 +2243,30 @@ pub async fn run_translation_task(
         inp_pool.close().await;
         return Ok(());
     }
+
+    let glossary_chunks = glossary_source_chunks(&inp_pool).await?;
+    let glossary_entries = match prepare_task_glossary(
+        &app,
+        &provider_pool,
+        &glossary_config_pool,
+        &glossary_workspace_root,
+        &client,
+        &inp_pool,
+        &config_pool,
+        &prepared.inp_path,
+        &task,
+        &glossary_chunks,
+        &prepared.config,
+        &interrupt,
+    )
+    .await?
+    {
+        TaskGlossaryPreparation::Ready(entries) => Arc::new(entries),
+        TaskGlossaryPreparation::Interrupted => {
+            inp_pool.close().await;
+            return Ok(());
+        }
+    };
 
     let model = db::get_model(&provider_pool, &task.model_id).await?;
     let config = db::runtime_config(&provider_pool, &task.provider_id).await?;
@@ -1739,6 +2323,7 @@ pub async fn run_translation_task(
             let target_language = target_language.clone();
             let assistant_prompt = assistant_prompt.clone();
             let assistant_custom_parameters = assistant_custom_parameters.clone();
+            let glossary_entries = glossary_entries.clone();
             async move {
                 if interrupted.is_interrupted() {
                     return;
@@ -1755,6 +2340,7 @@ pub async fn run_translation_task(
                     target_language,
                     assistant_prompt,
                     assistant_custom_parameters,
+                    glossary_entries,
                     document_format,
                     content_format,
                     chunk,
@@ -1777,6 +2363,338 @@ pub async fn run_translation_task(
     writer.await.map_err(|error| error.to_string())??;
     inp_pool.close().await;
     Ok(())
+}
+
+async fn prepare_task_glossary(
+    app: &AppHandle,
+    provider_pool: &SqlitePool,
+    glossary_config_pool: &SqlitePool,
+    glossary_workspace_root: &Path,
+    client: &Client,
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    task: &TranslationTaskView,
+    pending_chunks: &[ChunkRecord],
+    config: &TranslationConfigView,
+    interrupt: &TranslationInterrupt,
+) -> Result<TaskGlossaryPreparation, String> {
+    let glossary_config = task_glossary_config(inp_pool).await?;
+    if !glossary_config.use_glossary {
+        return Ok(TaskGlossaryPreparation::Ready(Vec::new()));
+    }
+
+    let glossary_id = match glossary_config.glossary_mode {
+        GlossaryMode::Existing => glossary_config
+            .glossary_id
+            .ok_or_else(|| "Glossary selection is required for this task".to_string())?,
+        GlossaryMode::Auto => match glossary_config.glossary_id {
+            Some(id) => id,
+            None => {
+                match generate_auto_glossary(
+                    provider_pool,
+                    glossary_config_pool,
+                    glossary_workspace_root,
+                    client,
+                    task,
+                    pending_chunks,
+                    config,
+                    interrupt,
+                )
+                .await?
+                {
+                    AutoGlossaryGeneration::Created(view) => {
+                        set_task_glossary_id(inp_pool, &view.id).await?;
+                        let refreshed =
+                            refresh_task_stats(inp_pool, config_pool, inp_path, None).await?;
+                        let _ = app.emit(
+                            TRANSLATION_PROGRESS_EVENT,
+                            TranslationProgressPayload { task: refreshed },
+                        );
+                        view.id
+                    }
+                    AutoGlossaryGeneration::Interrupted(reason) => {
+                        finalize_task(
+                            app,
+                            inp_pool,
+                            config_pool,
+                            inp_path,
+                            TranslationTaskStatus::Interrupted,
+                            Some(reason),
+                            None,
+                        )
+                        .await?;
+                        return Ok(TaskGlossaryPreparation::Interrupted);
+                    }
+                }
+            }
+        },
+    };
+
+    let entries = glossaries::load_glossary_entries(glossary_config_pool, &glossary_id).await?;
+    Ok(TaskGlossaryPreparation::Ready(entries))
+}
+
+async fn generate_auto_glossary(
+    provider_pool: &SqlitePool,
+    glossary_config_pool: &SqlitePool,
+    glossary_workspace_root: &Path,
+    client: &Client,
+    task: &TranslationTaskView,
+    pending_chunks: &[ChunkRecord],
+    config: &TranslationConfigView,
+    interrupt: &TranslationInterrupt,
+) -> Result<AutoGlossaryGeneration, String> {
+    let glossary_runtime = select_glossary_runtime(provider_pool, client).await?;
+    let chunks = pending_chunks
+        .iter()
+        .filter(|chunk| !chunk.source_text.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        let view = glossaries::create_auto_glossary(
+            glossary_config_pool,
+            glossary_workspace_root,
+            CreateAutoGlossaryInput {
+                name: format!("{} 自动术语表", task.name),
+                source_language: task.source_language.clone(),
+                target_language: task.target_language.clone(),
+                entries: Vec::new(),
+            },
+        )
+        .await?;
+        return Ok(AutoGlossaryGeneration::Created(view));
+    }
+
+    let dynamic_rate_limit = config.rate_limit_strategy == RateLimitStrategy::Dynamic;
+    let limiter = Arc::new(AdaptiveLimiter::new(
+        config.max_concurrency.max(1) as usize,
+        dynamic_rate_limit,
+    ));
+    let quota = Arc::new(HeaderQuotaPolicy::new(dynamic_rate_limit));
+    let manual_limiter = if config.rate_limit_strategy == RateLimitStrategy::Manual {
+        Some(Arc::new(ManualRateLimiter::new(
+            config.max_requests_per_minute as u64,
+            config.max_tokens_per_minute as u64,
+        )))
+    } else {
+        None
+    };
+    let max_concurrency = config.max_concurrency.max(1) as usize;
+    let max_retries = config.max_retries.max(0) as u32;
+    let target_language = task.target_language.clone();
+    let document_format = document_format_from_source_path(&task.source_path)?;
+    let content_format = content_format_from_source_path(&task.source_path)?;
+    let runtime = Arc::new(glossary_runtime);
+
+    let mut outcomes = stream::iter(chunks.clone())
+        .map(|chunk| {
+            let runtime = runtime.clone();
+            let limiter = limiter.clone();
+            let quota = quota.clone();
+            let manual_limiter = manual_limiter.clone();
+            let target_language = target_language.clone();
+            let interrupted = interrupt.clone();
+            async move {
+                generate_glossary_for_chunk(
+                    runtime,
+                    target_language,
+                    document_format,
+                    content_format,
+                    chunk,
+                    max_retries,
+                    quota,
+                    limiter,
+                    manual_limiter,
+                    interrupted,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(max_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    outcomes.sort_by_key(|outcome| match outcome {
+        AutoGlossaryChunkOutcome::Success { sequence, .. }
+        | AutoGlossaryChunkOutcome::Failed { sequence, .. } => *sequence,
+        AutoGlossaryChunkOutcome::Interrupted { .. } => i64::MAX,
+    });
+
+    let mut entries = Vec::new();
+    let mut failed_chunks = 0_usize;
+    for outcome in outcomes {
+        match outcome {
+            AutoGlossaryChunkOutcome::Success {
+                entries: chunk_entries,
+                ..
+            } => {
+                entries.extend(chunk_entries);
+            }
+            AutoGlossaryChunkOutcome::Failed { error, .. } => {
+                failed_chunks += 1;
+                if failed_chunks as f64 / chunks.len() as f64 > AUTO_GLOSSARY_FAILURE_THRESHOLD {
+                    return Ok(AutoGlossaryGeneration::Interrupted(format!(
+                        "Auto glossary generation failed for more than 40% of chunks: {error}"
+                    )));
+                }
+            }
+            AutoGlossaryChunkOutcome::Interrupted { error } => {
+                return Ok(AutoGlossaryGeneration::Interrupted(error));
+            }
+        }
+    }
+
+    let view = glossaries::create_auto_glossary(
+        glossary_config_pool,
+        glossary_workspace_root,
+        CreateAutoGlossaryInput {
+            name: format!("{} 自动术语表", task.name),
+            source_language: task.source_language.clone(),
+            target_language: task.target_language.clone(),
+            entries,
+        },
+    )
+    .await?;
+    Ok(AutoGlossaryGeneration::Created(view))
+}
+
+async fn select_glossary_runtime(
+    provider_pool: &SqlitePool,
+    client: &Client,
+) -> Result<GlossaryRuntime, String> {
+    let provider = db::list_providers(provider_pool, Some(ProviderPurpose::Glossary))
+        .await?
+        .into_iter()
+        .find(|provider| provider.enabled)
+        .ok_or_else(|| "No enabled glossary provider is configured".to_string())?;
+    let model = provider
+        .models
+        .first()
+        .ok_or_else(|| "The selected glossary provider has no model".to_string())?;
+    let assistant = db::list_assistants(provider_pool, ProviderPurpose::Glossary)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No glossary assistant is configured".to_string())?;
+    let config = db::runtime_config(provider_pool, &provider.id).await?;
+    Ok(GlossaryRuntime {
+        adapter: Arc::new(RuntimeAdapter::new(client.clone(), config)),
+        model_request_name: model.request_name.clone(),
+        assistant_prompt: Some(assistant.system_prompt),
+        assistant_custom_parameters: assistant.custom_parameters,
+    })
+}
+
+async fn generate_glossary_for_chunk(
+    runtime: Arc<GlossaryRuntime>,
+    target_language: String,
+    document_format: DocumentFormat,
+    content_format: ContentFormat,
+    chunk: ChunkRecord,
+    max_retries: u32,
+    quota: Arc<HeaderQuotaPolicy>,
+    limiter: Arc<AdaptiveLimiter>,
+    manual_limiter: Option<Arc<ManualRateLimiter>>,
+    interrupted: TranslationInterrupt,
+) -> AutoGlossaryChunkOutcome {
+    let mut last_error = None;
+    for attempt in 0..=max_retries {
+        if interrupted.is_interrupted() {
+            return AutoGlossaryChunkOutcome::Interrupted {
+                error: interrupted
+                    .reason()
+                    .unwrap_or_else(|| "Task interrupted".to_string()),
+            };
+        }
+        let Some(_permit) = limiter.acquire(&interrupted.flag).await else {
+            return AutoGlossaryChunkOutcome::Interrupted {
+                error: interrupted
+                    .reason()
+                    .unwrap_or_else(|| "Task interrupted".to_string()),
+            };
+        };
+        let prompt = build_glossary_prompt(GlossaryPromptInput {
+            target_language: target_language.clone(),
+            assistant_system_prompt: runtime.assistant_prompt.clone(),
+            chunk: TaskChunkInput {
+                text: chunk.source_text.clone(),
+                document_format,
+                content_format,
+            },
+        });
+        let messages = match prompt {
+            Ok(GlossaryPromptBuildResult::Request { messages }) => messages,
+            Ok(GlossaryPromptBuildResult::Skipped { .. }) => {
+                return AutoGlossaryChunkOutcome::Success {
+                    sequence: chunk.sequence,
+                    entries: Vec::new(),
+                };
+            }
+            Err(error) => {
+                return AutoGlossaryChunkOutcome::Failed {
+                    sequence: chunk.sequence,
+                    error,
+                };
+            }
+        };
+        let request = UnifiedChatRequest {
+            model: runtime.model_request_name.clone(),
+            messages,
+            tools: Vec::new(),
+            tool_choice: UnifiedToolChoice::None,
+            thinking: None,
+            max_output_tokens: None,
+            temperature: Some(0.0),
+            stream: false,
+            logprobs: false,
+            custom_parameters: runtime.assistant_custom_parameters.clone(),
+        };
+        let estimated_tokens = estimate_tokens(&chunk.source_text) + 512;
+        if let Some(manual_limiter) = manual_limiter.as_ref() {
+            manual_limiter.before_request(estimated_tokens).await;
+        }
+        quota.before_request(estimated_tokens).await;
+        match runtime.adapter.send_chat_with_meta(&request).await {
+            Ok(meta) => {
+                quota.update(&meta.rate_limits).await;
+                limiter
+                    .on_result(meta.rate_limits.has_quota_headers(), true, false)
+                    .await;
+                match sanitize_and_flatten_glossary(&meta.response.text, Some(&chunk.source_text)) {
+                    Ok(parsed) => {
+                        return AutoGlossaryChunkOutcome::Success {
+                            sequence: chunk.sequence,
+                            entries: parsed.entries,
+                        }
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(error) => {
+                quota.update(&error.rate_limits).await;
+                limiter
+                    .on_result(
+                        error.rate_limits.has_quota_headers(),
+                        false,
+                        error.is_rate_limited(),
+                    )
+                    .await;
+                if error.is_rate_limited() {
+                    return AutoGlossaryChunkOutcome::Interrupted {
+                        error: error.to_string(),
+                    };
+                }
+                last_error = Some(error.to_string());
+            }
+        }
+        if attempt < max_retries {
+            tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
+        }
+    }
+    AutoGlossaryChunkOutcome::Failed {
+        sequence: chunk.sequence,
+        error: last_error.unwrap_or_else(|| "Auto glossary generation failed".to_string()),
+    }
 }
 
 async fn writer_loop(
@@ -1834,6 +2752,7 @@ async fn translate_chunk(
     target_language: String,
     assistant_prompt: Option<String>,
     assistant_custom_parameters: Value,
+    glossary_entries: Arc<Vec<GlossaryEntry>>,
     document_format: DocumentFormat,
     content_format: ContentFormat,
     chunk: ChunkRecord,
@@ -1857,6 +2776,7 @@ async fn translate_chunk(
                 document_format,
                 content_format,
             },
+            glossary: matching_glossary_entries(&chunk.source_text, &glossary_entries),
         });
         let messages = match prompt {
             Ok(TranslationPromptBuildResult::Passthrough { text }) => {
@@ -2525,6 +3445,24 @@ async fn pending_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>, String> {
         .into_iter()
         .map(|row| ChunkRecord {
             id: row.get("id"),
+            sequence: row.get("sequence"),
+            source_text: row.get("source_text"),
+            map_json: row.get("map_json"),
+        })
+        .collect())
+}
+
+async fn glossary_source_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>, String> {
+    let rows =
+        sqlx::query("SELECT id, sequence, source_text, map_json FROM chunks ORDER BY sequence")
+            .fetch_all(pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ChunkRecord {
+            id: row.get("id"),
+            sequence: row.get("sequence"),
             source_text: row.get("source_text"),
             map_json: row.get("map_json"),
         })
@@ -2539,6 +3477,32 @@ async fn task_assistant_prompt(pool: &SqlitePool) -> Result<Option<String>, Stri
             .map_err(|error| error.to_string())?
             .flatten();
     Ok(prompt)
+}
+
+async fn task_glossary_config(pool: &SqlitePool) -> Result<TaskGlossaryConfig, String> {
+    let row = sqlx::query("SELECT use_glossary, glossary_mode, glossary_id FROM metadata LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(TaskGlossaryConfig {
+        use_glossary: row.get::<i64, _>("use_glossary") != 0,
+        glossary_mode: GlossaryMode::parse(row.get::<String, _>("glossary_mode").as_str())?,
+        glossary_id: row.get("glossary_id"),
+    })
+}
+
+async fn set_task_glossary_id(pool: &SqlitePool, glossary_id: &str) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE metadata
+         SET glossary_id = ?, updated_at = ?
+         WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
+    )
+    .bind(glossary_id)
+    .bind(unix_timestamp())
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 async fn task_assistant_custom_parameters(pool: &SqlitePool) -> Result<Value, String> {
@@ -2600,7 +3564,11 @@ fn config_snapshot_json(
         "rateLimitStrategy": config.rate_limit_strategy,
         "maxRequestsPerMinute": config.max_requests_per_minute,
         "maxTokensPerMinute": config.max_tokens_per_minute,
+        "useGlossary": config.use_glossary,
+        "glossaryMode": config.glossary_mode,
+        "glossaryId": config.glossary_id,
         "confidenceMode": config.confidence_mode,
+        "pdfParsingMode": config.pdf_parsing_mode,
         "providerId": provider_id,
         "modelId": model_id
     })
@@ -2719,6 +3687,17 @@ fn document_format_from_source_path(path: &str) -> Result<DocumentFormat, String
 
 fn content_format_from_source_path(path: &str) -> Result<ContentFormat, String> {
     document_parsing::content_format_from_path(Path::new(path))
+}
+
+fn matching_glossary_entries(
+    chunk_text: &str,
+    glossary_entries: &[GlossaryEntry],
+) -> Vec<GlossaryEntry> {
+    glossary_entries
+        .iter()
+        .filter(|entry| chunk_text.contains(&entry.src))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -3150,10 +4129,73 @@ pub async fn mark_task_failed_after_runtime_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document_parsing::types::{BlockRef, PlaceholderMap};
+    use crate::domain::{AddModelInput, CreateProviderInput, ProviderProtocol};
+    use std::io::{Cursor, Read, Write};
     use std::path::{Path, PathBuf};
+    use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
     fn temp_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("insitu-test-{label}-{}", db::new_id("workspace")))
+    }
+
+    fn test_docx_bytes(body_xml: &str) -> Result<Vec<u8>, String> {
+        let document = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body_xml}</w:body></w:document>"#
+        );
+        let entries = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+            ),
+            (
+                "word/_rels/document.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+            ),
+            ("word/document.xml", document.as_str()),
+            ("word/styles.xml", "<w:styles />"),
+        ];
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(cursor);
+        for (name, text) in entries {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .map_err(|error| error.to_string())?;
+            writer
+                .write_all(text.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+        let cursor = writer.finish().map_err(|error| error.to_string())?;
+        Ok(cursor.into_inner())
+    }
+
+    fn read_zip_entry_from_bytes(bytes: &[u8], entry: &str) -> Result<String, String> {
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
+        let mut file = archive.by_name(entry).map_err(|error| error.to_string())?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|error| error.to_string())?;
+        Ok(text)
+    }
+
+    fn docx_block_map_json(block_index: usize) -> Result<String, String> {
+        PlaceholderMap::empty(
+            DocumentFormat::Docx,
+            ContentFormat::Xml,
+            BlockRef {
+                kind: "docx-text-block".into(),
+                path: Some("word/document.xml".into()),
+                index: Some(block_index),
+                pointer: None,
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+        )
+        .to_json()
     }
 
     async fn write_test_inp(path: &Path, task_id: &str, name: &str) -> Result<(), String> {
@@ -3216,6 +4258,143 @@ mod tests {
 
         pool.close().await;
         Ok(())
+    }
+
+    #[test]
+    fn matching_glossary_entries_only_returns_terms_in_current_chunk() {
+        let entries = vec![
+            GlossaryEntry {
+                src: "Apple".into(),
+                dst: "Pingguo".into(),
+            },
+            GlossaryEntry {
+                src: "animation".into(),
+                dst: "Donghua".into(),
+            },
+            GlossaryEntry {
+                src: "banana".into(),
+                dst: "Xiangjiao".into(),
+            },
+        ];
+
+        let matched = matching_glossary_entries("Apple studies animation.", &entries);
+
+        assert_eq!(
+            matched,
+            vec![
+                GlossaryEntry {
+                    src: "Apple".into(),
+                    dst: "Pingguo".into(),
+                },
+                GlossaryEntry {
+                    src: "animation".into(),
+                    dst: "Donghua".into(),
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_freezes_glossary_config_in_inp_metadata() {
+        let root = temp_root("glossary-freeze");
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        let provider_db = root.join("providers.sqlite");
+        let provider_pool = db::connect(&provider_db).await.expect("provider db");
+        let config_pool = connect_config_db(&root).await.expect("config db");
+        let provider = db::create_provider(
+            &provider_pool,
+            CreateProviderInput {
+                name: "Freeze Provider".into(),
+                protocol: ProviderProtocol::OpenaiChat,
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("provider");
+        let model = db::add_model(
+            &provider_pool,
+            AddModelInput {
+                provider_id: provider.id.clone(),
+                request_name: "freeze-model".into(),
+                alias: "Freeze Model".into(),
+                source: "manual".into(),
+            },
+        )
+        .await
+        .expect("model");
+        update_translation_config(
+            &config_pool,
+            UpdateTranslationConfigInput {
+                source_language: "English".into(),
+                custom_source_language: String::new(),
+                target_language: "Simplified Chinese".into(),
+                custom_target_language: String::new(),
+                provider_id: provider.id.clone(),
+                model_id: model.id.clone(),
+                assistant_id: String::new(),
+                chunk_token_limit: 800,
+                max_concurrency: 3,
+                max_retries: 2,
+                rate_limit_strategy: RateLimitStrategy::Manual,
+                max_requests_per_minute: 120,
+                max_tokens_per_minute: 60_000,
+                use_glossary: true,
+                glossary_mode: GlossaryMode::Existing,
+                glossary_id: Some("glossary-freeze-id".into()),
+                confidence_mode: ConfidenceMode::Off,
+                pdf_parsing_mode: PdfParsingMode::LocalFirst,
+            },
+        )
+        .await
+        .expect("update config");
+        let source_path = root.join("source.txt");
+        tokio::fs::write(&source_path, "Apple animation.")
+            .await
+            .expect("write source");
+
+        let task = create_translation_task(
+            &provider_pool,
+            &Client::new(),
+            &config_pool,
+            &root,
+            CreateTranslationTaskInput {
+                file_path: source_path.to_string_lossy().to_string(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                tags: Vec::new(),
+                provider_id: provider.id,
+                model_id: model.id,
+                assistant_id: None,
+            },
+        )
+        .await
+        .expect("create task");
+        let inp_pool = connect_inp(Path::new(&task.inp_path)).await.expect("inp");
+        let glossary_config = task_glossary_config(&inp_pool)
+            .await
+            .expect("glossary config");
+        let snapshot_json: String =
+            sqlx::query_scalar("SELECT config_snapshot_json FROM metadata LIMIT 1")
+                .fetch_one(&inp_pool)
+                .await
+                .expect("snapshot");
+        let snapshot: Value = serde_json::from_str(&snapshot_json).expect("snapshot json");
+
+        assert!(glossary_config.use_glossary);
+        assert_eq!(glossary_config.glossary_mode, GlossaryMode::Existing);
+        assert_eq!(
+            glossary_config.glossary_id.as_deref(),
+            Some("glossary-freeze-id")
+        );
+        assert_eq!(snapshot["useGlossary"], true);
+        assert_eq!(snapshot["glossaryMode"], "existing");
+        assert_eq!(snapshot["glossaryId"], "glossary-freeze-id");
+
+        inp_pool.close().await;
+        provider_pool.close().await;
+        config_pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -3507,6 +4686,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inp_migration_creates_assets_table_and_export_releases_assets() {
+        let root = temp_root("asset-export");
+        let inp_path = root.join("asset.inp");
+        write_test_inp(&inp_path, "task-assets", "Asset Export")
+            .await
+            .expect("write inp");
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        let columns = sqlx::query("PRAGMA table_info(assets)")
+            .fetch_all(&pool)
+            .await
+            .expect("asset columns");
+        assert!(columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "relative_path"));
+        let source_columns = sqlx::query("PRAGMA table_info(source_file)")
+            .fetch_all(&pool)
+            .await
+            .expect("source file columns");
+        assert!(source_columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "bytes"));
+        sqlx::query(
+            "INSERT INTO assets (relative_path, media_type, bytes, source, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("assets/task-assets/fig.png")
+        .bind("image/png")
+        .bind(Vec::from(&b"png"[..]))
+        .bind("mineru-standard")
+        .bind(unix_timestamp())
+        .execute(&pool)
+        .await
+        .expect("insert asset");
+
+        let export_path = root.join("translated.md");
+        release_assets_for_export(&pool, &export_path)
+            .await
+            .expect("release assets");
+        let released = tokio::fs::read(root.join("assets/task-assets/fig.png"))
+            .await
+            .expect("read released asset");
+        assert_eq!(released, b"png");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inp_migration_backfills_readable_legacy_source_file() {
+        let root = temp_root("source-backfill");
+        let inp_path = root.join("legacy.inp");
+        let source_path = root.join("legacy.txt");
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        tokio::fs::write(&source_path, b"legacy source bytes")
+            .await
+            .expect("write legacy source");
+        write_test_inp(&inp_path, "task-backfill", "Backfill")
+            .await
+            .expect("write inp");
+
+        let pool = connect_inp(&inp_path)
+            .await
+            .expect("open inp before legacy");
+        sqlx::query("UPDATE metadata SET schema_version = 4, source_path = ?")
+            .bind(source_path.to_string_lossy().to_string())
+            .execute(&pool)
+            .await
+            .expect("mark legacy");
+        sqlx::query("DELETE FROM source_file")
+            .execute(&pool)
+            .await
+            .expect("clear source file");
+        pool.close().await;
+
+        let migrated = connect_inp(&inp_path).await.expect("migrate backfill");
+        let schema_version: i64 = sqlx::query_scalar("SELECT schema_version FROM metadata LIMIT 1")
+            .fetch_one(&migrated)
+            .await
+            .expect("schema version");
+        assert_eq!(schema_version, INP_SCHEMA_VERSION);
+        let row = sqlx::query("SELECT file_name, bytes FROM source_file WHERE id = 1")
+            .fetch_one(&migrated)
+            .await
+            .expect("source file row");
+        assert_eq!(row.get::<String, _>("file_name"), "legacy.txt");
+        assert_eq!(
+            row.get::<Vec<u8>, _>("bytes"),
+            Vec::from(&b"legacy source bytes"[..])
+        );
+        migrated.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn missing_embedded_and_original_source_errors_clearly() {
+        let root = temp_root("source-missing");
+        let inp_path = root.join("missing.inp");
+        write_test_inp(&inp_path, "task-missing-source", "Missing Source")
+            .await
+            .expect("write inp");
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        let source_path: String = sqlx::query_scalar("SELECT source_path FROM metadata LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("source path");
+
+        let error = rendered_task_document(&pool, Path::new(&source_path))
+            .await
+            .expect_err("missing source should error");
+        assert_eq!(error, SOURCE_FILE_UNAVAILABLE);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn rendered_docx_uses_embedded_source_file_after_original_is_deleted() {
+        let root = temp_root("source-docx");
+        let inp_path = root.join("docx.inp");
+        let source_path = root.join("source.docx");
+        let source_bytes =
+            test_docx_bytes(r#"<w:p><w:r><w:t>Hello</w:t></w:r></w:p>"#).expect("docx bytes");
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        tokio::fs::write(&source_path, &source_bytes)
+            .await
+            .expect("write source");
+        write_test_inp(&inp_path, "task-docx-source", "Docx Source")
+            .await
+            .expect("write inp");
+
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        let now = unix_timestamp();
+        sqlx::query("UPDATE metadata SET source_path = ?, total_chunks = 1 WHERE task_id = ?")
+            .bind(source_path.to_string_lossy().to_string())
+            .bind("task-docx-source")
+            .execute(&pool)
+            .await
+            .expect("update metadata");
+        sqlx::query("DELETE FROM chunks")
+            .execute(&pool)
+            .await
+            .expect("clear chunks");
+        sqlx::query(
+            "INSERT OR REPLACE INTO source_file (id, file_name, bytes, created_at)
+             VALUES (1, ?, ?, ?)",
+        )
+        .bind("source.docx")
+        .bind(source_bytes)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert source file");
+        sqlx::query(
+            "INSERT INTO chunks (
+                id, sequence, map_json, preprocessed_text, source_text,
+                after_translate_text, translated_text, status, retry_count, updated_at
+             ) VALUES (?, 0, ?, ?, ?, ?, ?, ?, 0, ?)",
+        )
+        .bind("task-docx-source-chunk-000000")
+        .bind(docx_block_map_json(0).expect("map"))
+        .bind("Hello")
+        .bind("Hello")
+        .bind("Hola")
+        .bind("Hola")
+        .bind(TranslationChunkStatus::Success.as_str())
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert docx chunk");
+        tokio::fs::remove_file(&source_path)
+            .await
+            .expect("remove original source");
+
+        let rendered = rendered_task_document(&pool, &source_path)
+            .await
+            .expect("render from embedded source");
+        let document_xml =
+            read_zip_entry_from_bytes(&rendered, "word/document.xml").expect("document xml");
+        assert!(document_xml.contains(">Hola<"));
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn default_config_is_seeded() {
         let root = std::env::temp_dir().join(format!("insitu-test-{}", db::new_id("workspace")));
         let pool = connect_config_db(&root).await.expect("connect config");
@@ -3528,6 +4890,7 @@ mod tests {
         assert_eq!(config.glossary_mode, GlossaryMode::Auto);
         assert_eq!(config.glossary_id, None);
         assert_eq!(config.confidence_mode, ConfidenceMode::Off);
+        assert_eq!(config.pdf_parsing_mode, PdfParsingMode::LocalFirst);
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3580,6 +4943,7 @@ mod tests {
                 glossary_mode: GlossaryMode::Auto,
                 glossary_id: None,
                 confidence_mode: ConfidenceMode::ConfidenceIndex,
+                pdf_parsing_mode: PdfParsingMode::MineruFirst,
             },
         )
         .await
@@ -3603,6 +4967,7 @@ mod tests {
         assert!(persisted.use_glossary);
         assert_eq!(persisted.glossary_mode, GlossaryMode::Auto);
         assert_eq!(persisted.confidence_mode, ConfidenceMode::ConfidenceIndex);
+        assert_eq!(persisted.pdf_parsing_mode, PdfParsingMode::MineruFirst);
         migrated_pool.close().await;
 
         let final_pool = connect_config_db(&root).await.expect("final reconnect");
@@ -3627,6 +4992,7 @@ mod tests {
             final_config.confidence_mode,
             ConfidenceMode::ConfidenceIndex
         );
+        assert_eq!(final_config.pdf_parsing_mode, PdfParsingMode::MineruFirst);
         final_pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }

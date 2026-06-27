@@ -9,9 +9,14 @@ import {
 } from "react";
 
 import {
-  APPEARANCE_STORAGE_KEY,
+  getAppearancePreferences,
+  isTauriRuntime,
+  updateAppearancePreferences,
+} from "@/features/appearance/api";
+import {
   DEFAULT_APPEARANCE,
   DEFAULT_CUSTOM_THEME_COLOR,
+  APPEARANCE_STORAGE_KEY,
   SYSTEM_FONT_STACK,
   SYSTEM_FONT_VALUE,
 } from "@/features/appearance/constants";
@@ -37,42 +42,6 @@ interface AppearanceContextValue {
 
 const AppearanceContext = createContext<AppearanceContextValue | null>(null);
 
-function readPreferences(): AppearancePreferences {
-  try {
-    const stored = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
-    if (!stored) return DEFAULT_APPEARANCE;
-    const value = JSON.parse(stored) as Partial<AppearancePreferences>;
-    const customThemeColor =
-      typeof value.customThemeColor === "string"
-        ? normalizeHexColor(value.customThemeColor)
-        : null;
-    return {
-      colorMode:
-        value.colorMode === "light" ||
-        value.colorMode === "dark" ||
-        value.colorMode === "system"
-          ? value.colorMode
-          : DEFAULT_APPEARANCE.colorMode,
-      themeId:
-        value.themeId === "sky" ||
-        value.themeId === "iris" ||
-        value.themeId === "pine" ||
-        value.themeId === "lagoon" ||
-        value.themeId === "sand" ||
-        value.themeId === "custom"
-          ? value.themeId
-          : DEFAULT_APPEARANCE.themeId,
-      customThemeColor: customThemeColor ?? DEFAULT_CUSTOM_THEME_COLOR,
-      fontFamily:
-        typeof value.fontFamily === "string" && value.fontFamily.trim()
-          ? value.fontFamily
-          : DEFAULT_APPEARANCE.fontFamily,
-    };
-  } catch {
-    return DEFAULT_APPEARANCE;
-  }
-}
-
 function fontStack(fontFamily: string): string {
   if (fontFamily === SYSTEM_FONT_VALUE) return SYSTEM_FONT_STACK;
   const escaped = fontFamily.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
@@ -83,8 +52,48 @@ function systemIsDark(): boolean {
   return window.matchMedia("(prefers-color-scheme: dark)").matches;
 }
 
+function normalizePreferences(value: AppearancePreferences): AppearancePreferences {
+  const customThemeColor = normalizeHexColor(value.customThemeColor);
+  return {
+    colorMode:
+      value.colorMode === "light" ||
+      value.colorMode === "dark" ||
+      value.colorMode === "system"
+        ? value.colorMode
+        : DEFAULT_APPEARANCE.colorMode,
+    themeId:
+      value.themeId === "sky" ||
+      value.themeId === "iris" ||
+      value.themeId === "pine" ||
+      value.themeId === "lagoon" ||
+      value.themeId === "sand" ||
+      value.themeId === "custom"
+        ? value.themeId
+        : DEFAULT_APPEARANCE.themeId,
+    customThemeColor: customThemeColor ?? DEFAULT_CUSTOM_THEME_COLOR,
+    fontFamily: value.fontFamily.trim() || DEFAULT_APPEARANCE.fontFamily,
+  };
+}
+
+function readLegacyPreferences(): AppearancePreferences | null {
+  try {
+    const stored = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
+    if (!stored) return null;
+    const value = JSON.parse(stored) as Partial<AppearancePreferences>;
+    return normalizePreferences({
+      colorMode: value.colorMode ?? DEFAULT_APPEARANCE.colorMode,
+      themeId: value.themeId ?? DEFAULT_APPEARANCE.themeId,
+      customThemeColor: value.customThemeColor ?? DEFAULT_APPEARANCE.customThemeColor,
+      fontFamily: value.fontFamily ?? DEFAULT_APPEARANCE.fontFamily,
+    });
+  } catch {
+    return null;
+  }
+}
+
 export function AppearanceProvider({ children }: { children: ReactNode }) {
-  const [preferences, setPreferences] = useState<AppearancePreferences>(readPreferences);
+  const [preferences, setPreferences] = useState<AppearancePreferences>(DEFAULT_APPEARANCE);
+  const [loaded, setLoaded] = useState<boolean>(!isTauriRuntime());
   const [systemDark, setSystemDark] = useState<boolean>(systemIsDark);
   const resolvedMode =
     preferences.colorMode === "system"
@@ -92,6 +101,26 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
         ? "dark"
         : "light"
       : preferences.colorMode;
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    void getAppearancePreferences()
+      .then((stored) => {
+        if (disposed) return;
+        const migrated = stored.stored ? null : readLegacyPreferences();
+        const nextPreferences = migrated ?? normalizePreferences(stored.preferences);
+        setPreferences(nextPreferences);
+        if (migrated) void updateAppearancePreferences(migrated);
+        setLoaded(true);
+      })
+      .catch((error: unknown) => {
+        console.error("Unable to load appearance preferences.", error);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   useEffect(() => {
     const query = window.matchMedia("(prefers-color-scheme: dark)");
@@ -115,8 +144,12 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
     } else {
       clearCustomThemeVariables(root);
     }
-    window.localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify(preferences));
   }, [preferences, resolvedMode]);
+
+  useEffect(() => {
+    if (!loaded || !isTauriRuntime()) return;
+    void updateAppearancePreferences(preferences);
+  }, [loaded, preferences]);
 
   const setColorMode = useCallback((colorMode: ColorMode): void => {
     setPreferences((current) => ({ ...current, colorMode }));

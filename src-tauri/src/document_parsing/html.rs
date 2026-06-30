@@ -1,16 +1,22 @@
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 
-use scraper::Html;
+use regex::Regex;
+use scraper::{Html, Node, StrTendril};
 
 use crate::task_prompt::{ContentFormat, DocumentFormat};
 
-use super::placeholders::protect_html;
-use super::types::{BlockRef, ParsedChunk, RenderInput, RenderedChunk};
-use super::{chunk_raw_block_refs, token_limit_usize, DocumentParser, RawBlockRef};
+use super::types::{
+    BlockRef, ParsedChunk, PlaceholderEntry, PlaceholderMap, RenderInput, RenderedChunk,
+    PLACEHOLDER_MAP_VERSION,
+};
+use super::{
+    chunk_raw_block_refs, token_limit_usize, ChunkedRawBlock, DocumentParser, RawBlockRef,
+};
 
-const HTML_TEXT_KIND: &str = "html-text";
-const HTML_ATTRIBUTE_KIND: &str = "html-attribute";
-const HTML_LEGACY_TEXT_BLOCK_KIND: &str = "text-block";
+const HTML_DOM_CHUNK_KIND: &str = "html-dom-chunk";
+const HTML_TEXT_BLOCK_KIND: &str = "html-dom-text-block";
+const HTML_TEXT_NODE_KIND: &str = "html-dom-text-node";
+const HTML_ATTRIBUTE_KIND: &str = "html-dom-attribute";
 const TRANSLATABLE_ATTRIBUTES: &[&str] = &["alt", "title", "placeholder"];
 
 pub struct HtmlParser;
@@ -19,700 +25,541 @@ impl DocumentParser for HtmlParser {
     fn parse(&self, input: super::types::ParserInput<'_>) -> Result<Vec<ParsedChunk>, String> {
         let text = std::fs::read_to_string(input.source_path)
             .map_err(|error| format!("Unable to read HTML source: {error}"))?;
-        parse_html_text(
-            &text,
-            DocumentFormat::Html,
-            ContentFormat::Html,
-            None,
-            input.token_limit,
-        )
+        parse_html_text(&text, input.token_limit)
+    }
+
+    fn restore_chunk(&self, map_json: &str, after_translate_text: &str) -> Result<String, String> {
+        let map = super::parse_map(map_json)?;
+        if map.block_ref.kind == HTML_DOM_CHUNK_KIND {
+            return restore_html_dom_chunk(&map, after_translate_text);
+        }
+        super::placeholders::restore_from_json(map_json, after_translate_text)
     }
 
     fn render_document(&self, input: RenderInput<'_>) -> Result<Vec<u8>, String> {
         let text = std::fs::read_to_string(input.source_path)
             .map_err(|error| format!("Unable to read HTML for render: {error}"))?;
-        render_html_document(&text, input.chunks, None).map(|text| text.into_bytes())
+        render_html_document(&text, input.chunks).map(|text| text.into_bytes())
     }
 }
 
-pub fn parse_html_text(
-    text: &str,
-    format: DocumentFormat,
-    content_format: ContentFormat,
-    path: Option<String>,
-    token_limit: i64,
-) -> Result<Vec<ParsedChunk>, String> {
-    let _document = Html::parse_document(text);
-    let segments = html_segments(text);
-    let groups = html_text_groups(text, &segments, token_limit);
-    let mut chunks = Vec::new();
-
-    for (index, (start, end)) in groups.into_iter().enumerate() {
-        let raw = text
-            .get(start..end)
-            .ok_or_else(|| format!("Invalid HTML segment range {start}:{end}"))?;
-        let block_ref = html_block_ref(&path, index, HTML_TEXT_KIND, start, end);
-        let (source_text, map_json) = protect_html(raw, format, content_format, block_ref)?;
-        chunks.push(ParsedChunk {
-            sequence: index as i64,
-            preprocessed_text: raw.to_string(),
-            source_text,
-            map_json,
-        });
-    }
-
-    for segment in segments
-        .iter()
-        .filter(|segment| matches!(segment.kind, HtmlSegmentKind::Attribute))
-    {
-        let block_ref = html_block_ref(
-            &path,
-            chunks.len(),
-            HTML_ATTRIBUTE_KIND,
-            segment.start,
-            segment.end,
-        );
-        let value = text
-            .get(segment.start..segment.end)
-            .ok_or_else(|| {
-                format!(
-                    "Invalid HTML attribute range {}:{}",
-                    segment.start, segment.end
-                )
-            })?
-            .to_string();
-        let map = super::types::PlaceholderMap::empty(format, content_format, block_ref);
-        chunks.push(ParsedChunk {
-            sequence: chunks.len() as i64,
-            preprocessed_text: value.clone(),
-            source_text: value,
-            map_json: map.to_json()?,
-        });
-    }
-
+fn parse_html_text(text: &str, token_limit: i64) -> Result<Vec<ParsedChunk>, String> {
+    let document = Html::parse_document(text);
+    let mut chunks = html_text_chunks(&document, token_limit)?;
+    let attributes = html_attribute_chunks(&document, chunks.len())?;
+    chunks.extend(attributes);
     Ok(chunks)
 }
 
-pub fn render_html_document(
-    original_text: &str,
-    chunks: &[RenderedChunk],
-    path: Option<&str>,
-) -> Result<String, String> {
-    let mut patches = Vec::new();
-    let mut legacy = Vec::new();
-    let normalized_path = path.map(normalize_zip_path);
+fn render_html_document(original_text: &str, chunks: &[RenderedChunk]) -> Result<String, String> {
+    let mut document = Html::parse_document(original_text);
+    let text_replacements = html_text_replacements(chunks)?;
+    let attribute_replacements = html_attribute_replacements(chunks)?;
 
-    for chunk in chunks {
-        let map = super::parse_map(&chunk.map_json)?;
-        if !path_matches(map.block_ref.path.as_deref(), normalized_path.as_deref()) {
+    apply_text_replacements(&mut document, text_replacements)?;
+    apply_attribute_replacements(&mut document, attribute_replacements)?;
+
+    Ok(document.html())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HtmlTextMeta {
+    node_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HtmlUnitDescriptor {
+    tag: String,
+    node_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HtmlAttributeReplacement {
+    node_index: usize,
+    attr_name: String,
+    text: String,
+}
+
+fn html_text_chunks(document: &Html, token_limit: i64) -> Result<Vec<ParsedChunk>, String> {
+    let raw_blocks = collect_html_text_blocks(document)
+        .into_iter()
+        .map(|block| {
+            RawBlockRef::new(
+                block.text,
+                true,
+                HtmlTextMeta {
+                    node_index: block.node_index,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if raw_blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    chunk_raw_block_refs(raw_blocks, token_limit_usize(token_limit))
+        .into_iter()
+        .enumerate()
+        .filter(|(_, blocks)| !blocks.is_empty())
+        .map(|(sequence, blocks)| html_chunk_from_blocks(sequence, blocks))
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HtmlTextBlock {
+    node_index: usize,
+    text: String,
+}
+
+fn collect_html_text_blocks(document: &Html) -> Vec<HtmlTextBlock> {
+    document
+        .tree
+        .nodes()
+        .enumerate()
+        .filter_map(|(node_index, node)| {
+            let ancestor_names = node
+                .ancestors()
+                .filter_map(|ancestor| {
+                    ancestor
+                        .value()
+                        .as_element()
+                        .map(|element| element.name().to_string())
+                })
+                .collect::<Vec<_>>();
+            if !is_translatable_name_context(None, &ancestor_names) {
+                return None;
+            }
+            let Node::Text(text) = node.value() else {
+                return None;
+            };
+            let core = trimmed_core(&text.text)?;
+            Some(HtmlTextBlock {
+                node_index,
+                text: core.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn html_chunk_from_blocks(
+    sequence: usize,
+    blocks: Vec<ChunkedRawBlock<HtmlTextMeta>>,
+) -> Result<ParsedChunk, String> {
+    let mut source_parts = Vec::new();
+    let mut preprocessed_parts = Vec::new();
+    let mut entries = Vec::new();
+    let mut next_text_index = 1_usize;
+
+    for (local_index, block) in blocks.iter().enumerate() {
+        let unit_id = format!("it{local_index}");
+        let text_id = format!("t{next_text_index}");
+        next_text_index += 1;
+
+        source_parts.push(format!(
+            "<{unit_id}><{text_id}>{}</{text_id}></{unit_id}>",
+            block.text
+        ));
+        preprocessed_parts.push(block.text.clone());
+        entries.push(PlaceholderEntry {
+            id: unit_id.clone(),
+            kind: HTML_TEXT_BLOCK_KIND.into(),
+            original: block.text.clone(),
+            open: String::new(),
+            close: String::new(),
+            translatable: true,
+            native_ref: Some(format!(
+                "node:{};range:{}:{}",
+                block.metadata.node_index, block.source_start, block.source_end
+            )),
+        });
+        entries.push(PlaceholderEntry {
+            id: text_id,
+            kind: HTML_TEXT_NODE_KIND.into(),
+            original: block.text.clone(),
+            open: String::new(),
+            close: String::new(),
+            translatable: true,
+            native_ref: Some(format!("unit:{unit_id};node:{}", block.metadata.node_index)),
+        });
+    }
+
+    let map = PlaceholderMap {
+        version: PLACEHOLDER_MAP_VERSION,
+        format: DocumentFormat::Html,
+        content_format: ContentFormat::Html,
+        block_ref: BlockRef {
+            kind: HTML_DOM_CHUNK_KIND.into(),
+            path: None,
+            index: Some(sequence),
+            pointer: Some(format!("units:{}", blocks.len())),
+            prefix: String::new(),
+            suffix: String::new(),
+        },
+        entries,
+    };
+
+    Ok(ParsedChunk {
+        sequence: sequence as i64,
+        preprocessed_text: preprocessed_parts.join("\n"),
+        source_text: source_parts.join("\n"),
+        map_json: map.to_json()?,
+    })
+}
+
+fn html_attribute_chunks(
+    document: &Html,
+    start_sequence: usize,
+) -> Result<Vec<ParsedChunk>, String> {
+    let mut chunks = Vec::new();
+    for (node_index, node) in document.tree.nodes().enumerate() {
+        let Some(element) = node.value().as_element() else {
+            continue;
+        };
+        let ancestor_names = node
+            .ancestors()
+            .filter_map(|ancestor| {
+                ancestor
+                    .value()
+                    .as_element()
+                    .map(|element| element.name().to_string())
+            })
+            .collect::<Vec<_>>();
+        if !is_translatable_name_context(Some(element.name()), &ancestor_names) {
             continue;
         }
+        for attr_name in TRANSLATABLE_ATTRIBUTES {
+            let Some(value) = element.attr(attr_name) else {
+                continue;
+            };
+            let Some((_, core, _)) = split_core(value) else {
+                continue;
+            };
+            let map = PlaceholderMap::empty(
+                DocumentFormat::Html,
+                ContentFormat::Html,
+                BlockRef {
+                    kind: HTML_ATTRIBUTE_KIND.into(),
+                    path: None,
+                    index: Some(start_sequence + chunks.len()),
+                    pointer: Some(format!("node:{node_index};attr:{attr_name}")),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+            );
+            chunks.push(ParsedChunk {
+                sequence: (start_sequence + chunks.len()) as i64,
+                preprocessed_text: core.to_string(),
+                source_text: core.to_string(),
+                map_json: map.to_json()?,
+            });
+        }
+    }
+    Ok(chunks)
+}
 
-        match map.block_ref.kind.as_str() {
-            HTML_TEXT_KIND | HTML_ATTRIBUTE_KIND => {
-                let Some(pointer) = map.block_ref.pointer.as_deref() else {
-                    continue;
-                };
-                let Some((start, end)) = parse_range_pointer(pointer) else {
-                    continue;
-                };
-                patches.push(HtmlPatch {
-                    start,
-                    end,
-                    replacement: chunk.translated_text.clone(),
-                });
-            }
-            HTML_LEGACY_TEXT_BLOCK_KIND => {
-                let order = map
-                    .block_ref
-                    .index
-                    .map(|index| index as i64)
-                    .unwrap_or(chunk.sequence);
-                legacy.push((order, chunk.sequence, chunk.translated_text.as_str()));
-            }
+fn is_translatable_name_context(self_name: Option<&str>, ancestor_names: &[String]) -> bool {
+    let mut in_head = false;
+    let mut in_title = false;
+
+    if self_name.is_some_and(is_blocked_element_name) {
+        return false;
+    }
+
+    for name in ancestor_names {
+        match name.as_str() {
+            "head" => in_head = true,
+            "title" => in_title = true,
+            name if is_blocked_element_name(name) => return false,
             _ => {}
         }
     }
 
-    if !patches.is_empty() {
-        apply_html_patches(original_text, &patches)
-    } else if !legacy.is_empty() {
-        legacy.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-        Ok(legacy
-            .into_iter()
-            .map(|(_, _, text)| text)
-            .collect::<String>())
-    } else {
-        Ok(original_text.to_string())
-    }
+    !(in_head && !in_title)
 }
 
-fn html_block_ref(
-    path: &Option<String>,
-    index: usize,
-    kind: &str,
-    start: usize,
-    end: usize,
-) -> BlockRef {
-    BlockRef {
-        kind: kind.into(),
-        path: path.clone(),
-        index: Some(index),
-        pointer: Some(format!("range:{start}:{end}")),
-        prefix: String::new(),
-        suffix: String::new(),
-    }
+fn is_blocked_element_name(name: &str) -> bool {
+    matches!(name, "script" | "style" | "link" | "meta" | "template")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HtmlSegmentKind {
-    Text,
-    Attribute,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HtmlSegment {
-    kind: HtmlSegmentKind,
-    start: usize,
-    end: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HtmlTag {
-    name: String,
-    start: usize,
-    end: usize,
-    closing: bool,
-    self_closing: bool,
-    raw: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HtmlPatch {
-    start: usize,
-    end: usize,
-    replacement: String,
-}
-
-fn html_segments(text: &str) -> Vec<HtmlSegment> {
-    let mut segments = Vec::new();
-    let mut stack = Vec::<String>::new();
-    let mut index = 0_usize;
-
-    while index < text.len() {
-        let Some(next_tag_offset) = text[index..].find('<') else {
-            push_text_segment(text, index, text.len(), &stack, &mut segments);
-            break;
-        };
-        let tag_start = index + next_tag_offset;
-        push_text_segment(text, index, tag_start, &stack, &mut segments);
-
-        let Some(tag) = parse_tag_at(text, tag_start) else {
-            push_text_segment(text, tag_start, text.len(), &stack, &mut segments);
-            break;
-        };
-
-        if !tag.closing {
-            push_attribute_segments(&tag, &stack, &mut segments);
+fn restore_html_dom_chunk(
+    map: &PlaceholderMap,
+    after_translate_text: &str,
+) -> Result<String, String> {
+    let units = html_unit_descriptors(map)?;
+    let mut restored = Vec::new();
+    for unit in units {
+        let unit_text = extract_tagged_text(after_translate_text, &unit.tag).ok_or_else(|| {
+            format!(
+                "Translated HTML chunk is missing expected unit tag <{}>",
+                unit.tag
+            )
+        })?;
+        for entry in text_entries_for_unit(map, &unit.tag) {
+            extract_tagged_text(&unit_text, &entry.id).ok_or_else(|| {
+                format!(
+                    "Translated HTML unit <{}> is missing expected text node tag <{}>",
+                    unit.tag, entry.id
+                )
+            })?;
         }
-        update_stack(&tag, &mut stack);
-        index = if !tag.closing && matches!(tag.name.as_str(), "script" | "style") {
-            let next_index = skip_raw_text_element(text, &tag).unwrap_or(tag.end);
-            if stack.last().is_some_and(|name| name == &tag.name) {
-                stack.pop();
-            }
-            next_index
-        } else {
-            tag.end
-        };
+        restored.push(format!(
+            "<{}>{}</{}>",
+            unit.tag,
+            strip_text_placeholders(&unit_text),
+            unit.tag
+        ));
     }
-
-    segments
+    Ok(restored.join("\n"))
 }
 
-fn push_text_segment(
-    text: &str,
-    start: usize,
-    end: usize,
-    stack: &[String],
-    segments: &mut Vec<HtmlSegment>,
-) {
-    if start >= end || !is_translatable_context(stack) {
-        return;
-    }
-    let raw = &text[start..end];
-    if raw.trim().is_empty() {
-        return;
-    }
-    let core_start = start + leading_whitespace_len(raw);
-    let core_end = end - trailing_whitespace_len(raw);
-    if core_start < core_end {
-        segments.push(HtmlSegment {
-            kind: HtmlSegmentKind::Text,
-            start: core_start,
-            end: core_end,
-        });
-    }
-}
+fn html_text_replacements(chunks: &[RenderedChunk]) -> Result<BTreeMap<usize, String>, String> {
+    let mut collected = Vec::<(i64, usize, usize, String)>::new();
+    let mut order = 0_usize;
 
-fn push_attribute_segments(tag: &HtmlTag, stack: &[String], segments: &mut Vec<HtmlSegment>) {
-    if !is_translatable_context_for_start_tag(stack, &tag.name) {
-        return;
-    }
-    for attribute in parse_attributes(tag) {
-        if !TRANSLATABLE_ATTRIBUTES
-            .iter()
-            .any(|name| attribute.name.eq_ignore_ascii_case(name))
-        {
+    for chunk in chunks {
+        let map = super::parse_map(&chunk.map_json)?;
+        if map.block_ref.kind != HTML_DOM_CHUNK_KIND {
             continue;
         }
-        if attribute.value_start >= attribute.value_end {
-            continue;
-        }
-        let value = &tag.raw[attribute.value_start - tag.start..attribute.value_end - tag.start];
-        if value.trim().is_empty() {
-            continue;
-        }
-        let core_start = attribute.value_start + leading_whitespace_len(value);
-        let core_end = attribute.value_end - trailing_whitespace_len(value);
-        if core_start < core_end {
-            segments.push(HtmlSegment {
-                kind: HtmlSegmentKind::Attribute,
-                start: core_start,
-                end: core_end,
-            });
-        }
-    }
-}
-
-fn parse_tag_at(text: &str, start: usize) -> Option<HtmlTag> {
-    if text.get(start..)?.starts_with("<!--") {
-        let end = start + text[start..].find("-->")? + 3;
-        return Some(HtmlTag {
-            name: String::new(),
-            start,
-            end,
-            closing: false,
-            self_closing: true,
-            raw: text[start..end].to_string(),
-        });
-    }
-    if text.get(start..)?.starts_with("<![CDATA[") {
-        let end = start + text[start..].find("]]>")? + 3;
-        return Some(HtmlTag {
-            name: String::new(),
-            start,
-            end,
-            closing: false,
-            self_closing: true,
-            raw: text[start..end].to_string(),
-        });
-    }
-    if text.get(start..)?.starts_with("<!") || text.get(start..)?.starts_with("<?") {
-        let end = find_tag_end(text, start)?;
-        return Some(HtmlTag {
-            name: String::new(),
-            start,
-            end,
-            closing: false,
-            self_closing: true,
-            raw: text[start..end].to_string(),
-        });
-    }
-
-    let end = find_tag_end(text, start)?;
-    let raw = &text[start..end];
-    let mut cursor = 1_usize;
-    skip_ascii_whitespace(raw, &mut cursor);
-    let closing = raw[cursor..].starts_with('/');
-    if closing {
-        cursor += 1;
-        skip_ascii_whitespace(raw, &mut cursor);
-    }
-    let name_start = cursor;
-    while cursor < raw.len() {
-        let byte = raw.as_bytes()[cursor];
-        if byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>') {
-            break;
-        }
-        cursor += 1;
-    }
-    if name_start == cursor {
-        return Some(HtmlTag {
-            name: String::new(),
-            start,
-            end,
-            closing,
-            self_closing: true,
-            raw: raw.to_string(),
-        });
-    }
-    let name = raw[name_start..cursor].to_ascii_lowercase();
-    let self_closing =
-        raw[..raw.len().saturating_sub(1)].trim_end().ends_with('/') || is_void_element(&name);
-
-    Some(HtmlTag {
-        name,
-        start,
-        end,
-        closing,
-        self_closing,
-        raw: raw.to_string(),
-    })
-}
-
-fn find_tag_end(text: &str, start: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut index = start + 1;
-    let mut quote = None::<u8>;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if let Some(quote_byte) = quote {
-            if byte == quote_byte {
-                quote = None;
-            }
-        } else if byte == b'\'' || byte == b'"' {
-            quote = Some(byte);
-        } else if byte == b'>' {
-            return Some(index + 1);
-        }
-        index += 1;
-    }
-    None
-}
-
-fn update_stack(tag: &HtmlTag, stack: &mut Vec<String>) {
-    if tag.name.is_empty() {
-        return;
-    }
-    if tag.closing {
-        if let Some(position) = stack.iter().rposition(|name| name == &tag.name) {
-            stack.truncate(position);
-        }
-    } else if !tag.self_closing {
-        stack.push(tag.name.clone());
-    }
-}
-
-fn skip_raw_text_element(text: &str, tag: &HtmlTag) -> Option<usize> {
-    let close_pattern = format!("</{}", tag.name);
-    let lower_tail = text.get(tag.end..)?.to_ascii_lowercase();
-    let close_offset = lower_tail.find(&close_pattern)?;
-    let close_start = tag.end + close_offset;
-    parse_tag_at(text, close_start).map(|close_tag| close_tag.end)
-}
-
-fn is_translatable_context(stack: &[String]) -> bool {
-    if stack
-        .iter()
-        .any(|name| matches!(name.as_str(), "script" | "style" | "link" | "meta"))
-    {
-        return false;
-    }
-    if stack.iter().any(|name| name == "head") && !stack.iter().any(|name| name == "title") {
-        return false;
-    }
-    true
-}
-
-fn is_translatable_context_for_start_tag(stack: &[String], tag_name: &str) -> bool {
-    if matches!(tag_name, "script" | "style" | "link" | "meta") {
-        return false;
-    }
-    is_translatable_context(stack)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HtmlAttribute {
-    name: String,
-    value_start: usize,
-    value_end: usize,
-}
-
-fn parse_attributes(tag: &HtmlTag) -> Vec<HtmlAttribute> {
-    let raw = tag.raw.as_str();
-    if tag.closing || raw.len() < 2 {
-        return Vec::new();
-    }
-
-    let mut cursor = 1_usize;
-    skip_ascii_whitespace(raw, &mut cursor);
-    while cursor < raw.len() {
-        let byte = raw.as_bytes()[cursor];
-        if byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>') {
-            break;
-        }
-        cursor += 1;
-    }
-
-    let mut attributes = Vec::new();
-    while cursor < raw.len() {
-        skip_ascii_whitespace(raw, &mut cursor);
-        if cursor >= raw.len() || matches!(raw.as_bytes()[cursor], b'/' | b'>') {
-            break;
-        }
-
-        let name_start = cursor;
-        while cursor < raw.len() {
-            let byte = raw.as_bytes()[cursor];
-            if byte.is_ascii_whitespace() || matches!(byte, b'=' | b'/' | b'>') {
-                break;
-            }
-            cursor += 1;
-        }
-        if name_start == cursor {
-            cursor += 1;
-            continue;
-        }
-        let name = raw[name_start..cursor].to_ascii_lowercase();
-        skip_ascii_whitespace(raw, &mut cursor);
-        if cursor >= raw.len() || raw.as_bytes()[cursor] != b'=' {
-            continue;
-        }
-        cursor += 1;
-        skip_ascii_whitespace(raw, &mut cursor);
-        if cursor >= raw.len() {
-            break;
-        }
-
-        let (value_start, value_end) = if matches!(raw.as_bytes()[cursor], b'\'' | b'"') {
-            let quote = raw.as_bytes()[cursor];
-            cursor += 1;
-            let value_start = cursor;
-            while cursor < raw.len() && raw.as_bytes()[cursor] != quote {
-                cursor += 1;
-            }
-            let value_end = cursor;
-            if cursor < raw.len() {
-                cursor += 1;
-            }
-            (value_start, value_end)
-        } else {
-            let value_start = cursor;
-            while cursor < raw.len() {
-                let byte = raw.as_bytes()[cursor];
-                if byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>') {
-                    break;
-                }
-                cursor += 1;
-            }
-            (value_start, cursor)
-        };
-
-        attributes.push(HtmlAttribute {
-            name,
-            value_start: tag.start + value_start,
-            value_end: tag.start + value_end,
-        });
-    }
-    attributes
-}
-
-fn html_text_groups(text: &str, segments: &[HtmlSegment], token_limit: i64) -> Vec<(usize, usize)> {
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    for segment in segments
-        .iter()
-        .filter(|segment| matches!(segment.kind, HtmlSegmentKind::Text))
-    {
-        let (start, end) = expand_inline_range(text, segment.start, segment.end);
-        if let Some(last) = groups.last_mut() {
-            if can_merge_text_ranges(text, last.1, start) {
-                last.1 = end;
+        let units = html_unit_descriptors(&map)?;
+        for unit in units {
+            let unit_text = extract_tagged_text(&chunk.after_translate_text, &unit.tag)
+                .ok_or_else(|| {
+                    format!(
+                        "Translated HTML chunk is missing expected unit tag <{}>",
+                        unit.tag
+                    )
+                })?;
+            let entries = text_entries_for_unit(&map, &unit.tag);
+            if entries.is_empty() {
+                collected.push((
+                    chunk.sequence,
+                    order,
+                    unit.node_index,
+                    strip_text_placeholders(&unit_text),
+                ));
+                order += 1;
                 continue;
             }
+            for entry in entries {
+                let node_index =
+                    text_node_index_from_native_ref(entry.native_ref.as_deref().unwrap_or(""))
+                        .unwrap_or(unit.node_index);
+                let text = extract_tagged_text(&unit_text, &entry.id).ok_or_else(|| {
+                    format!(
+                        "Translated HTML unit <{}> is missing expected text node tag <{}>",
+                        unit.tag, entry.id
+                    )
+                })?;
+                collected.push((chunk.sequence, order, node_index, text));
+                order += 1;
+            }
         }
-        groups.push((start, end));
     }
-    groups
-        .into_iter()
-        .flat_map(|(start, end)| split_text_range(text, start, end, token_limit))
+
+    collected.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let mut replacements = BTreeMap::<usize, String>::new();
+    for (_, _, node_index, text) in collected {
+        replacements
+            .entry(node_index)
+            .and_modify(|existing| existing.push_str(&text))
+            .or_insert(text);
+    }
+    Ok(replacements)
+}
+
+fn html_attribute_replacements(
+    chunks: &[RenderedChunk],
+) -> Result<Vec<HtmlAttributeReplacement>, String> {
+    let mut replacements = Vec::new();
+    for chunk in chunks {
+        let map = super::parse_map(&chunk.map_json)?;
+        if map.block_ref.kind != HTML_ATTRIBUTE_KIND {
+            continue;
+        }
+        let Some(pointer) = map.block_ref.pointer.as_deref() else {
+            return Err("HTML attribute chunk is missing pointer".into());
+        };
+        let Some((node_index, attr_name)) = parse_attribute_pointer(pointer) else {
+            return Err(format!("Invalid HTML attribute pointer `{pointer}`"));
+        };
+        replacements.push(HtmlAttributeReplacement {
+            node_index,
+            attr_name,
+            text: chunk.translated_text.clone(),
+        });
+    }
+    Ok(replacements)
+}
+
+fn html_unit_descriptors(map: &PlaceholderMap) -> Result<Vec<HtmlUnitDescriptor>, String> {
+    let units = map
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == HTML_TEXT_BLOCK_KIND)
+        .map(|entry| {
+            let node_index = entry
+                .native_ref
+                .as_deref()
+                .and_then(node_index_from_native_ref)
+                .ok_or_else(|| format!("HTML unit {} is missing node reference", entry.id))?;
+            Ok(HtmlUnitDescriptor {
+                tag: entry.id.clone(),
+                node_index,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if units.is_empty() {
+        return Err("HTML DOM chunk has no text block entries".into());
+    }
+    Ok(units)
+}
+
+fn text_entries_for_unit<'a>(map: &'a PlaceholderMap, unit_tag: &str) -> Vec<&'a PlaceholderEntry> {
+    map.entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == HTML_TEXT_NODE_KIND
+                && entry
+                    .native_ref
+                    .as_deref()
+                    .is_some_and(|native_ref| native_ref.starts_with(&format!("unit:{unit_tag};")))
+        })
         .collect()
 }
 
-fn expand_inline_range(text: &str, mut start: usize, mut end: usize) -> (usize, usize) {
-    loop {
-        let Some(tag_start) = immediately_preceding_tag_start(text, start) else {
-            break;
-        };
-        let Some(tag) = parse_tag_at(text, tag_start) else {
-            break;
-        };
-        if tag.end != start || tag.closing || !is_placeholder_inline_tag(&tag.name) {
-            break;
-        }
-        start = tag.start;
+fn apply_text_replacements(
+    document: &mut Html,
+    replacements: BTreeMap<usize, String>,
+) -> Result<(), String> {
+    if replacements.is_empty() {
+        return Ok(());
     }
-
-    loop {
-        if !text.get(end..).is_some_and(|rest| rest.starts_with("</")) {
-            break;
-        }
-        let Some(tag) = parse_tag_at(text, end) else {
-            break;
+    let node_ids = document
+        .tree
+        .nodes()
+        .map(|node| node.id())
+        .collect::<Vec<_>>();
+    for (node_index, replacement) in replacements {
+        let Some(node_id) = node_ids.get(node_index).copied() else {
+            return Err(format!("HTML text node index {node_index} is out of range"));
         };
-        if !tag.closing || !is_placeholder_inline_tag(&tag.name) {
-            break;
-        }
-        end = tag.end;
+        let mut node = document
+            .tree
+            .get_mut(node_id)
+            .ok_or_else(|| format!("Unable to resolve HTML text node {node_index}"))?;
+        let Node::Text(text) = node.value() else {
+            return Err(format!("HTML node {node_index} is not a text node"));
+        };
+        let original = text.text.to_string();
+        let (prefix, _, suffix) = split_core(&original).unwrap_or(("", "", ""));
+        text.text = StrTendril::from_slice(&format!("{prefix}{replacement}{suffix}"));
     }
-
-    (start, end)
+    Ok(())
 }
 
-fn immediately_preceding_tag_start(text: &str, end: usize) -> Option<usize> {
-    let before = text.get(..end)?;
-    let tag_start = before.rfind('<')?;
-    let tag_end = before.rfind('>');
-    if tag_end.is_some_and(|tag_end| tag_end > tag_start) {
+fn apply_attribute_replacements(
+    document: &mut Html,
+    replacements: Vec<HtmlAttributeReplacement>,
+) -> Result<(), String> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let node_ids = document
+        .tree
+        .nodes()
+        .map(|node| node.id())
+        .collect::<Vec<_>>();
+    for replacement in replacements {
+        let Some(node_id) = node_ids.get(replacement.node_index).copied() else {
+            return Err(format!(
+                "HTML attribute node index {} is out of range",
+                replacement.node_index
+            ));
+        };
+        let mut node = document.tree.get_mut(node_id).ok_or_else(|| {
+            format!(
+                "Unable to resolve HTML attribute node {}",
+                replacement.node_index
+            )
+        })?;
+        let Node::Element(element) = node.value() else {
+            return Err(format!(
+                "HTML node {} is not an element node",
+                replacement.node_index
+            ));
+        };
+        let Some((_, value)) = element
+            .attrs
+            .iter_mut()
+            .find(|(name, _)| name.local.as_ref() == replacement.attr_name.as_str())
+        else {
+            return Err(format!(
+                "HTML element node {} is missing `{}` attribute",
+                replacement.node_index, replacement.attr_name
+            ));
+        };
+        let original = value.to_string();
+        let (prefix, _, suffix) = split_core(&original).unwrap_or(("", "", ""));
+        *value = StrTendril::from_slice(&format!("{prefix}{}{suffix}", replacement.text));
+    }
+    Ok(())
+}
+
+fn node_index_from_native_ref(native_ref: &str) -> Option<usize> {
+    native_ref
+        .split(';')
+        .find_map(|part| part.strip_prefix("node:"))
+        .and_then(|index| index.parse::<usize>().ok())
+}
+
+fn text_node_index_from_native_ref(native_ref: &str) -> Option<usize> {
+    node_index_from_native_ref(native_ref)
+}
+
+fn parse_attribute_pointer(pointer: &str) -> Option<(usize, String)> {
+    let (node, attr) = pointer.split_once(";attr:")?;
+    let node_index = node.strip_prefix("node:")?.parse::<usize>().ok()?;
+    Some((node_index, attr.to_string()))
+}
+
+fn extract_tagged_text(text: &str, id: &str) -> Option<String> {
+    let pattern = Regex::new(&format!(
+        r"(?s)<{}>(.*?)</{}>",
+        regex::escape(id),
+        regex::escape(id)
+    ))
+    .ok()?;
+    pattern
+        .captures(text)
+        .and_then(|captures| captures.get(1).map(|value| value.as_str().to_string()))
+}
+
+fn strip_text_placeholders(text: &str) -> String {
+    let pattern = Regex::new(r"</?t\d+>").expect("static HTML text placeholder strip regex");
+    pattern.replace_all(text, "").to_string()
+}
+
+fn trimmed_core(text: &str) -> Option<&str> {
+    let (_, core, _) = split_core(text)?;
+    Some(core)
+}
+
+fn split_core(text: &str) -> Option<(&str, &str, &str)> {
+    if text.trim().is_empty() {
         return None;
     }
-    Some(tag_start)
-}
-
-fn can_merge_text_ranges(text: &str, previous_end: usize, next_start: usize) -> bool {
-    if previous_end > next_start {
-        return false;
+    let core_start = leading_whitespace_len(text);
+    let core_end = text.len() - trailing_whitespace_len(text);
+    if core_start >= core_end {
+        return None;
     }
-    let mut cursor = previous_end;
-    while cursor < next_start {
-        let rest = &text[cursor..next_start];
-        if rest.starts_with(char::is_whitespace) {
-            let character = rest.chars().next().expect("non-empty rest");
-            cursor += character.len_utf8();
-            continue;
-        }
-        if !rest.starts_with('<') {
-            return false;
-        }
-        let Some(tag) = parse_tag_at(text, cursor) else {
-            return false;
-        };
-        if tag.end > next_start || tag.self_closing || !is_placeholder_inline_tag(&tag.name) {
-            return false;
-        }
-        cursor = tag.end;
-    }
-    true
-}
-
-fn split_text_range(text: &str, start: usize, end: usize, token_limit: i64) -> Vec<(usize, usize)> {
-    let Some(raw) = text.get(start..end) else {
-        return Vec::new();
-    };
-    if raw.contains('<') {
-        return vec![(start, end)];
-    }
-    let chunked = chunk_raw_block_refs(
-        vec![RawBlockRef::new(raw.to_string(), true, ())],
-        token_limit_usize(token_limit),
-    );
-    if chunked.len() <= 1 {
-        return vec![(start, end)];
-    }
-    let mut ranges = Vec::new();
-    for chunk in chunked {
-        if chunk.is_empty() {
-            continue;
-        }
-        let chunk_start = chunk
-            .first()
-            .map(|block| start + block.source_start)
-            .unwrap_or(start);
-        let chunk_end = chunk
-            .last()
-            .map(|block| start + block.source_end)
-            .unwrap_or(end);
-        if chunk_start < chunk_end {
-            ranges.push((chunk_start, chunk_end));
-        }
-    }
-    ranges
-}
-
-fn is_placeholder_inline_tag(name: &str) -> bool {
-    matches!(
-        name,
-        "a" | "abbr"
-            | "b"
-            | "cite"
-            | "code"
-            | "data"
-            | "dfn"
-            | "em"
-            | "i"
-            | "kbd"
-            | "mark"
-            | "q"
-            | "s"
-            | "samp"
-            | "small"
-            | "span"
-            | "strong"
-            | "sub"
-            | "sup"
-            | "time"
-            | "u"
-            | "var"
-    )
-}
-
-fn apply_html_patches(text: &str, patches: &[HtmlPatch]) -> Result<String, String> {
-    let mut patches = patches.to_vec();
-    patches.sort_by(|left, right| left.start.cmp(&right.start).then(left.end.cmp(&right.end)));
-    let mut occupied = HashSet::new();
-    let mut previous_end = 0_usize;
-    for patch in &patches {
-        if patch.start >= patch.end || patch.end > text.len() {
-            return Err(format!(
-                "Invalid HTML replacement range {}:{}",
-                patch.start, patch.end
-            ));
-        }
-        if !text.is_char_boundary(patch.start) || !text.is_char_boundary(patch.end) {
-            return Err(format!(
-                "HTML replacement range is not on UTF-8 boundaries {}:{}",
-                patch.start, patch.end
-            ));
-        }
-        if patch.start < previous_end {
-            return Err("Overlapping HTML replacement ranges".into());
-        }
-        if !occupied.insert((patch.start, patch.end)) {
-            return Err("Duplicate HTML replacement range".into());
-        }
-        previous_end = patch.end;
-    }
-
-    let mut rendered = text.to_string();
-    for patch in patches.iter().rev() {
-        rendered.replace_range(patch.start..patch.end, &patch.replacement);
-    }
-    Ok(rendered)
-}
-
-fn parse_range_pointer(pointer: &str) -> Option<(usize, usize)> {
-    let rest = pointer.strip_prefix("range:")?;
-    let (start, end) = rest.split_once(':')?;
-    let start = start.parse::<usize>().ok()?;
-    let end = end.parse::<usize>().ok()?;
-    if start < end {
-        Some((start, end))
-    } else {
-        None
-    }
-}
-
-fn path_matches(map_path: Option<&str>, target_path: Option<&str>) -> bool {
-    match target_path {
-        Some(target) => map_path
-            .map(normalize_zip_path)
-            .is_some_and(|path| path == target),
-        None => map_path.is_none(),
-    }
-}
-
-fn normalize_zip_path(path: &str) -> String {
-    path.replace('\\', "/")
+    Some((
+        &text[..core_start],
+        &text[core_start..core_end],
+        &text[core_end..],
+    ))
 }
 
 fn leading_whitespace_len(text: &str) -> usize {
@@ -730,50 +577,27 @@ fn trailing_whitespace_len(text: &str) -> usize {
         .unwrap_or(text.len())
 }
 
-fn skip_ascii_whitespace(text: &str, cursor: &mut usize) {
-    while *cursor < text.len() && text.as_bytes()[*cursor].is_ascii_whitespace() {
-        *cursor += 1;
-    }
-}
-
-fn is_void_element(name: &str) -> bool {
-    matches!(
-        name,
-        "area"
-            | "base"
-            | "br"
-            | "col"
-            | "embed"
-            | "hr"
-            | "img"
-            | "input"
-            | "link"
-            | "meta"
-            | "param"
-            | "source"
-            | "track"
-            | "wbr"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_html_writes_placeholders_to_source_text_and_preserves_preprocessed_text() {
+    fn parse_html_uses_dom_text_node_placeholders() {
         let text = "Before <strong>Hello</strong> after";
-        let chunks = parse_html_text(text, DocumentFormat::Html, ContentFormat::Html, None, 800)
-            .expect("parse html");
+        let chunks = parse_html_text(text, 800).expect("parse html");
+        let sources = chunks
+            .iter()
+            .map(|chunk| chunk.source_text.as_str())
+            .collect::<Vec<_>>();
+        let source = sources.join("\n");
 
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].preprocessed_text, text);
-        assert_eq!(chunks[0].source_text, "Before <t1>Hello</t1> after");
-        assert_ne!(chunks[0].source_text, chunks[0].preprocessed_text);
+        assert!(source.contains("<it0><t1>Before</t1></it0>"));
+        assert!(source.contains(">Hello<"));
+        assert!(source.contains(">after<"));
     }
 
     #[test]
-    fn skips_non_visible_head_script_style_link_and_meta_text() {
+    fn skips_non_visible_head_script_style_link_meta_and_template_text() {
         let text = concat!(
             "<html><head>",
             "<title>Visible title</title>",
@@ -781,11 +605,10 @@ mod tests {
             "<link title=\"Skip link\" href=\"x.css\">",
             "<style>.x{content:'Skip style'}</style>",
             "<script>const text = 'Skip script';</script>",
-            "<template>Skip template? no translate because head</template>",
-            "</head><body><p>Body text</p></body></html>"
+            "<template>Skip template</template>",
+            "</head><body><p>Body text</p><template>Hidden body template</template></body></html>"
         );
-        let chunks = parse_html_text(text, DocumentFormat::Html, ContentFormat::Html, None, 800)
-            .expect("parse html");
+        let chunks = parse_html_text(text, 800).expect("parse html");
         let sources = chunks
             .iter()
             .map(|chunk| chunk.source_text.as_str())
@@ -799,6 +622,12 @@ mod tests {
         assert!(!sources.iter().any(|source| source.contains("Skip link")));
         assert!(!sources.iter().any(|source| source.contains("Skip style")));
         assert!(!sources.iter().any(|source| source.contains("Skip script")));
+        assert!(!sources
+            .iter()
+            .any(|source| source.contains("Skip template")));
+        assert!(!sources
+            .iter()
+            .any(|source| source.contains("Hidden body template")));
     }
 
     #[test]
@@ -808,21 +637,19 @@ mod tests {
             "<script>if (a < b) document.write('<span>Skip script</span>');</script>",
             "<p>Translate me</p>"
         );
-        let chunks = parse_html_text(text, DocumentFormat::Html, ContentFormat::Html, None, 800)
-            .expect("parse html");
+        let chunks = parse_html_text(text, 800).expect("parse html");
         let sources = chunks
             .iter()
             .map(|chunk| chunk.source_text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(sources, vec!["Translate me"]);
+        assert_eq!(sources, vec!["<it0><t1>Translate me</t1></it0>"]);
     }
 
     #[test]
-    fn extracts_and_renders_translatable_attributes() {
-        let text = r#"<input placeholder='Search here' title="Search title"><img alt=Cover>"#;
-        let chunks = parse_html_text(text, DocumentFormat::Html, ContentFormat::Html, None, 800)
-            .expect("parse html");
+    fn extracts_and_renders_translatable_attributes_with_dom_serialization() {
+        let text = r#"<input placeholder=' Search here ' title="Search title"><img alt=Cover>"#;
+        let chunks = parse_html_text(text, 800).expect("parse html");
         let rendered_chunks = chunks
             .iter()
             .map(|chunk| {
@@ -836,89 +663,71 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let rendered =
-            render_html_document(text, &rendered_chunks, None).expect("render html document");
+        let rendered = render_html_document(text, &rendered_chunks).expect("render html document");
 
-        assert_eq!(
-            rendered,
-            r#"<input placeholder='Buscar aqui' title="Titulo de busca"><img alt=Capa>"#
-        );
+        assert!(rendered.contains(r#"placeholder=" Buscar aqui ""#));
+        assert!(rendered.contains(r#"title="Titulo de busca""#));
+        assert!(rendered.contains(r#"alt="Capa""#));
     }
 
     #[test]
-    fn patches_only_targeted_html_ranges_without_serializing_document() {
+    fn dom_render_preserves_nested_structure_and_element_attributes() {
         let text = concat!(
-            "<!--keep--><div>{{ name }}</div>",
+            r#"<div id="app" class="layout" style="color:red" data-v-x="1">"#,
             "<p>Hello <strong>World</strong></p>",
+            "</div>",
             "<script>const value = 'World';</script>"
         );
-        let chunks = parse_html_text(text, DocumentFormat::Html, ContentFormat::Html, None, 800)
-            .expect("parse html");
+        let chunks = parse_html_text(text, 800).expect("parse html");
         let rendered_chunks = chunks
             .iter()
             .map(|chunk| {
-                let replacement = match chunk.source_text.as_str() {
-                    "{{ name }}" => "{{ name }}",
-                    "Hello <t1>World</t1>" => "Hola <t1>Mundo</t1>",
-                    other => other,
-                };
-                rendered_chunk(chunk, replacement)
+                let replacement = chunk
+                    .source_text
+                    .replace("Hello", "Hola")
+                    .replace("World", "Mundo");
+                rendered_chunk(chunk, &replacement)
             })
             .collect::<Vec<_>>();
 
-        let rendered =
-            render_html_document(text, &rendered_chunks, None).expect("render html document");
+        let rendered = render_html_document(text, &rendered_chunks).expect("render html document");
 
-        assert!(rendered.contains("<!--keep--><div>{{ name }}</div>"));
+        assert!(
+            rendered.contains(r#"<div class="layout" data-v-x="1" id="app" style="color:red">"#)
+        );
         assert!(rendered.contains("<p>Hola <strong>Mundo</strong></p>"));
         assert!(rendered.contains("<script>const value = 'World';</script>"));
     }
 
     #[test]
-    fn legacy_text_block_chunks_still_concatenate_for_old_tasks() {
-        let chunks = vec![
-            legacy_rendered_chunk(1, 20, "second"),
-            legacy_rendered_chunk(0, 10, "first"),
-        ];
+    fn dom_render_normalizes_broken_html_without_losing_translation() {
+        let text = "<p>Hello <b>world";
+        let chunks = parse_html_text(text, 800).expect("parse html");
+        let rendered_chunks = chunks
+            .iter()
+            .map(|chunk| {
+                let replacement = chunk
+                    .source_text
+                    .replace("Hello", "Hola")
+                    .replace("world", "mundo");
+                rendered_chunk(chunk, &replacement)
+            })
+            .collect::<Vec<_>>();
 
-        let rendered = render_html_document("original", &chunks, None).expect("render html");
+        let rendered = render_html_document(text, &rendered_chunks).expect("render html document");
 
-        assert_eq!(rendered, "firstsecond");
+        assert!(rendered.contains("<p>Hola <b>mundo</b></p>"));
     }
 
-    fn rendered_chunk(chunk: &ParsedChunk, translated_text: &str) -> RenderedChunk {
+    fn rendered_chunk(chunk: &ParsedChunk, after_translate_text: &str) -> RenderedChunk {
         RenderedChunk {
             sequence: chunk.sequence,
             source_text: chunk.source_text.clone(),
-            after_translate_text: translated_text.into(),
-            translated_text: super::super::placeholders::restore_from_json(
-                &chunk.map_json,
-                translated_text,
-            )
-            .expect("restore html chunk"),
+            after_translate_text: after_translate_text.into(),
+            translated_text: HtmlParser
+                .restore_chunk(&chunk.map_json, after_translate_text)
+                .expect("restore html chunk"),
             map_json: chunk.map_json.clone(),
-        }
-    }
-
-    fn legacy_rendered_chunk(index: usize, sequence: i64, translated_text: &str) -> RenderedChunk {
-        let map = super::super::types::PlaceholderMap::empty(
-            DocumentFormat::Html,
-            ContentFormat::Html,
-            BlockRef {
-                kind: HTML_LEGACY_TEXT_BLOCK_KIND.into(),
-                path: None,
-                index: Some(index),
-                pointer: None,
-                prefix: String::new(),
-                suffix: String::new(),
-            },
-        );
-        RenderedChunk {
-            sequence,
-            source_text: String::new(),
-            after_translate_text: translated_text.into(),
-            translated_text: translated_text.into(),
-            map_json: map.to_json().expect("map json"),
         }
     }
 }

@@ -13,6 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+aho-corasick = "1.1"
 calamine = "0.35.0"
 comrak = { version = "0.28", default-features = false }
 docx-rs = { version = "0.4.20", default-features = false }

@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -508,6 +510,99 @@ enum AutoGlossaryChunkOutcome {
 enum TaskGlossaryPreparation {
     Ready(Vec<GlossaryEntry>),
     Interrupted,
+}
+
+#[derive(Debug, Clone)]
+struct TaskGlossaryMatcher {
+    entries: Vec<GlossaryEntry>,
+    automaton: Option<AhoCorasick>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GlossaryMatchCandidate {
+    entry_index: usize,
+    start: usize,
+    end: usize,
+    term_len: usize,
+}
+
+impl TaskGlossaryMatcher {
+    fn new(entries: Vec<GlossaryEntry>) -> Result<Self, String> {
+        if entries.is_empty() {
+            return Ok(Self {
+                entries,
+                automaton: None,
+            });
+        }
+
+        let patterns = entries
+            .iter()
+            .map(|entry| entry.src.as_str())
+            .collect::<Vec<_>>();
+        let automaton = AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            // find_overlapping_iter only supports MatchKind::Standard. Do not switch this
+            // to LeftmostFirst or LeftmostLongest, because that would panic at runtime.
+            .match_kind(MatchKind::Standard)
+            .build(patterns)
+            .map_err(|error| format!("Unable to build glossary matcher: {error}"))?;
+
+        Ok(Self {
+            entries,
+            automaton: Some(automaton),
+        })
+    }
+
+    fn match_entries(&self, chunk_text: &str) -> Vec<GlossaryEntry> {
+        let Some(automaton) = self.automaton.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut candidates = automaton
+            .find_overlapping_iter(chunk_text)
+            .filter_map(|matched| {
+                let entry_index = matched.pattern().as_usize();
+                let entry = self.entries.get(entry_index)?;
+                let start = matched.start();
+                let end = matched.end();
+                if !valid_glossary_match_boundary(chunk_text, start, end, entry) {
+                    return None;
+                }
+                Some(GlossaryMatchCandidate {
+                    entry_index,
+                    start,
+                    end,
+                    term_len: entry.src.chars().count(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        candidates.sort_by(|left, right| {
+            right
+                .term_len
+                .cmp(&left.term_len)
+                .then_with(|| left.start.cmp(&right.start))
+                .then_with(|| left.entry_index.cmp(&right.entry_index))
+        });
+
+        let mut matched_indexes = BTreeSet::new();
+        let mut accepted_spans = Vec::new();
+        for candidate in candidates {
+            if accepted_spans
+                .iter()
+                .any(|(start, end)| spans_overlap(candidate.start, candidate.end, *start, *end))
+            {
+                continue;
+            }
+            accepted_spans.push((candidate.start, candidate.end));
+            matched_indexes.insert(candidate.entry_index);
+        }
+
+        matched_indexes
+            .into_iter()
+            .filter_map(|index| self.entries.get(index).cloned())
+            .collect()
+    }
 }
 
 enum AutoGlossaryGeneration {
@@ -2245,7 +2340,7 @@ pub async fn run_translation_task(
     }
 
     let glossary_chunks = glossary_source_chunks(&inp_pool).await?;
-    let glossary_entries = match prepare_task_glossary(
+    let glossary_matcher = match prepare_task_glossary(
         &app,
         &provider_pool,
         &glossary_config_pool,
@@ -2261,7 +2356,7 @@ pub async fn run_translation_task(
     )
     .await?
     {
-        TaskGlossaryPreparation::Ready(entries) => Arc::new(entries),
+        TaskGlossaryPreparation::Ready(entries) => Arc::new(TaskGlossaryMatcher::new(entries)?),
         TaskGlossaryPreparation::Interrupted => {
             inp_pool.close().await;
             return Ok(());
@@ -2323,7 +2418,7 @@ pub async fn run_translation_task(
             let target_language = target_language.clone();
             let assistant_prompt = assistant_prompt.clone();
             let assistant_custom_parameters = assistant_custom_parameters.clone();
-            let glossary_entries = glossary_entries.clone();
+            let glossary_matcher = glossary_matcher.clone();
             async move {
                 if interrupted.is_interrupted() {
                     return;
@@ -2340,7 +2435,7 @@ pub async fn run_translation_task(
                     target_language,
                     assistant_prompt,
                     assistant_custom_parameters,
-                    glossary_entries,
+                    glossary_matcher,
                     document_format,
                     content_format,
                     chunk,
@@ -2752,7 +2847,7 @@ async fn translate_chunk(
     target_language: String,
     assistant_prompt: Option<String>,
     assistant_custom_parameters: Value,
-    glossary_entries: Arc<Vec<GlossaryEntry>>,
+    glossary_matcher: Arc<TaskGlossaryMatcher>,
     document_format: DocumentFormat,
     content_format: ContentFormat,
     chunk: ChunkRecord,
@@ -2776,7 +2871,7 @@ async fn translate_chunk(
                 document_format,
                 content_format,
             },
-            glossary: matching_glossary_entries(&chunk.source_text, &glossary_entries),
+            glossary: glossary_matcher.match_entries(&chunk.source_text),
         });
         let messages = match prompt {
             Ok(TranslationPromptBuildResult::Passthrough { text }) => {
@@ -3689,15 +3784,45 @@ fn content_format_from_source_path(path: &str) -> Result<ContentFormat, String> 
     document_parsing::content_format_from_path(Path::new(path))
 }
 
-fn matching_glossary_entries(
+fn valid_glossary_match_boundary(
     chunk_text: &str,
-    glossary_entries: &[GlossaryEntry],
-) -> Vec<GlossaryEntry> {
-    glossary_entries
-        .iter()
-        .filter(|entry| chunk_text.contains(&entry.src))
-        .cloned()
-        .collect()
+    start: usize,
+    end: usize,
+    entry: &GlossaryEntry,
+) -> bool {
+    if !chunk_text.is_char_boundary(start) || !chunk_text.is_char_boundary(end) {
+        return false;
+    }
+
+    let needs_start_boundary = entry.src.chars().next().is_some_and(is_ascii_word_char);
+    let needs_end_boundary = entry
+        .src
+        .chars()
+        .next_back()
+        .is_some_and(is_ascii_word_char);
+
+    if needs_start_boundary {
+        let char_before = chunk_text[..start].chars().next_back();
+        if char_before.is_some_and(is_ascii_word_char) {
+            return false;
+        }
+    }
+    if needs_end_boundary {
+        let char_after = chunk_text[end..].chars().next();
+        if char_after.is_some_and(is_ascii_word_char) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_ascii_word_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+fn spans_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+    left_start < right_end && right_start < left_end
 }
 
 #[derive(Debug, Clone)]
@@ -4260,36 +4385,113 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn matching_glossary_entries_only_returns_terms_in_current_chunk() {
-        let entries = vec![
-            GlossaryEntry {
-                src: "Apple".into(),
-                dst: "Pingguo".into(),
-            },
-            GlossaryEntry {
-                src: "animation".into(),
-                dst: "Donghua".into(),
-            },
-            GlossaryEntry {
-                src: "banana".into(),
-                dst: "Xiangjiao".into(),
-            },
-        ];
+    fn test_glossary_entry(src: &str, dst: &str) -> GlossaryEntry {
+        GlossaryEntry {
+            src: src.into(),
+            dst: dst.into(),
+        }
+    }
 
-        let matched = matching_glossary_entries("Apple studies animation.", &entries);
+    fn test_glossary_matcher(entries: Vec<GlossaryEntry>) -> TaskGlossaryMatcher {
+        TaskGlossaryMatcher::new(entries).expect("glossary matcher")
+    }
+
+    #[test]
+    fn glossary_matcher_only_returns_terms_in_current_chunk() {
+        let matcher = test_glossary_matcher(vec![
+            test_glossary_entry("Apple", "Pingguo"),
+            test_glossary_entry("animation", "Donghua"),
+            test_glossary_entry("banana", "Xiangjiao"),
+        ]);
+
+        let matched = matcher.match_entries("Apple studies animation.");
 
         assert_eq!(
             matched,
             vec![
-                GlossaryEntry {
-                    src: "Apple".into(),
-                    dst: "Pingguo".into(),
-                },
-                GlossaryEntry {
-                    src: "animation".into(),
-                    dst: "Donghua".into(),
-                }
+                test_glossary_entry("Apple", "Pingguo"),
+                test_glossary_entry("animation", "Donghua"),
+            ]
+        );
+    }
+
+    #[test]
+    fn glossary_matcher_matches_ascii_case_insensitively() {
+        let matcher = test_glossary_matcher(vec![test_glossary_entry("api", "API")]);
+
+        assert_eq!(
+            matcher.match_entries("The API gateway calls an Api endpoint."),
+            vec![test_glossary_entry("api", "API")]
+        );
+    }
+
+    #[test]
+    fn glossary_matcher_enforces_ascii_word_boundaries() {
+        let matcher = test_glossary_matcher(vec![test_glossary_entry("car", "车")]);
+
+        assert!(matcher.match_entries("cartoon").is_empty());
+        assert!(matcher.match_entries("race_car").is_empty());
+        assert!(matcher.match_entries("car2").is_empty());
+        assert_eq!(
+            matcher.match_entries("car. (car)"),
+            vec![test_glossary_entry("car", "车")]
+        );
+    }
+
+    #[test]
+    fn glossary_matcher_prefers_longest_overlapping_term() {
+        let matcher = test_glossary_matcher(vec![
+            test_glossary_entry("machine", "机器"),
+            test_glossary_entry("machine learning", "机器学习"),
+        ]);
+
+        assert_eq!(
+            matcher.match_entries("machine learning"),
+            vec![test_glossary_entry("machine learning", "机器学习")]
+        );
+        assert_eq!(
+            matcher.match_entries("machine learning uses a machine."),
+            vec![
+                test_glossary_entry("machine", "机器"),
+                test_glossary_entry("machine learning", "机器学习"),
+            ]
+        );
+    }
+
+    #[test]
+    fn glossary_matcher_dedupes_repeated_terms() {
+        let matcher = test_glossary_matcher(vec![test_glossary_entry("Apple", "苹果")]);
+
+        assert_eq!(
+            matcher.match_entries("Apple talks to apple about APPLE."),
+            vec![test_glossary_entry("Apple", "苹果")]
+        );
+    }
+
+    #[test]
+    fn glossary_matcher_does_not_apply_ascii_boundaries_to_cjk_terms() {
+        let matcher = test_glossary_matcher(vec![test_glossary_entry("猫", "cat")]);
+
+        assert_eq!(
+            matcher.match_entries("小猫咪"),
+            vec![test_glossary_entry("猫", "cat")]
+        );
+    }
+
+    #[test]
+    fn glossary_matcher_outputs_original_glossary_order() {
+        let matcher = test_glossary_matcher(vec![
+            test_glossary_entry("banana", "香蕉"),
+            test_glossary_entry("Apple", "苹果"),
+            test_glossary_entry("animation", "动画"),
+        ]);
+
+        assert_eq!(
+            matcher.match_entries("animation follows Apple and banana."),
+            vec![
+                test_glossary_entry("banana", "香蕉"),
+                test_glossary_entry("Apple", "苹果"),
+                test_glossary_entry("animation", "动画"),
             ]
         );
     }

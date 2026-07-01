@@ -19,7 +19,9 @@ docx-rs = { version = "0.4.20", default-features = false }
 futures-util = "0.3"
 fontdb = "0.23"
 jsonwebtoken = "9"
+lib-epub = { version = "0.3.1", features = ["builder", "content-builder"] }
 lrc = "0.1.8"
+markup5ever_rcdom = "0.39.0"
 pdf_oxide = { version = "0.3", default-features = false }
 quick-xml = "0.36"
 regex = "1"
@@ -36,4 +38,5 @@ tiktoken-rs = "0.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
 unicode-segmentation = "1"
 url = "2"
+xml5ever = "0.39.0"
 zip = { version = "2", default-features = false, features = ["deflate"] }

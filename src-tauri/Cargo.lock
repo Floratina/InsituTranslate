@@ -2642,7 +2642,9 @@ dependencies = [
  "fontdb",
  "futures-util",
  "jsonwebtoken",
+ "lib-epub",
  "lrc",
+ "markup5ever_rcdom",
  "pdf_oxide",
  "quick-xml 0.36.2",
  "regex 1.12.4",
@@ -2660,6 +2662,7 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "url",
+ "xml5ever",
  "zip 2.4.2",
 ]
 
@@ -2933,6 +2936,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "lib-epub"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e23438b5d8eb851a90d7f533ea32d4ac5f5857c24567579c4c9ce6795f186a"
+dependencies = [
+ "chrono",
+ "indexmap 2.14.0",
+ "infer",
+ "log 0.4.32",
+ "quick-xml 0.39.4",
+ "sha1",
+ "thiserror 2.0.18",
+ "walkdir",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "libappindicator"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3078,6 +3098,18 @@ dependencies = [
  "log 0.4.32",
  "tendril",
  "web_atoms",
+]
+
+[[package]]
+name = "markup5ever_rcdom"
+version = "0.39.0+unofficial"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ac010f19d6c4af81eeb4018a39d7a115de9d285af45c126a4ac02e6fc5716b7"
+dependencies = [
+ "html5ever 0.39.0",
+ "markup5ever 0.39.0",
+ "tendril",
+ "xml5ever",
 ]
 
 [[package]]
@@ -5254,6 +5286,7 @@ dependencies = [
  "parking_lot",
  "phf_shared",
  "precomputed-hash",
+ "serde",
 ]
 
 [[package]]
@@ -7504,6 +7537,16 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xml5ever"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ab627f34ff61b80d756180d556f9c68801d836d271b3b8c094504ceca69d221"
+dependencies = [
+ "log 0.4.32",
+ "markup5ever 0.39.0",
 ]
 
 [[package]]

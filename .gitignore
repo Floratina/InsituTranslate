@@ -9,3 +9,4 @@ src-tauri/gen/
 *.db-wal
 *.sqlite
 *.sqlite3
+*.bak

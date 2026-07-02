@@ -19,6 +19,7 @@ mod task_prompt;
 // Reserved for the document translation pipeline; intentionally not exposed through IPC yet.
 #[allow(dead_code)]
 mod translation_prompt;
+#[path = "translation/mod.rs"]
 mod translation_tasks;
 mod vertex_ai;
 

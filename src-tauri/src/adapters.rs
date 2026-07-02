@@ -855,11 +855,19 @@ fn content_text(parts: &[UnifiedContent]) -> String {
     parts
         .iter()
         .filter_map(|part| match part {
-            UnifiedContent::Text { text } => Some(text.as_str()),
+            UnifiedContent::Text { text } | UnifiedContent::CacheableText { text } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn is_plain_openai_text_part(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("text")
+        && part.get("text").and_then(Value::as_str).is_some()
+        && part.get("cache_control").is_none()
 }
 
 fn openai_messages(
@@ -878,6 +886,13 @@ fn openai_messages(
             match content {
                 UnifiedContent::Text { text } => {
                     text_parts.push(json!({"type": "text", "text": text}))
+                }
+                UnifiedContent::CacheableText { text } => {
+                    let mut part = json!({"type": "text", "text": text});
+                    if cache_control {
+                        part["cache_control"] = json!({"type": "ephemeral"});
+                    }
+                    text_parts.push(part);
                 }
                 UnifiedContent::Image { media_type, data } => text_parts.push(json!({
                     "type": "image_url",
@@ -934,15 +949,22 @@ fn openai_messages(
             || !reasoning_texts.is_empty()
             || !reasoning_details.is_empty()
         {
+            let content = if text_parts.is_empty() {
+                Value::String(String::new())
+            } else if text_parts.iter().all(is_plain_openai_text_part) {
+                Value::String(
+                    text_parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                )
+            } else {
+                Value::Array(text_parts)
+            };
             let mut item = json!({
                 "role": message.role,
-                "content": if text_parts.is_empty() {
-                    Value::String(String::new())
-                } else if text_parts.len() == 1 {
-                    Value::String(text_parts[0].get("text").and_then(Value::as_str).unwrap_or_default().to_string())
-                } else {
-                    Value::Array(text_parts)
-                }
+                "content": content
             });
             if !tool_calls.is_empty() {
                 item["tool_calls"] = Value::Array(tool_calls);
@@ -968,40 +990,7 @@ fn openai_messages(
             output.push(item);
         }
     }
-    if cache_control {
-        apply_openai_cache_control(&mut output);
-    }
     output
-}
-
-fn apply_openai_cache_control(messages: &mut [Value]) {
-    for role in ["system", "user"] {
-        if let Some(message) = messages
-            .iter_mut()
-            .rev()
-            .find(|message| message.get("role").and_then(Value::as_str) == Some(role))
-        {
-            if let Some(content) = message.get_mut("content") {
-                match content {
-                    Value::String(text) => {
-                        *content = Value::Array(vec![json!({
-                            "type": "text", "text": text.clone(), "cache_control": {"type": "ephemeral"}
-                        })]);
-                    }
-                    Value::Array(parts) => {
-                        if let Some(part) = parts
-                            .iter_mut()
-                            .rev()
-                            .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-                        {
-                            part["cache_control"] = json!({"type": "ephemeral"});
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
 }
 
 pub fn build_openai_chat_body(base_url: &str, request: &UnifiedChatRequest) -> Value {
@@ -1187,7 +1176,7 @@ fn openai_responses_input(messages: &[UnifiedMessage]) -> Vec<Value> {
         let mut content = Vec::new();
         for (part_index, part) in message.content.iter().enumerate() {
             match part {
-                UnifiedContent::Text { text } => {
+                UnifiedContent::Text { text } | UnifiedContent::CacheableText { text } => {
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -1308,6 +1297,11 @@ fn anthropic_content(message: &UnifiedMessage) -> Vec<Value> {
         .iter()
         .map(|part| match part {
             UnifiedContent::Text { text } => json!({"type": "text", "text": text}),
+            UnifiedContent::CacheableText { text } => json!({
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"}
+            }),
             UnifiedContent::Image { media_type, data } => json!({
                 "type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}
             }),
@@ -1378,24 +1372,6 @@ pub fn build_anthropic_body(request: &UnifiedChatRequest) -> Value {
             messages.push(json!({"role": message.role, "content": anthropic_content(message)}));
         }
     }
-    if let Some(last) = system.last_mut() {
-        last["cache_control"] = json!({"type": "ephemeral"});
-    }
-    if let Some(last_user) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-    {
-        if let Some(last) = last_user
-            .get_mut("content")
-            .and_then(Value::as_array_mut)
-            .and_then(|parts| parts.last_mut())
-        {
-            if last.get("type").and_then(Value::as_str) != Some("thinking") {
-                last["cache_control"] = json!({"type": "ephemeral"});
-            }
-        }
-    }
     let messages = ensure_anthropic_alternating_roles(messages).unwrap_or_default();
     let thinking_enabled = request.thinking.as_ref().is_some_and(|thinking| {
         thinking.mode != ThinkingMode::Disabled && thinking.effort != Some(ThinkingEffort::None)
@@ -1455,6 +1431,7 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
             .iter()
             .map(|part| match part {
                 UnifiedContent::Text { text } => json!({"text": text}),
+                UnifiedContent::CacheableText { text } => json!({"text": text}),
                 UnifiedContent::Image { media_type, data } => json!({"inlineData": {"mimeType": media_type, "data": data}}),
                 UnifiedContent::ToolCall { id, name, arguments } => json!({"functionCall": {"id": id, "name": name, "args": arguments}}),
                 UnifiedContent::ToolResult { call_id, content, .. } => json!({"functionResponse": {"id": call_id, "name": call_id, "response": {"content": content}}}),

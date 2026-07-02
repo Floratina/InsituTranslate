@@ -45,7 +45,7 @@ import {
   StartSettingsSkeleton,
   type StartSettingsNumberKey,
 } from "@/features/translation/StartSettingsPanel";
-import type { TranslationConfigView } from "@/features/translation/types";
+import type { ContextHandlingMode, TranslationConfigView } from "@/features/translation/types";
 import { appSessionCache } from "@/lib/session-cache";
 import { cn } from "@/lib/utils";
 
@@ -67,6 +67,7 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   rateLimitStrategy: "dynamic",
   maxRequestsPerMinute: 60,
   maxTokensPerMinute: 60_000,
+  contextHandlingMode: "off",
   useGlossary: false,
   glossaryMode: "auto",
   glossaryId: null,
@@ -123,12 +124,28 @@ function normalizeGlossaryConfig(
   };
 }
 
+function normalizeContextHandlingMode(
+  mode: ContextHandlingMode | "sliding-window" | undefined,
+  useGlobalBackground?: boolean,
+): ContextHandlingMode {
+  if (mode === "sliding-window") {
+    return "sliding-window-target";
+  }
+  return mode ?? (useGlobalBackground ? "global-background" : "off");
+}
+
 function normalizeStartConfig(
   config: TranslationConfigView,
   glossaries?: GlossaryView[],
 ): TranslationConfigView {
+  const { useGlobalBackground, ...configWithoutLegacyBackground } = config;
+  const contextHandlingMode = normalizeContextHandlingMode(
+    config.contextHandlingMode as ContextHandlingMode | "sliding-window" | undefined,
+    useGlobalBackground,
+  );
   const withDefaults: TranslationConfigView = {
-    ...config,
+    ...configWithoutLegacyBackground,
+    contextHandlingMode,
     confidenceMode: config.confidenceMode ?? "off",
     pdfParsingMode: config.pdfParsingMode ?? "local-first",
   };

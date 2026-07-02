@@ -28,6 +28,7 @@ import { displayLanguage } from "@/features/languages/languageOptions";
 import { ProviderAvatar } from "@/features/providers/ProviderAvatar";
 import type { ModelView, ProviderView } from "@/features/providers/types";
 import type {
+  ContextHandlingMode,
   PdfParsingMode,
   RateLimitStrategy,
   TranslationConfigView,
@@ -105,6 +106,33 @@ const RATE_LIMIT_OPTIONS: Array<{
     value: "manual",
     label: "手动限流",
     description: "使用固定的每分钟请求数与 Token 数",
+  },
+];
+
+const CONTEXT_HANDLING_OPTIONS: Array<{
+  value: ContextHandlingMode;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "off",
+    label: "关闭",
+    description: "不告诉模型任何上下文信息",
+  },
+  {
+    value: "sliding-window-target",
+    label: "串行滑动窗口 (仅译文)",
+    description: "始终告诉模型上一块的译文信息，并发数只能为 1，速度慢",
+  },
+  {
+    value: "sliding-window-source",
+    label: "并行滑动窗口 (仅原文)",
+    description: "始终告诉模型上一块的原文信息，支持多并发",
+  },
+  {
+    value: "global-background",
+    label: "全局背景信息",
+    description: "提取文档开头的文本作为背景信息，全局参考",
   },
 ];
 
@@ -243,6 +271,11 @@ function glossarySelectedValue(config: TranslationConfigView, glossaries: Glossa
 function selectedRateLimitLabel(strategy: RateLimitStrategy): string {
   return RATE_LIMIT_OPTIONS.find((option) => option.value === strategy)?.label
     ?? RATE_LIMIT_OPTIONS[0].label;
+}
+
+function selectedContextHandlingLabel(mode: ContextHandlingMode): string {
+  return CONTEXT_HANDLING_OPTIONS.find((option) => option.value === mode)?.label
+    ?? CONTEXT_HANDLING_OPTIONS[0].label;
 }
 
 function selectedPdfParsingLabel(mode: PdfParsingMode): string {
@@ -534,7 +567,7 @@ export function StartSettingsPanel({
                   value={config.maxConcurrency}
                   min={1}
                   max={32}
-                  disabled={loading}
+                  disabled={loading || config.contextHandlingMode === "sliding-window-target"}
                   onChange={(value) => onNumberChange("maxConcurrency", value)}
                 />
               </FieldBlock>
@@ -547,6 +580,40 @@ export function StartSettingsPanel({
                   disabled={loading}
                   onChange={(value) => onNumberChange("maxRetries", value)}
                 />
+              </FieldBlock>
+
+              <FieldBlock label="上下文处理模式">
+                <Select
+                  value={config.contextHandlingMode}
+                  disabled={loading}
+                  onValueChange={(value) => onConfigChange((current) => ({
+                    ...current,
+                    contextHandlingMode: value as ContextHandlingMode,
+                  }))}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择上下文处理模式">
+                      {selectedContextHandlingLabel(config.contextHandlingMode)}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {CONTEXT_HANDLING_OPTIONS.map((option) => (
+                      <SelectItem
+                        key={option.value}
+                        value={option.value}
+                        textValue={option.label}
+                        className="h-auto py-2"
+                      >
+                        <span className="grid gap-0.5">
+                          <span>{option.label}</span>
+                          <span className="text-xs leading-4 text-muted-foreground">
+                            {option.description}
+                          </span>
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </FieldBlock>
 
               <FieldBlock label="PDF解析模式">

@@ -46,7 +46,9 @@ const DEFAULT_MAX_CONCURRENCY: i64 = 5;
 const DEFAULT_MAX_RETRIES: i64 = 5;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: i64 = 60;
 const DEFAULT_MAX_TOKENS_PER_MINUTE: i64 = 60_000;
-const INP_SCHEMA_VERSION: i64 = 6;
+const INP_SCHEMA_VERSION: i64 = 7;
+const GLOBAL_BACKGROUND_TARGET_TOKENS: u64 = 1000;
+const GLOBAL_BACKGROUND_BATCH_CHUNKS: i64 = 20;
 const MAX_TASK_TAGS: usize = 12;
 const MAX_TASK_TAG_LENGTH: usize = 48;
 const MAX_TASK_NAME_LENGTH: usize = 120;
@@ -150,6 +152,22 @@ impl Default for RateLimitStrategy {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextHandlingMode {
+    Off,
+    #[serde(alias = "sliding-window")]
+    SlidingWindowTarget,
+    SlidingWindowSource,
+    GlobalBackground,
+}
+
+impl Default for ContextHandlingMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GlossaryMode {
     Auto,
@@ -234,6 +252,9 @@ pub struct TranslationConfigView {
     pub rate_limit_strategy: RateLimitStrategy,
     pub max_requests_per_minute: i64,
     pub max_tokens_per_minute: i64,
+    pub context_handling_mode: ContextHandlingMode,
+    #[serde(default, skip_serializing)]
+    pub use_global_background: bool,
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
@@ -257,6 +278,8 @@ impl Default for TranslationConfigView {
             rate_limit_strategy: RateLimitStrategy::Dynamic,
             max_requests_per_minute: DEFAULT_MAX_REQUESTS_PER_MINUTE,
             max_tokens_per_minute: DEFAULT_MAX_TOKENS_PER_MINUTE,
+            context_handling_mode: ContextHandlingMode::Off,
+            use_global_background: false,
             use_glossary: false,
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
@@ -282,6 +305,10 @@ pub struct UpdateTranslationConfigInput {
     pub rate_limit_strategy: RateLimitStrategy,
     pub max_requests_per_minute: i64,
     pub max_tokens_per_minute: i64,
+    #[serde(default)]
+    pub context_handling_mode: ContextHandlingMode,
+    #[serde(default, skip_serializing)]
+    pub use_global_background: bool,
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
@@ -978,6 +1005,7 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
             "error_rate",
             "last_error",
             "rate_limit_status",
+            "global_background",
             "created_at",
             "updated_at",
         ],
@@ -1069,6 +1097,9 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
             &["use_glossary", "glossary_mode", "glossary_id"],
         )
         .await?;
+    }
+    if schema_version >= 7 {
+        require_columns(pool, "metadata", &["global_background"]).await?;
     }
     TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -1176,6 +1207,7 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             max_concurrency INTEGER NOT NULL,
             max_retries INTEGER NOT NULL,
             config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            global_background TEXT,
             total_chunks INTEGER NOT NULL DEFAULT 0,
             completed_chunks INTEGER NOT NULL DEFAULT 0,
             failed_chunks INTEGER NOT NULL DEFAULT 0,
@@ -1255,6 +1287,7 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
     )
     .await?;
     add_column_if_missing(pool, "metadata", "glossary_id", "TEXT").await?;
+    add_column_if_missing(pool, "metadata", "global_background", "TEXT").await?;
     add_column_if_missing(pool, "chunks", "map_json", "TEXT NOT NULL DEFAULT '{}'").await?;
     add_column_if_missing(
         pool,
@@ -1474,6 +1507,10 @@ fn legacy_translation_config(
 }
 
 fn normalize_translation_config(mut config: TranslationConfigView) -> TranslationConfigView {
+    if config.context_handling_mode == ContextHandlingMode::Off && config.use_global_background {
+        config.context_handling_mode = ContextHandlingMode::GlobalBackground;
+    }
+    config.use_global_background = false;
     config.source_language = if config.source_language == "__other__" {
         DEFAULT_SOURCE_LANGUAGE.to_string()
     } else {
@@ -1536,6 +1573,14 @@ fn validate_saved_selection(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn effective_translation_concurrency(config: &TranslationConfigView) -> usize {
+    if config.context_handling_mode == ContextHandlingMode::SlidingWindowTarget {
+        1
+    } else {
+        config.max_concurrency.max(1) as usize
+    }
+}
+
 pub async fn update_translation_config(
     config_pool: &SqlitePool,
     input: UpdateTranslationConfigInput,
@@ -1554,6 +1599,14 @@ pub async fn update_translation_config(
         rate_limit_strategy: input.rate_limit_strategy,
         max_requests_per_minute: input.max_requests_per_minute,
         max_tokens_per_minute: input.max_tokens_per_minute,
+        context_handling_mode: if input.context_handling_mode == ContextHandlingMode::Off
+            && input.use_global_background
+        {
+            ContextHandlingMode::GlobalBackground
+        } else {
+            input.context_handling_mode
+        },
+        use_global_background: false,
         use_glossary: input.use_glossary,
         glossary_mode: input.glossary_mode,
         glossary_id: input
@@ -1691,6 +1744,17 @@ pub async fn create_translation_task(
         config.pdf_parsing_mode,
     )
     .await?;
+    let global_background = if config.context_handling_mode == ContextHandlingMode::GlobalBackground
+    {
+        Some(global_background_from_texts(
+            parsed_source
+                .chunks
+                .iter()
+                .map(|chunk| chunk.source_text.as_str()),
+        ))
+    } else {
+        None
+    };
     let created_at = unix_timestamp();
     let inp_pool = connect_inp(&inp_path).await?;
     let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
@@ -1700,9 +1764,10 @@ pub async fn create_translation_task(
             task_id, schema_version, name, source_path, source_language, target_language, status,
             progress, provider_id, model_id, model_request_name, assistant_id, assistant_system_prompt,
             assistant_custom_parameters_json, use_glossary, glossary_mode, glossary_id, tags_json,
-            token_limit, max_concurrency, max_retries, config_snapshot_json, total_chunks,
+            token_limit, max_concurrency, max_retries, config_snapshot_json, global_background,
+            total_chunks,
             created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&task_id)
     .bind(INP_SCHEMA_VERSION)
@@ -1725,6 +1790,7 @@ pub async fn create_translation_task(
     .bind(config.max_concurrency)
     .bind(config.max_retries)
     .bind(config_snapshot)
+    .bind(global_background.as_deref())
     .bind(parsed_source.chunks.len() as i64)
     .bind(&created_at)
     .bind(&created_at)
@@ -2304,6 +2370,10 @@ async fn rebuild_chunks_for_retranslate(
         .await
         .map_err(|error| error.to_string())?;
     }
+    sqlx::query("UPDATE metadata SET global_background = NULL")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
     transaction
         .commit()
         .await
@@ -2339,6 +2409,11 @@ pub async fn run_translation_task(
         return Ok(());
     }
 
+    let global_background = ensure_task_global_background(
+        &inp_pool,
+        prepared.config.context_handling_mode == ContextHandlingMode::GlobalBackground,
+    )
+    .await?;
     let glossary_chunks = glossary_source_chunks(&inp_pool).await?;
     let glossary_matcher = match prepare_task_glossary(
         &app,
@@ -2369,8 +2444,10 @@ pub async fn run_translation_task(
     let assistant_prompt = task_assistant_prompt(&inp_pool).await?;
     let assistant_custom_parameters = task_assistant_custom_parameters(&inp_pool).await?;
     let dynamic_rate_limit = prepared.config.rate_limit_strategy == RateLimitStrategy::Dynamic;
+    let context_handling_mode = prepared.config.context_handling_mode;
+    let effective_max_concurrency = effective_translation_concurrency(&prepared.config);
     let limiter = Arc::new(AdaptiveLimiter::new(
-        prepared.config.max_concurrency as usize,
+        effective_max_concurrency,
         dynamic_rate_limit,
     ));
     let quota = Arc::new(HeaderQuotaPolicy::new(dynamic_rate_limit));
@@ -2382,7 +2459,42 @@ pub async fn run_translation_task(
     } else {
         None
     };
-    let (tx, rx) = mpsc::channel::<ChunkOutcome>(prepared.config.max_concurrency as usize * 2 + 1);
+    let max_concurrency = effective_max_concurrency;
+    let max_retries = prepared.config.max_retries.max(0) as u32;
+    let confidence_mode = prepared.config.confidence_mode;
+    let target_language = task.target_language.clone();
+    let document_format = document_format_from_source_path(&task.source_path)?;
+    let content_format = content_format_from_source_path(&task.source_path)?;
+
+    if context_handling_mode == ContextHandlingMode::SlidingWindowTarget {
+        run_sliding_window_translation(
+            &app,
+            &inp_pool,
+            &config_pool,
+            &prepared.inp_path,
+            adapter,
+            model.request_name.clone(),
+            target_language,
+            assistant_prompt,
+            assistant_custom_parameters,
+            global_background,
+            glossary_matcher,
+            document_format,
+            content_format,
+            pending_chunks,
+            max_retries,
+            confidence_mode,
+            quota,
+            limiter,
+            manual_limiter,
+            &interrupt,
+        )
+        .await?;
+        inp_pool.close().await;
+        return Ok(());
+    }
+
+    let (tx, rx) = mpsc::channel::<ChunkOutcome>(max_concurrency * 2 + 1);
     let writer_pool = inp_pool.clone();
     let writer_config_pool = config_pool.clone();
     let writer_path = prepared.inp_path.clone();
@@ -2399,12 +2511,6 @@ pub async fn run_translation_task(
         )
         .await
     });
-    let max_concurrency = prepared.config.max_concurrency.max(1) as usize;
-    let max_retries = prepared.config.max_retries.max(0) as u32;
-    let confidence_mode = prepared.config.confidence_mode;
-    let target_language = task.target_language.clone();
-    let document_format = document_format_from_source_path(&task.source_path)?;
-    let content_format = content_format_from_source_path(&task.source_path)?;
 
     stream::iter(pending_chunks)
         .for_each_concurrent(max_concurrency, |chunk| {
@@ -2419,10 +2525,34 @@ pub async fn run_translation_task(
             let assistant_prompt = assistant_prompt.clone();
             let assistant_custom_parameters = assistant_custom_parameters.clone();
             let glossary_matcher = glossary_matcher.clone();
+            let global_background = global_background.clone();
+            let inp_pool = inp_pool.clone();
             async move {
                 if interrupted.is_interrupted() {
                     return;
                 }
+                let previous_context =
+                    if context_handling_mode == ContextHandlingMode::SlidingWindowSource {
+                        match previous_source_context(&inp_pool, chunk.sequence).await {
+                            Ok(context) => context,
+                            Err(error) => {
+                                let outcome = failed_outcome(
+                                    chunk,
+                                    TranslationChunkStatus::Failed,
+                                    0,
+                                    Some(error),
+                                    None,
+                                    TokenStats::default(),
+                                    None,
+                                    false,
+                                );
+                                let _ = tx.send(outcome).await;
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 let Some(_permit) = limiter.acquire(&interrupted.flag).await else {
                     return;
                 };
@@ -2435,6 +2565,8 @@ pub async fn run_translation_task(
                     target_language,
                     assistant_prompt,
                     assistant_custom_parameters,
+                    global_background,
+                    previous_context,
                     glossary_matcher,
                     document_format,
                     content_format,
@@ -2458,6 +2590,68 @@ pub async fn run_translation_task(
     writer.await.map_err(|error| error.to_string())??;
     inp_pool.close().await;
     Ok(())
+}
+
+async fn run_sliding_window_translation(
+    app: &AppHandle,
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    adapter: Arc<RuntimeAdapter>,
+    model_request_name: String,
+    target_language: String,
+    assistant_prompt: Option<String>,
+    assistant_custom_parameters: Value,
+    global_background: Option<String>,
+    glossary_matcher: Arc<TaskGlossaryMatcher>,
+    document_format: DocumentFormat,
+    content_format: ContentFormat,
+    pending_chunks: Vec<ChunkRecord>,
+    max_retries: u32,
+    confidence_mode: ConfidenceMode,
+    quota: Arc<HeaderQuotaPolicy>,
+    limiter: Arc<AdaptiveLimiter>,
+    manual_limiter: Option<Arc<ManualRateLimiter>>,
+    interrupt: &TranslationInterrupt,
+) -> Result<(), String> {
+    for chunk in pending_chunks {
+        if interrupt.is_interrupted() {
+            break;
+        }
+        let previous_context = previous_translation_context(inp_pool, chunk.sequence).await?;
+        let Some(_permit) = limiter.acquire(&interrupt.flag).await else {
+            break;
+        };
+        if interrupt.is_interrupted() {
+            break;
+        }
+        let outcome = translate_chunk(
+            adapter.clone(),
+            model_request_name.clone(),
+            target_language.clone(),
+            assistant_prompt.clone(),
+            assistant_custom_parameters.clone(),
+            global_background.clone(),
+            previous_context,
+            glossary_matcher.clone(),
+            document_format,
+            content_format,
+            chunk,
+            max_retries,
+            confidence_mode,
+            quota.clone(),
+            limiter.clone(),
+            manual_limiter.clone(),
+        )
+        .await;
+        let interrupt_task = outcome.interrupt_task;
+        apply_and_emit_chunk_outcome(app, inp_pool, config_pool, inp_path, outcome).await?;
+        if interrupt_task {
+            interrupt.interrupt("Rate limit reached; task interrupted");
+            limiter.notify_waiters();
+        }
+    }
+    finalize_translation_run(app, inp_pool, config_pool, inp_path, interrupt).await
 }
 
 async fn prepare_task_glossary(
@@ -2801,14 +2995,35 @@ async fn writer_loop(
     interrupted: TranslationInterrupt,
 ) -> Result<(), String> {
     while let Some(outcome) = rx.recv().await {
-        apply_chunk_outcome(&inp_pool, outcome).await?;
-        let task = refresh_task_stats(&inp_pool, &config_pool, &inp_path, None).await?;
-        let _ = app.emit(
-            TRANSLATION_PROGRESS_EVENT,
-            TranslationProgressPayload { task },
-        );
+        apply_and_emit_chunk_outcome(&app, &inp_pool, &config_pool, &inp_path, outcome).await?;
     }
-    let stats = aggregate_chunk_stats(&inp_pool).await?;
+    finalize_translation_run(&app, &inp_pool, &config_pool, &inp_path, &interrupted).await
+}
+
+async fn apply_and_emit_chunk_outcome(
+    app: &AppHandle,
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    outcome: ChunkOutcome,
+) -> Result<(), String> {
+    apply_chunk_outcome(inp_pool, outcome).await?;
+    let task = refresh_task_stats(inp_pool, config_pool, inp_path, None).await?;
+    let _ = app.emit(
+        TRANSLATION_PROGRESS_EVENT,
+        TranslationProgressPayload { task },
+    );
+    Ok(())
+}
+
+async fn finalize_translation_run(
+    app: &AppHandle,
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    interrupted: &TranslationInterrupt,
+) -> Result<(), String> {
+    let stats = aggregate_chunk_stats(inp_pool).await?;
     let (status, last_error) = if interrupted.is_interrupted() {
         (
             TranslationTaskStatus::Interrupted,
@@ -2847,6 +3062,8 @@ async fn translate_chunk(
     target_language: String,
     assistant_prompt: Option<String>,
     assistant_custom_parameters: Value,
+    global_background: Option<String>,
+    previous_context: Option<String>,
     glossary_matcher: Arc<TaskGlossaryMatcher>,
     document_format: DocumentFormat,
     content_format: ContentFormat,
@@ -2871,6 +3088,8 @@ async fn translate_chunk(
                 document_format,
                 content_format,
             },
+            global_background: global_background.clone(),
+            previous_context: previous_context.clone(),
             glossary: glossary_matcher.match_entries(&chunk.source_text),
         });
         let messages = match prompt {
@@ -2929,7 +3148,16 @@ async fn translate_chunk(
             logprobs: confidence_mode.enabled(),
             custom_parameters: assistant_custom_parameters.clone(),
         };
-        let estimated_tokens = estimate_tokens(&chunk.source_text) + 256;
+        let estimated_tokens = estimate_tokens(&chunk.source_text)
+            + global_background
+                .as_deref()
+                .map(estimate_tokens)
+                .unwrap_or(0)
+            + previous_context
+                .as_deref()
+                .map(estimate_tokens)
+                .unwrap_or(0)
+            + 256;
         if let Some(manual_limiter) = manual_limiter.as_ref() {
             manual_limiter.before_request(estimated_tokens).await;
         }
@@ -3564,6 +3792,188 @@ async fn glossary_source_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>, S
         .collect())
 }
 
+async fn previous_translation_context(
+    pool: &SqlitePool,
+    current_sequence: i64,
+) -> Result<Option<String>, String> {
+    if current_sequence <= 0 {
+        return Ok(None);
+    }
+    let translated_text: Option<String> = sqlx::query_scalar(
+        "SELECT translated_text
+         FROM chunks
+         WHERE sequence = ? AND status = ?
+         LIMIT 1",
+    )
+    .bind(current_sequence - 1)
+    .bind(TranslationChunkStatus::Success.as_str())
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(translated_text.and_then(|text| previous_context_section("Previous Translation", &text)))
+}
+
+async fn previous_source_context(
+    pool: &SqlitePool,
+    current_sequence: i64,
+) -> Result<Option<String>, String> {
+    if current_sequence <= 0 {
+        return Ok(None);
+    }
+    let preprocessed_text: Option<String> = sqlx::query_scalar(
+        "SELECT preprocessed_text
+         FROM chunks
+         WHERE sequence = ?
+         LIMIT 1",
+    )
+    .bind(current_sequence - 1)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(preprocessed_text.and_then(|text| previous_context_section("Previous Source Text", &text)))
+}
+
+fn previous_context_section(title: &str, text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(format!("# {title}\n{text}"))
+    }
+}
+
+fn append_background_text(background: &mut String, text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    if !background.is_empty() {
+        background.push_str("\n\n");
+    }
+    background.push_str(text);
+    estimate_tokens(background) >= GLOBAL_BACKGROUND_TARGET_TOKENS
+}
+
+fn global_background_from_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut background = String::new();
+    for text in texts {
+        if append_background_text(&mut background, text) {
+            break;
+        }
+    }
+    truncate_global_background(&background)
+}
+
+fn truncate_global_background(background: &str) -> String {
+    let background = background.trim();
+    if background.is_empty() {
+        return String::new();
+    }
+    if estimate_tokens(background) <= GLOBAL_BACKGROUND_TARGET_TOKENS {
+        return background.to_string();
+    }
+
+    let mut bounds = background
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    bounds.push(background.len());
+    let mut low = 0_usize;
+    let mut high = bounds.len().saturating_sub(1);
+    while low < high {
+        let mid = (low + high + 1) / 2;
+        if estimate_tokens(&background[..bounds[mid]]) <= GLOBAL_BACKGROUND_TARGET_TOKENS {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    background[..bounds[low]].trim_end().to_string()
+}
+
+async fn generate_global_background(pool: &SqlitePool) -> Result<String, String> {
+    let mut background = String::new();
+    let mut cursor = -1_i64;
+    loop {
+        let rows = sqlx::query(
+            "SELECT sequence, source_text
+             FROM chunks
+             WHERE sequence > ?
+             ORDER BY sequence
+             LIMIT ?",
+        )
+        .bind(cursor)
+        .bind(GLOBAL_BACKGROUND_BATCH_CHUNKS)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if rows.is_empty() {
+            break;
+        }
+
+        let row_count = rows.len();
+        for row in rows {
+            cursor = row.get("sequence");
+            let source_text: String = row.get("source_text");
+            if append_background_text(&mut background, &source_text) {
+                return Ok(truncate_global_background(&background));
+            }
+        }
+        if row_count < GLOBAL_BACKGROUND_BATCH_CHUNKS as usize {
+            break;
+        }
+    }
+    Ok(truncate_global_background(&background))
+}
+
+async fn task_global_background(pool: &SqlitePool) -> Result<Option<String>, String> {
+    let background: Option<String> =
+        sqlx::query_scalar("SELECT global_background FROM metadata LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| error.to_string())?
+            .flatten();
+    Ok(background)
+}
+
+async fn write_task_global_background(pool: &SqlitePool, background: &str) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE metadata
+         SET global_background = ?, updated_at = ?
+         WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
+    )
+    .bind(background)
+    .bind(unix_timestamp())
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn ensure_task_global_background(
+    pool: &SqlitePool,
+    enabled: bool,
+) -> Result<Option<String>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    if let Some(background) = task_global_background(pool).await? {
+        return if background.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(background))
+        };
+    }
+
+    let background = generate_global_background(pool).await?;
+    write_task_global_background(pool, &background).await?;
+    if background.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(background))
+    }
+}
+
 async fn task_assistant_prompt(pool: &SqlitePool) -> Result<Option<String>, String> {
     let prompt: Option<String> =
         sqlx::query_scalar("SELECT assistant_system_prompt FROM metadata LIMIT 1")
@@ -3659,6 +4069,7 @@ fn config_snapshot_json(
         "rateLimitStrategy": config.rate_limit_strategy,
         "maxRequestsPerMinute": config.max_requests_per_minute,
         "maxTokensPerMinute": config.max_tokens_per_minute,
+        "contextHandlingMode": config.context_handling_mode,
         "useGlossary": config.use_glossary,
         "glossaryMode": config.glossary_mode,
         "glossaryId": config.glossary_id,
@@ -4541,6 +4952,8 @@ mod tests {
                 rate_limit_strategy: RateLimitStrategy::Manual,
                 max_requests_per_minute: 120,
                 max_tokens_per_minute: 60_000,
+                context_handling_mode: ContextHandlingMode::Off,
+                use_global_background: false,
                 use_glossary: true,
                 glossary_mode: GlossaryMode::Existing,
                 glossary_id: Some("glossary-freeze-id".into()),
@@ -4590,6 +5003,8 @@ mod tests {
             Some("glossary-freeze-id")
         );
         assert_eq!(snapshot["useGlossary"], true);
+        assert_eq!(snapshot["contextHandlingMode"], "off");
+        assert!(snapshot.get("useGlobalBackground").is_none());
         assert_eq!(snapshot["glossaryMode"], "existing");
         assert_eq!(snapshot["glossaryId"], "glossary-freeze-id");
 
@@ -4639,6 +5054,239 @@ mod tests {
             .any(|row| row.get::<String, _>("name") == "confidence"));
         migrated.close().await;
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inp_migration_adds_global_background_column_as_null() {
+        let root = temp_root("global-background-migration");
+        let inp_path = root.join("legacy-v6.inp");
+        write_test_inp(&inp_path, "task-global-background-v6", "Global Background")
+            .await
+            .expect("write inp");
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        sqlx::query("ALTER TABLE metadata DROP COLUMN global_background")
+            .execute(&pool)
+            .await
+            .expect("drop global background");
+        sqlx::query("UPDATE metadata SET schema_version = 6")
+            .execute(&pool)
+            .await
+            .expect("mark v6");
+        pool.close().await;
+
+        let migrated = connect_inp(&inp_path).await.expect("migrate");
+        let schema_version: i64 = sqlx::query_scalar("SELECT schema_version FROM metadata LIMIT 1")
+            .fetch_one(&migrated)
+            .await
+            .expect("schema version");
+        let background: Option<String> =
+            sqlx::query_scalar("SELECT global_background FROM metadata LIMIT 1")
+                .fetch_one(&migrated)
+                .await
+                .expect("global background");
+        assert_eq!(schema_version, INP_SCHEMA_VERSION);
+        assert_eq!(background, None);
+        migrated.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn global_background_empty_marker_prevents_recalculation() {
+        let root = temp_root("global-background-empty");
+        let inp_path = root.join("empty.inp");
+        write_test_inp(&inp_path, "task-empty-background", "Empty Background")
+            .await
+            .expect("write inp");
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        sqlx::query("UPDATE chunks SET source_text = '   '")
+            .execute(&pool)
+            .await
+            .expect("blank chunks");
+        sqlx::query("UPDATE metadata SET global_background = NULL")
+            .execute(&pool)
+            .await
+            .expect("clear background");
+
+        let first = ensure_task_global_background(&pool, true)
+            .await
+            .expect("ensure empty background");
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT global_background FROM metadata LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .expect("stored background");
+        assert_eq!(first, None);
+        assert_eq!(stored.as_deref(), Some(""));
+
+        sqlx::query("UPDATE chunks SET source_text = 'Now has text'")
+            .execute(&pool)
+            .await
+            .expect("change chunks");
+        let second = ensure_task_global_background(&pool, true)
+            .await
+            .expect("ensure skipped background");
+        let stored_after: Option<String> =
+            sqlx::query_scalar("SELECT global_background FROM metadata LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .expect("stored background after");
+        assert_eq!(second, None);
+        assert_eq!(stored_after.as_deref(), Some(""));
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn global_background_extraction_truncates_to_target_tokens() {
+        let long_text = std::iter::repeat("background-token")
+            .take(2_000)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let background = global_background_from_texts([long_text.as_str()]);
+
+        assert!(!background.is_empty());
+        assert!(estimate_tokens(&background) <= GLOBAL_BACKGROUND_TARGET_TOKENS);
+    }
+
+    #[tokio::test]
+    async fn previous_translation_context_only_reads_successful_previous_chunk() {
+        let root = temp_root("previous-translation-context");
+        let inp_path = root.join("previous.inp");
+        write_test_inp(&inp_path, "task-previous-context", "Previous Context")
+            .await
+            .expect("write inp");
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        sqlx::query(
+            "UPDATE chunks
+             SET status = ?, translated_text = ?
+             WHERE sequence = 0",
+        )
+        .bind(TranslationChunkStatus::Success.as_str())
+        .bind("上一段译文")
+        .execute(&pool)
+        .await
+        .expect("mark previous success");
+
+        let context = previous_translation_context(&pool, 1)
+            .await
+            .expect("previous context");
+        assert_eq!(
+            context.as_deref(),
+            Some("# Previous Translation\n上一段译文")
+        );
+
+        sqlx::query(
+            "UPDATE chunks
+             SET status = ?, translated_text = ?
+             WHERE sequence = 0",
+        )
+        .bind(TranslationChunkStatus::Failed.as_str())
+        .bind("失败译文")
+        .execute(&pool)
+        .await
+        .expect("mark previous failed");
+        let failed_context = previous_translation_context(&pool, 1)
+            .await
+            .expect("failed previous context");
+        assert_eq!(failed_context, None);
+
+        sqlx::query(
+            "UPDATE chunks
+             SET status = ?, translated_text = '   '
+             WHERE sequence = 0",
+        )
+        .bind(TranslationChunkStatus::Success.as_str())
+        .execute(&pool)
+        .await
+        .expect("blank previous");
+        let blank_context = previous_translation_context(&pool, 1)
+            .await
+            .expect("blank previous context");
+        assert_eq!(blank_context, None);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn previous_source_context_reads_previous_preprocessed_text() {
+        let root = temp_root("previous-source-context");
+        let inp_path = root.join("previous-source.inp");
+        write_test_inp(
+            &inp_path,
+            "task-previous-source-context",
+            "Previous Source Context",
+        )
+        .await
+        .expect("write inp");
+        let pool = connect_inp(&inp_path).await.expect("open inp");
+        sqlx::query(
+            "UPDATE chunks
+             SET preprocessed_text = ?
+             WHERE sequence = 0",
+        )
+        .bind("Alice opened the door.")
+        .execute(&pool)
+        .await
+        .expect("write previous source");
+
+        let context = previous_source_context(&pool, 1)
+            .await
+            .expect("previous source context");
+        assert_eq!(
+            context.as_deref(),
+            Some("# Previous Source Text\nAlice opened the door.")
+        );
+        assert_eq!(
+            previous_source_context(&pool, 0)
+                .await
+                .expect("first chunk context"),
+            None
+        );
+
+        sqlx::query(
+            "UPDATE chunks
+             SET preprocessed_text = '   '
+             WHERE sequence = 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("blank previous source");
+        let blank_context = previous_source_context(&pool, 1)
+            .await
+            .expect("blank source context");
+        assert_eq!(blank_context, None);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sliding_window_target_forces_effective_concurrency_to_one() {
+        let mut config = TranslationConfigView {
+            max_concurrency: 12,
+            ..TranslationConfigView::default()
+        };
+        assert_eq!(effective_translation_concurrency(&config), 12);
+
+        config.context_handling_mode = ContextHandlingMode::SlidingWindowTarget;
+        assert_eq!(effective_translation_concurrency(&config), 1);
+
+        config.context_handling_mode = ContextHandlingMode::SlidingWindowSource;
+        assert_eq!(effective_translation_concurrency(&config), 12);
+
+        config.context_handling_mode = ContextHandlingMode::GlobalBackground;
+        assert_eq!(effective_translation_concurrency(&config), 12);
+    }
+
+    #[test]
+    fn context_handling_mode_accepts_legacy_sliding_window_value() {
+        let legacy: ContextHandlingMode =
+            serde_json::from_str("\"sliding-window\"").expect("legacy mode");
+        assert_eq!(legacy, ContextHandlingMode::SlidingWindowTarget);
+        let serialized =
+            serde_json::to_string(&ContextHandlingMode::SlidingWindowTarget).expect("serialize");
+        assert_eq!(serialized, "\"sliding-window-target\"");
     }
 
     #[tokio::test]
@@ -5088,6 +5736,8 @@ mod tests {
             DEFAULT_MAX_REQUESTS_PER_MINUTE
         );
         assert_eq!(config.max_tokens_per_minute, DEFAULT_MAX_TOKENS_PER_MINUTE);
+        assert_eq!(config.context_handling_mode, ContextHandlingMode::Off);
+        assert!(!config.use_global_background);
         assert!(!config.use_glossary);
         assert_eq!(config.glossary_mode, GlossaryMode::Auto);
         assert_eq!(config.glossary_id, None);
@@ -5141,6 +5791,8 @@ mod tests {
                 rate_limit_strategy: RateLimitStrategy::Manual,
                 max_requests_per_minute: 90,
                 max_tokens_per_minute: 90_000,
+                context_handling_mode: ContextHandlingMode::GlobalBackground,
+                use_global_background: false,
                 use_glossary: true,
                 glossary_mode: GlossaryMode::Auto,
                 glossary_id: None,
@@ -5166,6 +5818,11 @@ mod tests {
         assert_eq!(persisted.assistant_id, "assistant-test");
         assert_eq!(persisted.chunk_token_limit, 1200);
         assert_eq!(persisted.rate_limit_strategy, RateLimitStrategy::Manual);
+        assert_eq!(
+            persisted.context_handling_mode,
+            ContextHandlingMode::GlobalBackground
+        );
+        assert!(!persisted.use_global_background);
         assert!(persisted.use_glossary);
         assert_eq!(persisted.glossary_mode, GlossaryMode::Auto);
         assert_eq!(persisted.confidence_mode, ConfidenceMode::ConfidenceIndex);
@@ -5188,6 +5845,11 @@ mod tests {
         assert_eq!(final_config.max_retries, 2);
         assert_eq!(final_config.rate_limit_strategy, RateLimitStrategy::Manual);
         assert_eq!(final_config.max_requests_per_minute, 90);
+        assert_eq!(
+            final_config.context_handling_mode,
+            ContextHandlingMode::GlobalBackground
+        );
+        assert!(!final_config.use_global_background);
         assert!(final_config.use_glossary);
         assert_eq!(final_config.glossary_mode, GlossaryMode::Auto);
         assert_eq!(
@@ -5222,6 +5884,45 @@ mod tests {
         assert_eq!(config.custom_source_language, "");
         assert_eq!(config.target_language, DEFAULT_TARGET_LANGUAGE);
         assert_eq!(config.custom_target_language, "");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_global_background_bool_maps_to_context_mode() {
+        let root = std::env::temp_dir().join(format!("insitu-test-{}", db::new_id("workspace")));
+        let pool = connect_config_db(&root).await.expect("connect config");
+        sqlx::query("UPDATE translation_config SET config_json = ? WHERE id = 1")
+            .bind(json!({"useGlobalBackground": true}).to_string())
+            .execute(&pool)
+            .await
+            .expect("write legacy config");
+
+        let config = get_translation_config(&pool).await.expect("read config");
+        assert_eq!(
+            config.context_handling_mode,
+            ContextHandlingMode::GlobalBackground
+        );
+        assert!(!config.use_global_background);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_sliding_window_mode_maps_to_target_mode() {
+        let root = std::env::temp_dir().join(format!("insitu-test-{}", db::new_id("workspace")));
+        let pool = connect_config_db(&root).await.expect("connect config");
+        sqlx::query("UPDATE translation_config SET config_json = ? WHERE id = 1")
+            .bind(json!({"contextHandlingMode": "sliding-window"}).to_string())
+            .execute(&pool)
+            .await
+            .expect("write legacy sliding config");
+
+        let config = get_translation_config(&pool).await.expect("read config");
+        assert_eq!(
+            config.context_handling_mode,
+            ContextHandlingMode::SlidingWindowTarget
+        );
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }

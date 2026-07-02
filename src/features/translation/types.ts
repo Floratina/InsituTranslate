@@ -33,6 +33,8 @@ export interface TranslationConfigView {
   rateLimitStrategy: RateLimitStrategy;
   maxRequestsPerMinute: number;
   maxTokensPerMinute: number;
+  contextHandlingMode: ContextHandlingMode;
+  useGlobalBackground?: boolean;
   useGlossary: boolean;
   glossaryMode: GlossaryMode;
   glossaryId: string | null;
@@ -41,6 +43,11 @@ export interface TranslationConfigView {
 }
 
 export type RateLimitStrategy = "dynamic" | "manual";
+export type ContextHandlingMode =
+  | "off"
+  | "sliding-window-target"
+  | "sliding-window-source"
+  | "global-background";
 export type GlossaryMode = "auto" | "existing";
 export type ConfidenceMode = "off" | "confidence-index";
 export type PdfParsingMode = "local-first" | "mineru-first" | "local-only" | "mineru-only";

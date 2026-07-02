@@ -366,6 +366,9 @@ pub enum UnifiedContent {
     Text {
         text: String,
     },
+    CacheableText {
+        text: String,
+    },
     Image {
         media_type: String,
         data: String,

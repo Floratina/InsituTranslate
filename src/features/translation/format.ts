@@ -1,4 +1,11 @@
-import type { TranslationTaskStatus } from "./types";
+import type { ProgressStep, TranslationTaskStatus, TranslationTaskView } from "./types";
+
+export type TaskStatusSeverity = "muted" | "warning" | "danger";
+
+export interface TaskStatusMessage {
+  text: string;
+  severity: TaskStatusSeverity;
+}
 
 export function formatTokenK(value: number): string {
   return `${(value / 1000).toFixed(1)}k`;
@@ -16,11 +23,117 @@ export function statusLabel(status: TranslationTaskStatus): string {
   const labels: Record<TranslationTaskStatus, string> = {
     pending: "待开始",
     running: "进行中",
+    "interrupted-pending": "正在中断",
     interrupted: "中断",
     failed: "失败",
     success: "完成",
   };
   return labels[status];
+}
+
+function hasRateLimitSignal(value: string): boolean {
+  return /HTTP\s*429|RESOURCE_EXHAUSTED|rate_limited=true|Rate limit reached|quota|配额|频率/i.test(value);
+}
+
+function failedProgressStep(task: TranslationTaskView): ProgressStep | null {
+  if (!task.progressDetail) return null;
+  const steps = [
+    task.progressDetail.ast,
+    task.progressDetail.chunking,
+    task.progressDetail.glossary,
+    task.progressDetail.translating,
+  ];
+  return steps.find((step) => step.state === "failed") ?? null;
+}
+
+function localizeTaskError(value: string): TaskStatusMessage {
+  if (hasRateLimitSignal(value)) {
+    return {
+      text: "请求频率或配额达到限制，可稍后继续",
+      severity: "warning",
+    };
+  }
+  if (/placeholder|占位符|restore/i.test(value)) {
+    return {
+      text: "占位符恢复失败，请检查任务详情",
+      severity: "danger",
+    };
+  }
+  if (/error rate|错误率/i.test(value)) {
+    return {
+      text: "错误率过高，任务已停止",
+      severity: "danger",
+    };
+  }
+  if (/parse|AST|chunk|解析|分块/i.test(value)) {
+    return {
+      text: "文档解析或分块失败，请检查源文件",
+      severity: "danger",
+    };
+  }
+  if (/Task paused|interrupted|cancel/i.test(value)) {
+    return {
+      text: "任务已中断，可继续",
+      severity: "warning",
+    };
+  }
+  return {
+    text: `任务异常：${value}`,
+    severity: "danger",
+  };
+}
+
+export function taskStatusMessage(task: TranslationTaskView): TaskStatusMessage {
+  const lastError = task.lastError?.trim();
+  if (lastError) return localizeTaskError(lastError);
+
+  const rateLimitStatus = task.rateLimitStatus?.trim();
+  if (rateLimitStatus && hasRateLimitSignal(rateLimitStatus)) {
+    return localizeTaskError(rateLimitStatus);
+  }
+
+  const failedStep = failedProgressStep(task);
+  if (failedStep) {
+    return {
+      text: failedStep.label,
+      severity: "danger",
+    };
+  }
+
+  if (task.status === "running" && task.progressDetail?.translating) {
+    return {
+      text: task.progressDetail.translating.label,
+      severity: "muted",
+    };
+  }
+  if (task.status === "interrupted-pending") {
+    return {
+      text: "正在中断，等待当前请求结束",
+      severity: "warning",
+    };
+  }
+  if (task.status === "interrupted") {
+    return {
+      text: "任务已中断，可继续",
+      severity: "warning",
+    };
+  }
+  if (task.status === "failed") {
+    return {
+      text: "任务失败，请检查任务详情",
+      severity: "danger",
+    };
+  }
+  if (task.status === "success") {
+    return {
+      text: `翻译完成 (${task.completedChunks}/${task.totalChunks})`,
+      severity: "muted",
+    };
+  }
+  return {
+    text: statusLabel(task.status),
+    severity: "muted",
+  };
 }
 
 export function unixTimeLabel(value: string): string {

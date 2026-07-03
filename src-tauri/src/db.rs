@@ -14,6 +14,7 @@ use crate::domain::{
     UpdateAssistantSettingsInput, UpdateModelInput, UpdateProviderConfigInput,
     UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
 };
+use crate::features::infer_model_capabilities;
 use crate::secrets;
 use crate::vertex_ai;
 
@@ -96,6 +97,7 @@ pub async fn connect(path: &std::path::Path) -> Result<SqlitePool, String> {
     migrate_translation_only_builtins(&pool).await?;
     seed_mineru_builtin_provider(&pool).await?;
     migrate_builtin_disabled_default(&pool).await?;
+    backfill_model_capabilities(&pool).await?;
     Ok(pool)
 }
 
@@ -207,6 +209,27 @@ async fn migrate(pool: &SqlitePool) -> Result<(), String> {
         "provider_purposes",
         "sort_order",
         "INTEGER NOT NULL DEFAULT 100",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "models",
+        "capability_reasoning",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "models",
+        "capability_web",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "models",
+        "capability_tools",
+        "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
     sqlx::query(
@@ -739,6 +762,68 @@ async fn normalize_purpose_orders(pool: &SqlitePool) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         }
     }
+    Ok(())
+}
+
+async fn backfill_model_capabilities(pool: &SqlitePool) -> Result<(), String> {
+    let migrated: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM app_metadata WHERE key = 'model-capability-backfill-v1'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if migrated.is_some() {
+        return Ok(());
+    }
+
+    let rows = sqlx::query(
+        "SELECT m.id, m.request_name, m.capability_reasoning, m.capability_web,
+                m.capability_tools, p.protocol, p.base_url
+         FROM models m
+         JOIN providers p ON p.id = m.provider_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+    for row in rows {
+        let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
+        let request_name: String = row.get("request_name");
+        let inferred = infer_model_capabilities(
+            protocol,
+            row.get::<String, _>("base_url").as_str(),
+            &request_name,
+        );
+        let capability_reasoning =
+            row.get::<i64, _>("capability_reasoning") != 0 || inferred.reasoning;
+        let capability_web = row.get::<i64, _>("capability_web") != 0 || inferred.web;
+        let capability_tools = row.get::<i64, _>("capability_tools") != 0 || inferred.tools;
+        sqlx::query(
+            "UPDATE models
+             SET capability_reasoning = ?, capability_web = ?, capability_tools = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(capability_reasoning)
+        .bind(capability_web)
+        .bind(capability_tools)
+        .bind(row.get::<String, _>("id"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    sqlx::query(
+        "INSERT INTO app_metadata (key, value)
+         VALUES ('model-capability-backfill-v1', 'done')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1720,12 +1805,32 @@ pub async fn replace_headers(
 
 pub async fn add_model(pool: &SqlitePool, input: AddModelInput) -> Result<ModelView, String> {
     let id = new_id("model");
-    sqlx::query("INSERT INTO models (id, provider_id, request_name, alias, source, sort_order) VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM models WHERE provider_id = ?), 0)) ON CONFLICT(provider_id, request_name) DO UPDATE SET alias = excluded.alias")
+    let provider = sqlx::query("SELECT protocol, base_url FROM providers WHERE id = ?")
+        .bind(&input.provider_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let protocol = ProviderProtocol::parse(provider.get::<String, _>("protocol").as_str())?;
+    let request_name = input.request_name.trim();
+    let alias = if input.alias.trim().is_empty() {
+        request_name
+    } else {
+        input.alias.trim()
+    };
+    let inferred = infer_model_capabilities(
+        protocol,
+        provider.get::<String, _>("base_url").as_str(),
+        request_name,
+    );
+    sqlx::query("INSERT INTO models (id, provider_id, request_name, alias, source, capability_reasoning, capability_web, capability_tools, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM models WHERE provider_id = ?), 0)) ON CONFLICT(provider_id, request_name) DO UPDATE SET alias = excluded.alias")
         .bind(&id)
         .bind(&input.provider_id)
-        .bind(input.request_name.trim())
-        .bind(if input.alias.trim().is_empty() { input.request_name.trim() } else { input.alias.trim() })
+        .bind(request_name)
+        .bind(alias)
         .bind(input.source)
+        .bind(inferred.reasoning)
+        .bind(inferred.web)
+        .bind(inferred.tools)
         .bind(&input.provider_id)
         .execute(pool)
         .await
@@ -1893,6 +1998,102 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 0);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn add_model_infers_known_capabilities() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let provider = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "OpenAI Responses Test".into(),
+                protocol: ProviderProtocol::OpenaiResponses,
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create provider");
+        let model = add_model(
+            &pool,
+            AddModelInput {
+                provider_id: provider.id.clone(),
+                request_name: "gpt-5".into(),
+                alias: "GPT-5".into(),
+                source: "manual".into(),
+            },
+        )
+        .await
+        .expect("add model");
+
+        assert!(model.capability_reasoning);
+        assert!(model.capability_web);
+        assert!(model.capability_tools);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn model_capability_backfill_preserves_later_manual_changes() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let provider = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Legacy OpenAI".into(),
+                protocol: ProviderProtocol::OpenaiResponses,
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create provider");
+        let model_id = new_id("model");
+        sqlx::query(
+            "INSERT INTO models
+             (id, provider_id, request_name, alias, source, capability_reasoning,
+              capability_web, capability_tools, sort_order)
+             VALUES (?, ?, 'gpt-5', 'GPT-5', 'manual', 0, 0, 0, 0)",
+        )
+        .bind(&model_id)
+        .bind(&provider.id)
+        .execute(&pool)
+        .await
+        .expect("insert legacy model");
+        sqlx::query("DELETE FROM app_metadata WHERE key = 'model-capability-backfill-v1'")
+            .execute(&pool)
+            .await
+            .expect("reset backfill marker");
+
+        backfill_model_capabilities(&pool).await.expect("backfill");
+        let backfilled = get_model(&pool, &model_id).await.expect("backfilled model");
+        assert!(backfilled.capability_reasoning);
+        assert!(backfilled.capability_web);
+        assert!(backfilled.capability_tools);
+
+        update_model(
+            &pool,
+            UpdateModelInput {
+                id: model_id.clone(),
+                alias: "GPT-5".into(),
+                capability_reasoning: true,
+                capability_web: false,
+                capability_tools: true,
+            },
+        )
+        .await
+        .expect("manual update");
+        backfill_model_capabilities(&pool)
+            .await
+            .expect("second backfill skips");
+        let manual = get_model(&pool, &model_id).await.expect("manual model");
+        assert!(!manual.capability_web);
+
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }

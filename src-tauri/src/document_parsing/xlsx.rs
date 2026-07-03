@@ -13,7 +13,8 @@ use crate::task_prompt::{ContentFormat, DocumentFormat};
 
 use super::types::{BlockRef, ParsedChunk, PlaceholderEntry, PlaceholderMap, RenderInput};
 use super::{
-    chunk_raw_block_refs, token_limit_usize, ChunkedRawBlock, DocumentParser, RawBlockRef,
+    chunk_raw_block_refs, chunk_raw_block_refs_with_progress, token_limit_usize, ChunkedRawBlock,
+    DocumentParser, RawBlockRef,
 };
 
 const SHARED_STRINGS_XML: &str = "xl/sharedStrings.xml";
@@ -24,7 +25,7 @@ const XLSX_RUN_KIND: &str = "xlsx-shared-text";
 pub struct XlsxParser;
 
 impl DocumentParser for XlsxParser {
-    fn parse(&self, input: super::types::ParserInput<'_>) -> Result<Vec<ParsedChunk>, String> {
+    fn parse(&self, input: super::types::ParserInput<'_, '_>) -> Result<Vec<ParsedChunk>, String> {
         validate_xlsx(input.source_path)?;
         let xml = match read_zip_text(input.source_path, SHARED_STRINGS_XML) {
             Ok(xml) => xml,
@@ -46,7 +47,15 @@ impl DocumentParser for XlsxParser {
                 )
             })
             .collect::<Vec<_>>();
-        chunk_raw_block_refs(raw_blocks, token_limit_usize(input.token_limit))
+        let chunked_blocks = match input.progress {
+            Some(progress) => chunk_raw_block_refs_with_progress(
+                raw_blocks,
+                token_limit_usize(input.token_limit),
+                Some(progress),
+            ),
+            None => chunk_raw_block_refs(raw_blocks, token_limit_usize(input.token_limit)),
+        };
+        chunked_blocks
             .into_iter()
             .enumerate()
             .map(|(sequence, blocks)| xlsx_chunk_from_blocks(sequence, blocks))
@@ -740,6 +749,7 @@ mod tests {
             .parse(ParserInput {
                 source_path: &path,
                 token_limit: 1,
+                progress: None,
             })
             .expect("parse xlsx");
 

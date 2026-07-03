@@ -82,6 +82,8 @@
   --latency-good: oklch(50.902% 0.11227 161.646);
   --latency-warning: oklch(76.841% 0.15268 80.036);
   --latency-danger: oklch(60.527% 0.1991 27.653);
+  --task-status-warning: oklch(62% 0.14 75);
+  --task-status-danger: oklch(56% 0.20 27);
   --scrollbar-thumb: oklch(0.556 0 0 / 0.45);
   --scrollbar-thumb-hover: oklch(0.62 0.18 255 / 0.7);
   --destructive: oklch(0.577 0.245 27.325);
@@ -165,6 +167,8 @@
   --latency-good: oklch(84.598% 0.12533 156.097);
   --latency-warning: oklch(88.39% 0.16341 94.184);
   --latency-danger: oklch(73.802% 0.14266 27.706);
+  --task-status-warning: oklch(86% 0.15 88);
+  --task-status-danger: oklch(72% 0.15 28);
   --scrollbar-thumb: oklch(0.70 0.015 255 / 0.46);
   --scrollbar-thumb-hover: oklch(0.72 0.13 235 / 0.72);
   --destructive: oklch(0.70 0.19 25);

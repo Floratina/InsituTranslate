@@ -12,7 +12,8 @@ use crate::task_prompt::{ContentFormat, DocumentFormat};
 
 use super::types::{BlockRef, ParsedChunk, PlaceholderEntry, PlaceholderMap, RenderInput};
 use super::{
-    chunk_raw_block_refs, token_limit_usize, ChunkedRawBlock, DocumentParser, RawBlockRef,
+    chunk_raw_block_refs, chunk_raw_block_refs_with_progress, token_limit_usize, ChunkedRawBlock,
+    DocumentParser, RawBlockRef,
 };
 
 const DOCUMENT_XML: &str = "word/document.xml";
@@ -23,7 +24,7 @@ const DOCX_RUN_KIND: &str = "docx-run-text";
 pub struct DocxParser;
 
 impl DocumentParser for DocxParser {
-    fn parse(&self, input: super::types::ParserInput<'_>) -> Result<Vec<ParsedChunk>, String> {
+    fn parse(&self, input: super::types::ParserInput<'_, '_>) -> Result<Vec<ParsedChunk>, String> {
         validate_docx(input.source_path)?;
         let xml = read_zip_text(input.source_path, DOCUMENT_XML)?;
         let blocks = extract_word_text_blocks(&xml)?;
@@ -41,7 +42,15 @@ impl DocumentParser for DocxParser {
                 )
             })
             .collect::<Vec<_>>();
-        chunk_raw_block_refs(raw_blocks, token_limit_usize(input.token_limit))
+        let chunked_blocks = match input.progress {
+            Some(progress) => chunk_raw_block_refs_with_progress(
+                raw_blocks,
+                token_limit_usize(input.token_limit),
+                Some(progress),
+            ),
+            None => chunk_raw_block_refs(raw_blocks, token_limit_usize(input.token_limit)),
+        };
+        chunked_blocks
             .into_iter()
             .enumerate()
             .map(|(sequence, blocks)| docx_chunk_from_blocks(sequence, blocks))
@@ -766,6 +775,7 @@ mod tests {
             .parse(ParserInput {
                 source_path: &path,
                 token_limit: 1,
+                progress: None,
             })
             .expect("parse docx");
 

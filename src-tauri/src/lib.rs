@@ -1,6 +1,7 @@
 mod adapters;
 mod commands;
 mod db;
+mod diagnostics;
 mod document_parsing;
 mod domain;
 mod features;
@@ -36,6 +37,8 @@ pub fn run() {
                 .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
             std::fs::create_dir_all(&app_data)
                 .map_err(|error| format!("Unable to create app data directory: {error}"))?;
+            diagnostics::initialize_backend_log(&app.handle())
+                .map_err(|error| format!("Unable to initialize diagnostics log: {error}"))?;
             let pool =
                 tauri::async_runtime::block_on(db::connect(&app_data.join("providers.sqlite3")))
                     .map_err(|error| format!("Unable to initialize provider database: {error}"))?;
@@ -73,6 +76,8 @@ pub fn run() {
                 glossary_workspace_root,
                 running_translation_task: Default::default(),
                 translation_batch_cancel: Default::default(),
+                translation_task_creation_jobs: Default::default(),
+                translation_task_staged_creations: Default::default(),
                 client,
             });
             Ok(())
@@ -80,6 +85,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_appearance_preferences,
             commands::update_appearance_preferences,
+            commands::open_backend_console,
             commands::get_cached_system_fonts,
             commands::refresh_system_fonts_cache,
             commands::list_providers,
@@ -111,6 +117,9 @@ pub fn run() {
             commands::runtime_chat,
             commands::runtime_chat_stream,
             commands::create_translation_task,
+            commands::start_translation_task_creation,
+            commands::cancel_translation_task_creation,
+            commands::publish_translation_task_creation,
             commands::list_translation_tasks,
             commands::import_translation_task,
             commands::update_translation_task_name,
@@ -122,6 +131,7 @@ pub fn run() {
             commands::retranslate_translation_task,
             commands::pause_translation_task,
             commands::start_translation_tasks_batch,
+            commands::retranslate_translation_tasks_batch,
             commands::pause_translation_tasks_batch,
             commands::delete_translation_task,
             commands::delete_translation_tasks,

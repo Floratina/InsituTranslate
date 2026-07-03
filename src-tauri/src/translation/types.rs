@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::ThinkingEffort;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
 use crate::pdf_parsing::PdfParsingMode;
 
@@ -17,6 +18,7 @@ use super::{
 pub enum TranslationTaskStatus {
     Pending,
     Running,
+    InterruptedPending,
     Interrupted,
     Failed,
     Success,
@@ -27,6 +29,7 @@ impl TranslationTaskStatus {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
+            Self::InterruptedPending => "interrupted-pending",
             Self::Interrupted => "interrupted",
             Self::Failed => "failed",
             Self::Success => "success",
@@ -37,6 +40,7 @@ impl TranslationTaskStatus {
         match value {
             "pending" => Ok(Self::Pending),
             "running" => Ok(Self::Running),
+            "interrupted-pending" => Ok(Self::InterruptedPending),
             "interrupted" => Ok(Self::Interrupted),
             "failed" => Ok(Self::Failed),
             "success" => Ok(Self::Success),
@@ -170,6 +174,100 @@ impl Default for ConfidenceMode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressStep {
+    pub state: String,
+    pub current: u64,
+    pub total: u64,
+    pub percent: f64,
+    pub label: String,
+}
+
+impl ProgressStep {
+    pub(super) fn new(
+        state: impl Into<String>,
+        current: u64,
+        total: u64,
+        label: impl Into<String>,
+    ) -> Self {
+        let percent = if total == 0 {
+            0.0
+        } else {
+            (current as f64 / total as f64).clamp(0.0, 1.0)
+        };
+        Self {
+            state: state.into(),
+            current,
+            total,
+            percent,
+            label: label.into(),
+        }
+    }
+
+    pub(super) fn pending(current: u64, total: u64, label: impl Into<String>) -> Self {
+        Self::new("pending", current, total, label)
+    }
+
+    pub(super) fn running(current: u64, total: u64, label: impl Into<String>) -> Self {
+        Self::new("running", current, total, label)
+    }
+
+    pub(super) fn success(current: u64, total: u64, label: impl Into<String>) -> Self {
+        Self::new("success", current, total, label)
+    }
+
+    pub(super) fn failed(current: u64, total: u64, label: impl Into<String>) -> Self {
+        Self::new("failed", current, total, label)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressDetail {
+    pub ast: ProgressStep,
+    pub chunking: ProgressStep,
+    pub glossary: ProgressStep,
+    pub translating: ProgressStep,
+    pub restore: ProgressStep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartTranslationTaskCreationResult {
+    pub client_task_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TranslationTaskCreationStage {
+    Ast,
+    Chunking,
+    Glossary,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TranslationTaskCreationStatus {
+    Queued,
+    Running,
+    Success,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationTaskCreationProgressPayload {
+    pub client_task_id: String,
+    pub file_path: String,
+    pub stage: TranslationTaskCreationStage,
+    pub step: ProgressStep,
+    pub status: TranslationTaskCreationStatus,
+    pub task: Option<TranslationTaskView>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenStats {
@@ -212,6 +310,9 @@ pub struct TranslationConfigView {
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
+    pub thinking_effort: ThinkingEffort,
+    pub use_web_search: bool,
+    pub use_tools: bool,
     pub confidence_mode: ConfidenceMode,
     pub pdf_parsing_mode: PdfParsingMode,
 }
@@ -237,6 +338,9 @@ impl Default for TranslationConfigView {
             use_glossary: false,
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
+            thinking_effort: ThinkingEffort::None,
+            use_web_search: false,
+            use_tools: false,
             confidence_mode: ConfidenceMode::Off,
             pdf_parsing_mode: PdfParsingMode::LocalFirst,
         }
@@ -266,6 +370,12 @@ pub struct UpdateTranslationConfigInput {
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
+    #[serde(default)]
+    pub thinking_effort: ThinkingEffort,
+    #[serde(default)]
+    pub use_web_search: bool,
+    #[serde(default)]
+    pub use_tools: bool,
     #[serde(default)]
     pub confidence_mode: ConfidenceMode,
     #[serde(default)]
@@ -371,6 +481,7 @@ pub struct TranslationTaskView {
     pub error_rate: f64,
     pub last_error: Option<String>,
     pub rate_limit_status: Option<String>,
+    pub progress_detail: Option<ProgressDetail>,
     pub created_at: String,
     pub updated_at: String,
 }

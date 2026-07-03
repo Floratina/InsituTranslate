@@ -1,13 +1,13 @@
 use crate::task_prompt::{ContentFormat, DocumentFormat};
 
-use super::markdown::parse_markdown_text;
+use super::markdown::parse_markdown_text_with_progress;
 use super::types::ParsedChunk;
 use super::DocumentParser;
 
 pub struct PdfParser;
 
 impl DocumentParser for PdfParser {
-    fn parse(&self, input: super::types::ParserInput<'_>) -> Result<Vec<ParsedChunk>, String> {
+    fn parse(&self, input: super::types::ParserInput<'_, '_>) -> Result<Vec<ParsedChunk>, String> {
         let document = pdf_oxide::PdfDocument::open(input.source_path)
             .map_err(|error| format!("Unable to open PDF: {error}"))?;
         let page_count = document
@@ -26,7 +26,8 @@ impl DocumentParser for PdfParser {
                     .trim(),
             );
         }
-        let mut chunks = parse_markdown_text(&markdown, input.token_limit)?;
+        let mut chunks =
+            parse_markdown_text_with_progress(&markdown, input.token_limit, input.progress)?;
         for chunk in &mut chunks {
             let mut map = super::parse_map(&chunk.map_json)?;
             map.format = DocumentFormat::Pdf;

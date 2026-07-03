@@ -7,7 +7,9 @@ import {
   type DragEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   FileText,
   LayoutDashboard,
@@ -36,8 +38,10 @@ import {
 } from "@/features/languages/languageOptions";
 import type { ProviderView } from "@/features/providers/types";
 import {
-  createTranslationTask,
+  cancelTranslationTaskCreation,
   getTranslationConfig,
+  publishTranslationTaskCreation,
+  startTranslationTaskCreation,
   updateTranslationConfig,
 } from "@/features/translation/api";
 import {
@@ -45,8 +49,15 @@ import {
   StartSettingsSkeleton,
   type StartSettingsNumberKey,
 } from "@/features/translation/StartSettingsPanel";
-import type { ContextHandlingMode, TranslationConfigView } from "@/features/translation/types";
-import { appSessionCache } from "@/lib/session-cache";
+import type {
+  ContextHandlingMode,
+  ProgressStep,
+  TranslationConfigView,
+  TranslationTaskCreationProgressPayload,
+  TranslationTaskCreationStage,
+  TranslationTaskCreationStatus,
+} from "@/features/translation/types";
+import { appSessionCache, type StartCreationJob } from "@/lib/session-cache";
 import { cn } from "@/lib/utils";
 
 interface StartPageProps {
@@ -71,6 +82,9 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   useGlossary: false,
   glossaryMode: "auto",
   glossaryId: null,
+  thinkingEffort: "none",
+  useWebSearch: false,
+  useTools: false,
   confidenceMode: "off",
   pdfParsingMode: "local-first",
 };
@@ -92,6 +106,18 @@ const SUPPORTED_EXTENSIONS = new Set([
   "lrc",
 ]);
 
+const CREATION_STAGES: TranslationTaskCreationStage[] = ["ast", "chunking", "glossary"];
+const activeCreationStatuses = new Set<TranslationTaskCreationStatus>(["queued", "running"]);
+const ignoredCreationIds = new Set<string>();
+const ignoredCreationPaths = new Set<string>();
+let creationProgressListenerStarted = false;
+
+type NativeDragDropPayload =
+  | { type: "enter"; paths: string[]; position: { x: number; y: number } }
+  | { type: "over"; position: { x: number; y: number } }
+  | { type: "drop"; paths: string[]; position: { x: number; y: number } }
+  | { type: "leave" };
+
 function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
@@ -107,6 +133,204 @@ function fileName(path: string): string {
 function supportedFile(path: string): boolean {
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
   return SUPPORTED_EXTENSIONS.has(extension);
+}
+
+function progressStep(
+  state: ProgressStep["state"],
+  current: number,
+  total: number,
+  label: string,
+): ProgressStep {
+  const percent = total > 0 ? Math.max(0, Math.min(1, current / total)) : state === "success" ? 1 : 0;
+  return { state, current, total, percent, label };
+}
+
+function glossaryCreationStep(config?: TranslationConfigView): ProgressStep {
+  if (!config) {
+    return progressStep("pending", 0, 0, "术语表等待中");
+  }
+  if (!config.useGlossary) {
+    return progressStep("success", 1, 1, "术语表已忽略");
+  }
+  if (config.glossaryMode === "existing" || config.glossaryId) {
+    return progressStep("success", 1, 1, "术语表已选择");
+  }
+  return progressStep("success", 1, 1, "自动术语表将在翻译时建立");
+}
+
+function createCreationJob(
+  filePath: string,
+  clientTaskId: string,
+  config?: TranslationConfigView,
+): StartCreationJob {
+  return {
+    clientTaskId,
+    filePath,
+    status: "queued",
+    stages: {
+      ast: progressStep("pending", 0, 0, "AST 等待中"),
+      chunking: progressStep("pending", 0, 0, "分块等待中"),
+      glossary: glossaryCreationStep(config),
+    },
+    taskId: null,
+    error: null,
+  };
+}
+
+function temporaryCreationId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `local_${crypto.randomUUID()}`;
+  }
+  return `local_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function creationStatusActive(status: TranslationTaskCreationStatus): boolean {
+  return activeCreationStatuses.has(status);
+}
+
+function nativeDropInsideElement(
+  position: { x: number; y: number },
+  element: HTMLElement | null,
+): boolean {
+  if (!element) return false;
+  const rect = element.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  const x = position.x / scale;
+  const y = position.y / scale;
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+function applyCreationProgressPayload(payload: TranslationTaskCreationProgressPayload): void {
+  if (
+    ignoredCreationIds.has(payload.clientTaskId)
+    || ignoredCreationPaths.has(payload.filePath)
+  ) {
+    return;
+  }
+  const existing = appSessionCache.startCreationJobs
+    .read()
+    .find(
+      (job) => job.clientTaskId === payload.clientTaskId || job.filePath === payload.filePath,
+    );
+  const base = existing ?? createCreationJob(payload.filePath, payload.clientTaskId);
+  const jobStatus = (
+    payload.task
+    || payload.status === "failed"
+    || payload.status === "cancelled"
+    || payload.status === "queued"
+  )
+    ? payload.status
+    : "running";
+  appSessionCache.startCreationJobs.upsert({
+    ...base,
+    clientTaskId: payload.clientTaskId,
+    status: jobStatus,
+    stages: {
+      ...base.stages,
+      [payload.stage]: payload.step,
+    },
+    taskId: payload.task?.id ?? base.taskId,
+    error: payload.error ?? (payload.status === "failed" ? base.error : null),
+  });
+}
+
+function ensureCreationProgressListener(): void {
+  if (creationProgressListenerStarted || !isTauriRuntime()) return;
+  creationProgressListenerStarted = true;
+  void listen<TranslationTaskCreationProgressPayload>(
+    "translation-task-creation-progress",
+    (event) => applyCreationProgressPayload(event.payload),
+  );
+}
+
+function IdleFileRow({
+  path,
+  onRemove,
+}: {
+  path: string;
+  onRemove: (path: string) => void;
+}) {
+  return (
+    <div
+      className="grid h-8 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-[6px] px-2"
+      title={path}
+    >
+      <FileText className="size-3.5 shrink-0 text-primary" />
+      <span className="min-w-0 truncate text-xs">{fileName(path)}</span>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-xs"
+        aria-label={`移除 ${fileName(path)}`}
+        onClick={() => onRemove(path)}
+      >
+        <X className="size-3.5" />
+      </Button>
+    </div>
+  );
+}
+
+function activeCreationStage(job: StartCreationJob): TranslationTaskCreationStage {
+  return CREATION_STAGES.find((stage) => job.stages[stage].state === "failed")
+    ?? CREATION_STAGES.find((stage) => job.stages[stage].state === "running")
+    ?? CREATION_STAGES.find((stage) => job.stages[stage].state === "pending")
+    ?? "glossary";
+}
+
+function creationStepWidth(step: ProgressStep): number {
+  if (step.state === "success") return 100;
+  return Math.round(Math.max(0, Math.min(1, step.percent)) * 100);
+}
+
+function creationStageFillClass(stage: TranslationTaskCreationStage, step: ProgressStep): string {
+  if (step.state === "failed") return "bg-destructive/20";
+  if (stage === "ast") return "bg-primary/20 dark:bg-primary/25";
+  if (stage === "chunking") return "bg-emerald-500/20 dark:bg-emerald-400/20";
+  return "bg-green-500/20 dark:bg-green-400/20";
+}
+
+function CreationFileRow({
+  job,
+  onRemove,
+}: {
+  job: StartCreationJob;
+  onRemove: (job: StartCreationJob) => void;
+}) {
+  const activeStage = activeCreationStage(job);
+  const activeStep = job.stages[activeStage];
+  const width = creationStepWidth(activeStep);
+  return (
+    <div
+      className={cn(
+        "relative grid min-h-8 grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-2 overflow-hidden rounded-[6px] px-2",
+        job.status === "failed" && "bg-destructive/5",
+      )}
+      title={job.error ? `${job.filePath}\n${job.error}` : job.filePath}
+    >
+      <span
+        className={cn(
+          "pointer-events-none absolute inset-y-0 left-0 transition-[width] duration-150 ease-out",
+          creationStageFillClass(activeStage, activeStep),
+        )}
+        style={{ width: `${width}%` }}
+      />
+      <FileText className="relative z-10 size-3.5 shrink-0 text-primary" />
+      <span className="relative z-10 min-w-0 truncate text-xs">{fileName(job.filePath)}</span>
+      <span className="relative z-10 max-w-[46vw] shrink-0 truncate text-2xs text-muted-foreground">
+        {activeStep.label} · {width}%
+      </span>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-xs"
+        aria-label={`移除 ${fileName(job.filePath)}`}
+        onClick={() => onRemove(job)}
+        className="relative z-10"
+      >
+        <X className="size-3.5" />
+      </Button>
+    </div>
+  );
 }
 
 function normalizeGlossaryConfig(
@@ -146,6 +370,9 @@ function normalizeStartConfig(
   const withDefaults: TranslationConfigView = {
     ...configWithoutLegacyBackground,
     contextHandlingMode,
+    thinkingEffort: config.thinkingEffort ?? "none",
+    useWebSearch: config.useWebSearch ?? false,
+    useTools: config.useTools ?? false,
     confidenceMode: config.confidenceMode ?? "off",
     pdfParsingMode: config.pdfParsingMode ?? "local-first",
   };
@@ -196,9 +423,43 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   const [loading, setLoading] = useState(!hasCachedOptions);
   const [busy, setBusy] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
-  const dropZoneRef = useRef<HTMLButtonElement | null>(null);
+  const [creationJobs, setCreationJobs] = useState<StartCreationJob[]>(
+    appSessionCache.startCreationJobs.read(),
+  );
   const shouldLoadInitialOptions = useRef(!hasCachedOptions);
+  const dropZoneRef = useRef<HTMLButtonElement | null>(null);
+  const lastNativeDropRef = useRef<{ key: string; at: number } | null>(null);
   const { pushToast } = useToast();
+
+  const activeCreation = useMemo(
+    () => creationJobs.some((job) => creationStatusActive(job.status)),
+    [creationJobs],
+  );
+  const completedCreationJobs = useMemo(
+    () => creationJobs.filter((job) => job.status === "success" && job.taskId),
+    [creationJobs],
+  );
+  const creationFilePaths = useMemo(
+    () => new Set(creationJobs.map((job) => job.filePath)),
+    [creationJobs],
+  );
+  const idleFilePaths = useMemo(
+    () => filePaths.filter((path) => !creationFilePaths.has(path)),
+    [creationFilePaths, filePaths],
+  );
+  const allStartFilePaths = useMemo(
+    () => [...idleFilePaths, ...creationJobs.map((job) => job.filePath)],
+    [creationJobs, idleFilePaths],
+  );
+  const fileRowCount = idleFilePaths.length + creationJobs.length;
+  const creationReady = useMemo(
+    () => (
+      creationJobs.length > 0
+      && idleFilePaths.length === 0
+      && creationJobs.every((job) => job.status === "success" && job.taskId)
+    ),
+    [creationJobs, idleFilePaths],
+  );
 
   const selectedProvider = useMemo(
     () => providers.find((provider) => provider.id === providerId) ?? null,
@@ -208,16 +469,83 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
 
   const addFilePaths = useCallback((paths: string[]): void => {
     const supported = paths.filter(supportedFile);
-    setFilePaths((current) => Array.from(new Set([...current, ...supported])));
+    supported.forEach((path) => ignoredCreationPaths.delete(path));
     if (paths.length > supported.length) {
       pushToast("已忽略不受支持的文件", "warning");
     }
+    if (supported.length > 0) {
+      void startPreprocessingForPaths(supported);
+    }
+  }, [
+    assistantId,
+    config,
+    filePaths,
+    loading,
+    modelId,
+    providerId,
+    pushToast,
+    sourceLanguage,
+    targetLanguage,
+  ]);
+  const addFilePathsRef = useRef(addFilePaths);
+
+  useEffect(() => {
+    addFilePathsRef.current = addFilePaths;
+  }, [addFilePaths]);
+
+  useEffect(() => {
+    ensureCreationProgressListener();
+    return appSessionCache.startCreationJobs.subscribe(() => {
+      setCreationJobs([...appSessionCache.startCreationJobs.read()]);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+    const handleNativePayload = (payload: NativeDragDropPayload): void => {
+      if (payload.type === "leave") {
+        setDragActive(false);
+        return;
+      }
+      if (payload.type === "enter" || payload.type === "over") {
+        setDragActive(nativeDropInsideElement(payload.position, dropZoneRef.current));
+        return;
+      }
+      setDragActive(false);
+      const key = payload.paths.join("\0");
+      const now = Date.now();
+      const previous = lastNativeDropRef.current;
+      if (previous && previous.key === key && now - previous.at < 500) return;
+      lastNativeDropRef.current = { key, at: now };
+      addFilePathsRef.current(payload.paths);
+    };
+    const registerUnlistener = (cleanup: () => void): void => {
+      if (cancelled) {
+        cleanup();
+        return;
+      }
+      unlisteners.push(cleanup);
+    };
+    void getCurrentWindow()
+      .onDragDropEvent((event) => handleNativePayload(event.payload))
+      .then(registerUnlistener)
+      .catch((error: unknown) => pushToast(getErrorMessage(error), "error"));
+    void getCurrentWebview()
+      .onDragDropEvent((event) => handleNativePayload(event.payload))
+      .then(registerUnlistener)
+      .catch((error: unknown) => pushToast(getErrorMessage(error), "error"));
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((cleanup) => cleanup());
+    };
   }, [pushToast]);
 
   useEffect(() => {
     if (loading) return;
     appSessionCache.startDraft.set({
-      filePaths,
+      filePaths: idleFilePaths,
       sourceLanguage,
       detectedSourceLanguage,
       targetLanguage,
@@ -230,7 +558,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     assistantId,
     config,
     detectedSourceLanguage,
-    filePaths,
+    idleFilePaths,
     loading,
     modelId,
     providerId,
@@ -239,12 +567,12 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   ]);
 
   useEffect(() => {
-    if (filePaths.length === 0 || sourceLanguage !== AUTO_LANGUAGE_CODE || !isTauriRuntime()) {
+    if (allStartFilePaths.length === 0 || sourceLanguage !== AUTO_LANGUAGE_CODE || !isTauriRuntime()) {
       setDetectedSourceLanguage(null);
       return;
     }
     let cancelled = false;
-    void invoke<string | null>("detect_source_language", { filePaths })
+    void invoke<string | null>("detect_source_language", { filePaths: allStartFilePaths })
       .then((language) => {
         if (!cancelled) setDetectedSourceLanguage(language);
       })
@@ -254,7 +582,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     return () => {
       cancelled = true;
     };
-  }, [filePaths, sourceLanguage]);
+  }, [allStartFilePaths, sourceLanguage]);
 
   useEffect(() => {
     if (!shouldLoadInitialOptions.current) return;
@@ -287,35 +615,6 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
       setAssistantId("__none__");
     }
   }, [assistantId, assistants]);
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let dispose: (() => void) | undefined;
-    void getCurrentWebview().onDragDropEvent((event) => {
-      const payload = event.payload;
-      if (payload.type === "leave") {
-        setDragActive(false);
-        return;
-      }
-      const bounds = dropZoneRef.current?.getBoundingClientRect();
-      const scale = window.devicePixelRatio || 1;
-      const inside = Boolean(
-        bounds
-          && payload.position.x / scale >= bounds.left
-          && payload.position.x / scale <= bounds.right
-          && payload.position.y / scale >= bounds.top
-          && payload.position.y / scale <= bounds.bottom,
-      );
-      setDragActive(inside);
-      if (payload.type === "drop") {
-        setDragActive(false);
-        if (inside) addFilePaths(payload.paths);
-      }
-    }).then((unlisten) => {
-      dispose = unlisten;
-    });
-    return () => dispose?.();
-  }, [addFilePaths]);
 
   async function refreshOptions(): Promise<void> {
     setLoading(true);
@@ -400,13 +699,22 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     }
   }
 
+  function handleBrowserDrag(event: DragEvent<HTMLButtonElement>): void {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    setDragActive(true);
+  }
+
   function handleBrowserDrop(event: DragEvent<HTMLButtonElement>): void {
     event.preventDefault();
+    event.stopPropagation();
     setDragActive(false);
     const paths = Array.from(event.dataTransfer.files)
       .map((file) => (file as File & { path?: string }).path ?? "")
       .filter(Boolean);
     if (paths.length > 0) addFilePaths(paths);
+    else pushToast("无法读取拖拽文件路径，请点击选择文件", "warning");
   }
 
   function updateNumber(key: StartSettingsNumberKey, value: string): void {
@@ -447,55 +755,144 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     }
   }
 
-  async function createTasks(): Promise<void> {
-    if (filePaths.length === 0) {
-      pushToast("请先添加至少一个支持的文件", "warning");
+  async function startPreprocessingForPaths(paths: string[]): Promise<void> {
+    const existingPaths = new Set([
+      ...filePaths,
+      ...appSessionCache.startCreationJobs.read().map((job) => job.filePath),
+    ]);
+    const pathsToCreate = Array.from(new Set(paths)).filter((path) => !existingPaths.has(path));
+    if (pathsToCreate.length === 0) return;
+
+    if (loading) {
+      pushToast("配置仍在加载，请稍后再添加文件", "warning");
       return;
     }
     if (!providerId || !modelId) {
-      pushToast("请先选择已启用的翻译提供商和模型", "warning");
+      pushToast("请先选择已启用的翻译提供商和模型，再添加文件", "warning");
       return;
     }
     const resolvedSourceLanguage = normalizeLanguageCode(sourceLanguage);
     const resolvedTargetLanguage = normalizeLanguageCode(targetLanguage);
     if (!resolvedSourceLanguage || !resolvedTargetLanguage) {
-      pushToast("请选择有效的原始语言和目标语言", "warning");
+      pushToast("请选择有效的原始语言和目标语言，再添加文件", "warning");
+      return;
+    }
+
+    if (!(await saveConfig(false))) return;
+    setFilePaths((current) => current.filter((path) => !pathsToCreate.includes(path)));
+
+    for (const path of pathsToCreate) {
+      const localId = temporaryCreationId();
+      appSessionCache.startCreationJobs.upsert(createCreationJob(path, localId, config));
+      try {
+        const result = await startTranslationTaskCreation({
+          filePath: path,
+          sourceLanguage: resolvedSourceLanguage,
+          targetLanguage: resolvedTargetLanguage,
+          tags: [],
+          providerId,
+          modelId,
+          assistantId: assistantId === "__none__" ? null : assistantId,
+        });
+        if (ignoredCreationPaths.has(path)) {
+          ignoredCreationIds.add(result.clientTaskId);
+          void cancelTranslationTaskCreation(result.clientTaskId);
+          continue;
+        }
+        appSessionCache.startCreationJobs.update(localId, (job) => ({
+          ...job,
+          clientTaskId: result.clientTaskId,
+        }));
+      } catch (error) {
+        appSessionCache.startCreationJobs.update(localId, (job) => ({
+          ...job,
+          status: "failed",
+          error: `${fileName(path)}：${getErrorMessage(error)}`,
+          stages: {
+            ...job.stages,
+            ast: progressStep("failed", 0, 0, "创建任务失败"),
+          },
+        }));
+      }
+    }
+  }
+
+  async function createTasks(): Promise<void> {
+    if (!creationReady) {
+      pushToast("仍有任务未完成预处理，请等待完成或移除失败条目", "warning");
       return;
     }
 
     setBusy(true);
     try {
-      if (!(await saveConfig(false))) return;
-      let createdCount = 0;
+      const publishedIds: string[] = [];
       const failed: string[] = [];
-      for (const path of filePaths) {
+      for (const job of completedCreationJobs) {
         try {
-          await createTranslationTask({
-            filePath: path,
-            sourceLanguage: resolvedSourceLanguage,
-            targetLanguage: resolvedTargetLanguage,
-            tags: [],
-            providerId,
-            modelId,
-            assistantId: assistantId === "__none__" ? null : assistantId,
-          });
-          createdCount += 1;
+          await publishTranslationTaskCreation(job.clientTaskId);
+          publishedIds.push(job.clientTaskId);
         } catch (error) {
-          failed.push(`${fileName(path)}：${getErrorMessage(error)}`);
+          failed.push(`${fileName(job.filePath)}：${getErrorMessage(error)}`);
         }
       }
-      if (createdCount > 0) {
+      if (publishedIds.length > 0) {
+        const publishedIdSet = new Set(publishedIds);
+        appSessionCache.startCreationJobs.set(
+          appSessionCache.startCreationJobs
+            .read()
+            .filter((job) => !publishedIdSet.has(job.clientTaskId)),
+        );
         appSessionCache.invalidateProofreading();
-        pushToast(`已创建 ${createdCount} 个翻译任务`, "success");
+        pushToast(`已创建 ${publishedIds.length} 个翻译任务`, "success");
         onTaskCreated();
       }
       if (failed.length > 0) {
-        pushToast(`${failed.length} 个任务创建失败：${failed[0]}`, "error");
+        pushToast(`${failed.length} 个任务发布失败：${failed[0]}`, "error");
       }
     } finally {
       setBusy(false);
     }
   }
+
+  function removeIdleFile(path: string): void {
+    setFilePaths((current) => current.filter((item) => item !== path));
+  }
+
+  async function removeCreationJob(job: StartCreationJob): Promise<void> {
+    if (creationStatusActive(job.status)) {
+      ignoredCreationIds.add(job.clientTaskId);
+      ignoredCreationPaths.add(job.filePath);
+      appSessionCache.startCreationJobs.remove(job.clientTaskId);
+      if (!job.clientTaskId.startsWith("local_")) {
+        try {
+          await cancelTranslationTaskCreation(job.clientTaskId);
+        } catch (error) {
+          pushToast(getErrorMessage(error), "error");
+        }
+      }
+      return;
+    }
+
+    if (job.taskId) {
+      try {
+        await cancelTranslationTaskCreation(job.clientTaskId);
+        appSessionCache.invalidateProofreading();
+        appSessionCache.startCreationJobs.remove(job.clientTaskId);
+      } catch (error) {
+        pushToast(getErrorMessage(error), "error");
+      }
+      return;
+    }
+
+    appSessionCache.startCreationJobs.remove(job.clientTaskId);
+  }
+
+  const browserDropProps = {
+    onDragEnter: handleBrowserDrag,
+    onDragOver: handleBrowserDrag,
+    onDragLeave: () => setDragActive(false),
+    onDrop: handleBrowserDrop,
+  };
 
   return (
     <main
@@ -519,25 +916,19 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
               <div className="flex items-center gap-2">
                 <FileText className="size-4 text-primary" />
                 <CardTitle>添加翻译文件</CardTitle>
-                {filePaths.length > 0 && (
+                {fileRowCount > 0 && (
                   <Badge variant="secondary" className="ml-auto rounded-[6px]">
-                    {filePaths.length} 个任务
+                    {fileRowCount} 个任务
                   </Badge>
                 )}
               </div>
             </CardHeader>
             <CardContent className="grid gap-2 px-3">
               <motion.button
-                ref={dropZoneRef}
                 type="button"
+                ref={dropZoneRef}
                 onClick={() => void pickFiles()}
-                onDragEnter={(event) => {
-                  event.preventDefault();
-                  setDragActive(true);
-                }}
-                onDragOver={(event) => event.preventDefault()}
-                onDragLeave={() => setDragActive(false)}
-                onDrop={handleBrowserDrop}
+                {...browserDropProps}
                 animate={dragActive ? { scale: 1.005 } : { scale: 1 }}
                 transition={{ duration: 0.15, ease: [0.03, 0.59, 0.19, 1] }}
                 className={cn(
@@ -556,26 +947,17 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
                 </span>
               </motion.button>
 
-              {filePaths.length > 0 && (
+              {fileRowCount > 0 && (
                 <div className="grid max-h-32 gap-1 overflow-y-auto rounded-[6px] border bg-muted/20 p-1.5">
-                  {filePaths.map((path) => (
-                    <div
-                      key={path}
-                      className="flex h-7 items-center gap-2 rounded-[6px] px-2 hover:bg-accent/60"
-                      title={path}
-                    >
-                      <FileText className="size-3.5 shrink-0 text-primary" />
-                      <span className="min-w-0 flex-1 truncate text-xs">{fileName(path)}</span>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-xs"
-                        aria-label={`移除 ${fileName(path)}`}
-                        onClick={() => setFilePaths((current) => current.filter((item) => item !== path))}
-                      >
-                        <X className="size-3.5" />
-                      </Button>
-                    </div>
+                  {idleFilePaths.map((path) => (
+                    <IdleFileRow key={path} path={path} onRemove={removeIdleFile} />
+                  ))}
+                  {creationJobs.map((job) => (
+                    <CreationFileRow
+                      key={job.clientTaskId}
+                      job={job}
+                      onRemove={(target) => void removeCreationJob(target)}
+                    />
                   ))}
                 </div>
               )}
@@ -623,7 +1005,13 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
         </Button>
         <Button
           type="button"
-          disabled={busy || loading || savingConfig}
+          disabled={
+            busy
+            || activeCreation
+            || !creationReady
+            || loading
+            || savingConfig
+          }
           onClick={() => void createTasks()}
           className="h-9 px-4 shadow-[0_6px_18px_rgba(0,0,0,0.16)] dark:shadow-[0_6px_20px_rgba(0,0,0,0.38)]"
         >

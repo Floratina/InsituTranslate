@@ -292,6 +292,7 @@ mod tests {
             messages,
             tools: Vec::new(),
             tool_choice: UnifiedToolChoice::None,
+            web_search: false,
             thinking: None,
             max_output_tokens: None,
             temperature: None,

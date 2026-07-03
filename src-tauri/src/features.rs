@@ -1,6 +1,15 @@
 use regex::Regex;
 use url::Url;
 
+use crate::domain::ProviderProtocol;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferredModelCapabilities {
+    pub reasoning: bool,
+    pub web: bool,
+    pub tools: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum FeatureId {
@@ -50,9 +59,125 @@ fn model_contains(model_id: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|pattern| model.contains(pattern))
 }
 
+fn model_name(model_id: &str) -> String {
+    let model = model_id.trim().to_lowercase();
+    model
+        .rsplit("/models/")
+        .next()
+        .unwrap_or(&model)
+        .trim_start_matches("models/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn model_name_is(model_id: &str, ids: &[&str]) -> bool {
+    let name = model_name(model_id);
+    ids.iter().any(|id| name == *id)
+}
+
+fn model_name_starts(model_id: &str, patterns: &[&str]) -> bool {
+    let name = model_name(model_id);
+    patterns.iter().any(|pattern| name.starts_with(pattern))
+}
+
 fn baidu_model(base_url: &str, model_id: &str, ids: &[&str]) -> bool {
     provider_is(base_url, &["qianfan.baidubce.com"])
         && ids.iter().any(|id| model_id.eq_ignore_ascii_case(id))
+}
+
+pub fn is_openai_chat_search_model(model_id: &str) -> bool {
+    model_name_is(
+        model_id,
+        &[
+            "gpt-5-search-api",
+            "gpt-4o-search-preview",
+            "gpt-4o-mini-search-preview",
+        ],
+    )
+}
+
+fn gemini_google_search_model(model_id: &str) -> bool {
+    model_name_starts(model_id, &["gemini-2.0", "gemini-2.5", "gemini-3"])
+}
+
+fn reasoning_model(protocol: ProviderProtocol, base_url: &str, model_id: &str) -> bool {
+    match protocol {
+        ProviderProtocol::OpenaiResponses => model_name_starts(
+            model_id,
+            &["gpt-5", "o1", "o3", "o4", "codex-mini", "gpt-oss"],
+        ),
+        ProviderProtocol::OpenaiChat => {
+            model_name_starts(
+                model_id,
+                &["gpt-5", "o1", "o3", "o4", "codex-mini", "gpt-oss"],
+            ) || is_feature_supported(FeatureId::OpenAiReasoningObject, base_url, model_id)
+                || is_feature_supported(FeatureId::OpenAiThinkingObject, base_url, model_id)
+                || is_feature_supported(FeatureId::OpenAiReasoningEffort, base_url, model_id)
+                || is_feature_supported(
+                    FeatureId::OpenAiDeepSeekReasoningEffort,
+                    base_url,
+                    model_id,
+                )
+                || is_feature_supported(FeatureId::OpenAiEnableThinking, base_url, model_id)
+        }
+        ProviderProtocol::Anthropic => model_name_starts(
+            model_id,
+            &[
+                "claude-opus-4",
+                "claude-sonnet-4",
+                "claude-haiku-4",
+                "claude-3-7-sonnet",
+            ],
+        ),
+        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
+            model_name_starts(model_id, &["gemini-2.5", "gemini-3", "gemma-4"])
+        }
+        ProviderProtocol::Ollama => {
+            model_contains(model_id, &["deepseek-r1", "qwen3", "gpt-oss", "magistral"])
+        }
+    }
+}
+
+pub fn native_web_search_supported(
+    protocol: ProviderProtocol,
+    base_url: &str,
+    model_id: &str,
+) -> bool {
+    match protocol {
+        ProviderProtocol::OpenaiResponses => true,
+        ProviderProtocol::OpenaiChat => is_openai_chat_search_model(model_id),
+        ProviderProtocol::Anthropic => {
+            is_feature_supported(FeatureId::AnthropicWebSearch, base_url, model_id)
+        }
+        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
+            gemini_google_search_model(model_id)
+        }
+        ProviderProtocol::Ollama => false,
+    }
+}
+
+fn tool_calling_supported(protocol: ProviderProtocol, base_url: &str) -> bool {
+    match protocol {
+        ProviderProtocol::OpenaiChat | ProviderProtocol::OpenaiResponses => {
+            !provider_is(base_url, &["mineru.net"])
+        }
+        ProviderProtocol::Anthropic | ProviderProtocol::Gemini | ProviderProtocol::VertexAi => true,
+        ProviderProtocol::Ollama => false,
+    }
+}
+
+pub fn infer_model_capabilities(
+    protocol: ProviderProtocol,
+    base_url: &str,
+    model_id: &str,
+) -> InferredModelCapabilities {
+    InferredModelCapabilities {
+        reasoning: reasoning_model(protocol, base_url, model_id),
+        web: native_web_search_supported(protocol, base_url, model_id),
+        tools: tool_calling_supported(protocol, base_url),
+    }
 }
 
 pub fn is_feature_supported(feature: FeatureId, base_url: &str, model_id: &str) -> bool {
@@ -105,7 +230,11 @@ pub fn is_feature_supported(feature: FeatureId, base_url: &str, model_id: &str) 
                 ],
             ) || baidu_model(base_url, model_id, &["gpt-oss-120b", "gpt-oss-20b"])
         }
-        FeatureId::OpenAiDeepSeekReasoningEffort => model_contains(model_id, &["deepseek-v4"]),
+        FeatureId::OpenAiDeepSeekReasoningEffort => {
+            model_contains(model_id, &["deepseek-v4"])
+                || (provider_is(base_url, &["open.bigmodel.cn", "api.z.ai"])
+                    && model_starts(model_id, &["glm-5"]))
+        }
         FeatureId::OpenAiEnableThinking => {
             provider_is(
                 base_url,
@@ -310,5 +439,60 @@ mod tests {
             "https://api.openai.com/v1",
             "gpt-4.1"
         ));
+    }
+
+    #[test]
+    fn infers_native_web_search_capabilities() {
+        assert!(native_web_search_supported(
+            ProviderProtocol::OpenaiResponses,
+            "https://api.openai.com",
+            "gpt-5"
+        ));
+        assert!(native_web_search_supported(
+            ProviderProtocol::OpenaiChat,
+            "https://api.openai.com",
+            "gpt-5-search-api"
+        ));
+        assert!(!native_web_search_supported(
+            ProviderProtocol::OpenaiChat,
+            "https://api.openai.com",
+            "gpt-5"
+        ));
+        assert!(native_web_search_supported(
+            ProviderProtocol::Gemini,
+            "https://generativelanguage.googleapis.com",
+            "models/gemini-2.5-pro"
+        ));
+        assert!(native_web_search_supported(
+            ProviderProtocol::VertexAi,
+            "https://aiplatform.googleapis.com",
+            "publishers/google/models/gemini-2.0-flash"
+        ));
+        assert!(!native_web_search_supported(
+            ProviderProtocol::Ollama,
+            "http://localhost:11434/api",
+            "qwen3"
+        ));
+    }
+
+    #[test]
+    fn infers_reasoning_web_and_tools_for_known_models() {
+        let openai = infer_model_capabilities(
+            ProviderProtocol::OpenaiResponses,
+            "https://api.openai.com",
+            "gpt-5",
+        );
+        assert!(openai.reasoning);
+        assert!(openai.web);
+        assert!(openai.tools);
+
+        let qwen = infer_model_capabilities(
+            ProviderProtocol::OpenaiChat,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "qwen3-235b-a22b",
+        );
+        assert!(qwen.reasoning);
+        assert!(!qwen.web);
+        assert!(qwen.tools);
     }
 }

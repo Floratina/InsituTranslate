@@ -1,19 +1,36 @@
 use super::placeholders::protect_markdown;
-use super::types::{BlockRef, ParsedChunk};
-use super::{chunk_raw_blocks, token_limit_usize, DocumentParser, RawBlock};
+use super::types::{BlockRef, ParsedChunk, ParserProgress};
+use super::{chunk_raw_blocks_with_progress, token_limit_usize, DocumentParser, RawBlock};
 
 pub struct MarkdownParser;
 
 impl DocumentParser for MarkdownParser {
-    fn parse(&self, input: super::types::ParserInput<'_>) -> Result<Vec<ParsedChunk>, String> {
+    fn parse(&self, input: super::types::ParserInput<'_, '_>) -> Result<Vec<ParsedChunk>, String> {
         let text = std::fs::read_to_string(input.source_path)
             .map_err(|error| format!("Unable to read Markdown source: {error}"))?;
-        parse_markdown_text(&text, input.token_limit)
+        match input.progress {
+            Some(progress) => {
+                parse_markdown_text_with_progress(&text, input.token_limit, Some(progress))
+            }
+            None => parse_markdown_text(&text, input.token_limit),
+        }
     }
 }
 
 pub fn parse_markdown_text(text: &str, token_limit: i64) -> Result<Vec<ParsedChunk>, String> {
-    let parts = chunk_raw_blocks(markdown_raw_blocks(text), token_limit_usize(token_limit));
+    parse_markdown_text_with_progress(text, token_limit, None)
+}
+
+pub fn parse_markdown_text_with_progress(
+    text: &str,
+    token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
+) -> Result<Vec<ParsedChunk>, String> {
+    let parts = chunk_raw_blocks_with_progress(
+        markdown_raw_blocks(text),
+        token_limit_usize(token_limit),
+        progress,
+    );
     parts
         .into_iter()
         .enumerate()

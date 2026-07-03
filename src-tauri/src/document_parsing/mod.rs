@@ -28,7 +28,10 @@ use self::pdf::PdfParser;
 use self::placeholders::restore_from_json;
 use self::subtitle::SubtitleParser;
 use self::txt::TxtParser;
-use self::types::{ParsedChunk, ParserInput, PlaceholderMap, RenderInput, RenderedChunk};
+use self::types::{
+    ParsedChunk, ParserInput, ParserProgress, ParserProgressStage, PlaceholderMap, RenderInput,
+    RenderedChunk,
+};
 use self::xlsx::XlsxParser;
 
 pub const HARD_CHUNK_TOKEN_LIMIT: usize = 2000;
@@ -36,7 +39,7 @@ pub const HARD_CHUNK_TOKEN_LIMIT: usize = 2000;
 static CL100K_TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
 
 pub trait DocumentParser {
-    fn parse(&self, input: ParserInput<'_>) -> Result<Vec<ParsedChunk>, String>;
+    fn parse(&self, input: ParserInput<'_, '_>) -> Result<Vec<ParsedChunk>, String>;
 
     fn restore_chunk(&self, map_json: &str, after_translate_text: &str) -> Result<String, String> {
         restore_from_json(map_json, after_translate_text)
@@ -57,10 +60,20 @@ pub fn parse_source_file(
     source_path: &Path,
     token_limit: i64,
 ) -> Result<Vec<ParsedChunk>, String> {
+    parse_source_file_with_progress(_task_id, source_path, token_limit, None)
+}
+
+pub fn parse_source_file_with_progress<'path, 'progress>(
+    _task_id: &str,
+    source_path: &'path Path,
+    token_limit: i64,
+    progress: Option<&'progress mut (dyn FnMut(ParserProgress) + Send + 'progress)>,
+) -> Result<Vec<ParsedChunk>, String> {
     let parser = parser_for_path(source_path)?;
     let mut chunks = parser.parse(ParserInput {
         source_path,
         token_limit,
+        progress,
     })?;
     for (index, chunk) in chunks.iter_mut().enumerate() {
         chunk.sequence = index as i64;
@@ -82,7 +95,15 @@ pub fn parse_source_file(
 }
 
 pub fn parse_pdf_markdown_text(text: &str, token_limit: i64) -> Result<Vec<ParsedChunk>, String> {
-    let mut chunks = markdown::parse_markdown_text(text, token_limit)?;
+    parse_pdf_markdown_text_with_progress(text, token_limit, None)
+}
+
+pub fn parse_pdf_markdown_text_with_progress<'progress>(
+    text: &str,
+    token_limit: i64,
+    progress: Option<&'progress mut (dyn FnMut(ParserProgress) + Send + 'progress)>,
+) -> Result<Vec<ParsedChunk>, String> {
+    let mut chunks = markdown::parse_markdown_text_with_progress(text, token_limit, progress)?;
     for (index, chunk) in chunks.iter_mut().enumerate() {
         chunk.sequence = index as i64;
         let mut map = parse_map(&chunk.map_json)?;
@@ -262,13 +283,34 @@ pub fn chunk_text(text: &str, token_limit: i64) -> Vec<String> {
     )
 }
 
+pub fn chunk_text_with_progress(
+    text: &str,
+    token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
+) -> Vec<String> {
+    chunk_raw_blocks_with_progress(
+        vec![RawBlock::new(text.to_string(), true)],
+        token_limit_usize(token_limit),
+        progress,
+    )
+}
+
 pub fn chunk_raw_blocks(blocks: Vec<RawBlock>, max_tokens: usize) -> Vec<String> {
-    chunk_raw_block_refs(
+    chunk_raw_blocks_with_progress(blocks, max_tokens, None)
+}
+
+pub fn chunk_raw_blocks_with_progress(
+    blocks: Vec<RawBlock>,
+    max_tokens: usize,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
+) -> Vec<String> {
+    chunk_raw_block_refs_with_progress(
         blocks
             .into_iter()
             .map(|block| RawBlockRef::new(block.text, block.is_breakable, ()))
             .collect(),
         max_tokens,
+        progress,
     )
     .into_iter()
     .map(|chunk| {
@@ -284,12 +326,23 @@ pub fn chunk_raw_block_refs<T: Clone>(
     blocks: Vec<RawBlockRef<T>>,
     max_tokens: usize,
 ) -> Vec<Vec<ChunkedRawBlock<T>>> {
+    chunk_raw_block_refs_with_progress(blocks, max_tokens, None)
+}
+
+pub fn chunk_raw_block_refs_with_progress<T: Clone>(
+    blocks: Vec<RawBlockRef<T>>,
+    max_tokens: usize,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
+) -> Vec<Vec<ChunkedRawBlock<T>>> {
     let max_tokens = max_tokens.max(1);
+    let total_blocks = blocks.len() as u64;
+    let mut progress = progress;
+    emit_chunking_progress(&mut progress, 0, total_blocks);
     let mut chunks = Vec::new();
     let mut current = Vec::<ChunkedRawBlock<T>>::new();
     let mut current_tokens = 0_usize;
 
-    for block in blocks {
+    for (index, block) in blocks.into_iter().enumerate() {
         let block_tokens = count_tokens(&block.text);
         if block.is_breakable && block_tokens > max_tokens {
             flush_chunk(&mut chunks, &mut current, &mut current_tokens);
@@ -308,6 +361,7 @@ pub fn chunk_raw_block_refs<T: Clone>(
                     true,
                 );
             }
+            emit_chunking_progress(&mut progress, index as u64 + 1, total_blocks);
             continue;
         }
 
@@ -321,6 +375,7 @@ pub fn chunk_raw_block_refs<T: Clone>(
                 source_end: block_len,
             });
             flush_chunk(&mut chunks, &mut current, &mut current_tokens);
+            emit_chunking_progress(&mut progress, index as u64 + 1, total_blocks);
             continue;
         }
 
@@ -341,6 +396,7 @@ pub fn chunk_raw_block_refs<T: Clone>(
         if force_own_chunk {
             flush_chunk(&mut chunks, &mut current, &mut current_tokens);
         }
+        emit_chunking_progress(&mut progress, index as u64 + 1, total_blocks);
     }
 
     flush_chunk(&mut chunks, &mut current, &mut current_tokens);
@@ -348,6 +404,24 @@ pub fn chunk_raw_block_refs<T: Clone>(
         chunks.push(Vec::new());
     }
     chunks
+}
+
+fn emit_chunking_progress(
+    progress: &mut Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
+    current: u64,
+    total: u64,
+) {
+    if total == 0 {
+        return;
+    }
+    if let Some(progress) = progress.as_deref_mut() {
+        progress(ParserProgress {
+            stage: ParserProgressStage::Chunking,
+            current,
+            total,
+            label: format!("分块 ({current}/{total})"),
+        });
+    }
 }
 
 pub fn token_limit_usize(token_limit: i64) -> usize {

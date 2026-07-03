@@ -70,25 +70,28 @@ import {
   deleteTranslationTask,
   deleteTranslationTasks,
   exportTranslationTask,
+  getTranslationTaskDetail,
   listTranslationTasks,
   openTranslationTaskFolder,
   pauseTranslationTask,
   pauseTranslationTasksBatch,
   retranslateTranslationTask,
+  retranslateTranslationTasksBatch,
   resumeTranslationTask,
   startTranslationTask,
   startTranslationTasksBatch,
   updateTranslationTaskName,
 } from "@/features/translation/api";
 import {
-  formatErrorRate,
   formatPercent,
   formatTokenK,
   statusLabel,
+  taskStatusMessage,
   unixTimeLabel,
 } from "@/features/translation/format";
 import type {
   ExportTranslationTaskInput,
+  ProgressStep,
   TranslationProgressPayload,
   TranslationTaskExportFormat,
   TranslationTaskStatus,
@@ -181,6 +184,61 @@ function taskTab(status: TranslationTaskStatus): TaskTab {
   if (status === "success") return "completed";
   if (status === "failed") return "unfinished";
   return "running";
+}
+
+function liveTaskStatus(status: TranslationTaskStatus): boolean {
+  return status === "running" || status === "interrupted-pending";
+}
+
+function startableTaskStatus(status: TranslationTaskStatus): boolean {
+  return status === "pending" || status === "interrupted";
+}
+
+function optimisticTimestamp(): string {
+  return Math.floor(Date.now() / 1000).toString();
+}
+
+function resetProgressStep(label: string, total: number): ProgressStep {
+  return {
+    state: "pending",
+    current: 0,
+    total,
+    percent: 0,
+    label: `${label} (0/${total})`,
+  };
+}
+
+function optimisticTaskStatus(
+  task: TranslationTaskView,
+  status: TranslationTaskStatus,
+  resetProgress = false,
+): TranslationTaskView {
+  const parsingAstStep: ProgressStep = {
+    state: "running",
+    current: 0,
+    total: 0,
+    percent: 0,
+    label: "AST 处理中",
+  };
+  const progressDetail = resetProgress && task.progressDetail
+    ? {
+        ...task.progressDetail,
+        ast: parsingAstStep,
+        chunking: resetProgressStep("分块", 0),
+        translating: resetProgressStep("翻译", task.totalChunks),
+        restore: resetProgressStep("占位符恢复", task.totalChunks),
+      }
+    : task.progressDetail;
+  return {
+    ...task,
+    status,
+    progress: resetProgress ? 0 : task.progress,
+    completedChunks: resetProgress ? 0 : task.completedChunks,
+    failedChunks: resetProgress ? 0 : task.failedChunks,
+    interruptedChunks: resetProgress ? 0 : task.interruptedChunks,
+    progressDetail,
+    updatedAt: optimisticTimestamp(),
+  };
 }
 
 function nextSortMode(mode: SortMode): SortMode {
@@ -341,7 +399,6 @@ function taskStatsLabel(task: TranslationTaskView): string {
     `${task.completedChunks}/${task.totalChunks}`,
     formatPercent(task.progress),
     formatTokenK(task.tokenStats.totalTokens),
-    formatErrorRate(task.errorRate),
   ].join(" ");
 }
 
@@ -368,17 +425,6 @@ function sortTasks(tasks: TranslationTaskView[], sort: TaskSortState): Translati
     collator.compare(sortKey(left, sort.field), sortKey(right, sort.field)) ||
     right.createdAt.localeCompare(left.createdAt),
   );
-}
-
-function statusBadgeClass(status: TranslationTaskStatus): string {
-  const classes: Record<TranslationTaskStatus, string> = {
-    pending: "border-slate-400/25 bg-slate-500/10 text-slate-600 dark:text-slate-300",
-    running: "border-blue-400/25 bg-blue-500/10 text-blue-600 dark:text-blue-300",
-    interrupted: "border-amber-400/35 bg-amber-500/15 text-amber-700 dark:text-amber-300",
-    failed: "border-destructive/30 bg-destructive/10 text-destructive",
-    success: "border-emerald-400/30 bg-emerald-500/12 text-emerald-700 dark:text-emerald-300",
-  };
-  return classes[status];
 }
 
 function sourceFormatLabel(task: TranslationTaskView): string {
@@ -451,6 +497,18 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
 
   const sortedTasks = useMemo(() => sortTasks(grouped[tab], sort), [grouped, sort, tab]);
   const totalPages = Math.max(1, Math.ceil(sortedTasks.length / pageSize));
+  const visibleStartableTasks = useMemo(
+    () => sortedTasks.filter((task) => startableTaskStatus(task.status)),
+    [sortedTasks],
+  );
+  const visibleRetranslatableTasks = useMemo(
+    () => sortedTasks.filter((task) => task.status === "success"),
+    [sortedTasks],
+  );
+  const pollingTaskIds = useMemo(
+    () => tasks.filter((task) => liveTaskStatus(task.status)).map((task) => task.id),
+    [tasks],
+  );
   const pagedTasks = useMemo(() => {
     const start = page * pageSize;
     return sortedTasks.slice(start, start + pageSize);
@@ -504,6 +562,32 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   }, []);
 
   useEffect(() => {
+    if (!isTauriRuntime() || pollingTaskIds.length === 0) return undefined;
+    let cancelled = false;
+    const tick = (): void => {
+      void Promise.all(
+        pollingTaskIds.map((id) =>
+          getTranslationTaskDetail(id)
+            .then((detail) => detail.task)
+            .catch(() => null),
+        ),
+      ).then((updatedTasks) => {
+        if (cancelled) return;
+        setTasks((current) => current.map((task) => {
+          const updated = updatedTasks.find((item) => item?.id === task.id);
+          return updated ?? task;
+        }));
+      });
+    };
+    tick();
+    const interval = window.setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [pollingTaskIds]);
+
+  useEffect(() => {
     setPage(0);
   }, [search, tagFilter, sourceLanguageFilter, targetLanguageFilter, tab, sort, pageSize]);
 
@@ -518,11 +602,17 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   async function runTaskAction(
     task: TranslationTaskView,
     action: (id: string) => Promise<TranslationTaskView>,
+    optimisticStatus?: TranslationTaskStatus,
+    resetProgress = false,
   ): Promise<void> {
     setBusyId(task.id);
+    if (optimisticStatus) {
+      mergeTask(optimisticTaskStatus(task, optimisticStatus, resetProgress));
+    }
     try {
       mergeTask(await action(task.id));
     } catch (error) {
+      if (optimisticStatus) mergeTask(task);
       pushToast(getErrorMessage(error), "error");
     } finally {
       setBusyId("");
@@ -611,19 +701,45 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   }
 
   async function startVisibleTasks(): Promise<void> {
-    const ids = sortedTasks
-      .filter((task) => task.status === "pending" || task.status === "interrupted")
-      .map((task) => task.id);
+    const ids = visibleStartableTasks.map((task) => task.id);
     if (ids.length === 0) {
       pushToast("当前列表没有可开始的任务", "warning");
       return;
     }
     setBatchBusy(true);
+    setTasks((current) =>
+      current.map((task) =>
+        ids.includes(task.id) ? optimisticTaskStatus(task, "running") : task,
+      ),
+    );
     try {
-      const updated = await startTranslationTasksBatch({ ids });
-      setTasks((current) => current.map((task) => updated.find((item) => item.id === task.id) ?? task));
+      await startTranslationTasksBatch({ ids });
       pushToast("已加入顺序开始队列", "success");
     } catch (error) {
+      void refresh();
+      pushToast(getErrorMessage(error), "error");
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function retranslateVisibleTasks(): Promise<void> {
+    const ids = visibleRetranslatableTasks.map((task) => task.id);
+    if (ids.length === 0) {
+      pushToast("当前列表没有可重新翻译的任务", "warning");
+      return;
+    }
+    setBatchBusy(true);
+    setTasks((current) =>
+      current.map((task) =>
+        ids.includes(task.id) ? optimisticTaskStatus(task, "running", true) : task,
+      ),
+    );
+    try {
+      await retranslateTranslationTasksBatch({ ids });
+      pushToast("已加入重新翻译队列", "success");
+    } catch (error) {
+      void refresh();
       pushToast(getErrorMessage(error), "error");
     } finally {
       setBatchBusy(false);
@@ -631,11 +747,18 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   }
 
   async function pauseVisibleTasks(): Promise<void> {
+    const ids = tasks.filter((task) => task.status === "running").map((task) => task.id);
     setBatchBusy(true);
+    setTasks((current) =>
+      current.map((task) =>
+        ids.includes(task.id) ? optimisticTaskStatus(task, "interrupted-pending") : task,
+      ),
+    );
     try {
       await pauseTranslationTasksBatch();
       pushToast("已请求暂停任务", "success");
     } catch (error) {
+      void refresh();
       pushToast(getErrorMessage(error), "error");
     } finally {
       setBatchBusy(false);
@@ -747,11 +870,16 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
             <Button
               size="sm"
               className={compactAccentButtonClass}
-              onClick={() => void startVisibleTasks()}
-              disabled={batchBusy || sortedTasks.length === 0}
+              onClick={() => void (tab === "completed" ? retranslateVisibleTasks() : startVisibleTasks())}
+              disabled={
+                batchBusy
+                || (tab === "completed"
+                  ? visibleRetranslatableTasks.length === 0
+                  : visibleStartableTasks.length === 0)
+              }
             >
-              <Play className="size-4" />
-              全部开始
+              {tab === "completed" ? <RotateCcw className="size-4" /> : <Play className="size-4" />}
+              {tab === "completed" ? "重新翻译" : "全部开始"}
             </Button>
             <Button
               size="sm"
@@ -793,10 +921,10 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         onPageSizeChange={setPageSize}
         onResize={(event, index) => startResize(event, index, widths, TASK_MIN_WIDTHS, setWidths)}
         onAutoFit={autoFitColumn}
-        onStart={(task) => void runTaskAction(task, startTranslationTask)}
-        onResume={(task) => void runTaskAction(task, resumeTranslationTask)}
-        onPause={(task) => void runTaskAction(task, pauseTranslationTask)}
-        onRetranslate={(task) => void runTaskAction(task, retranslateTranslationTask)}
+        onStart={(task) => void runTaskAction(task, startTranslationTask, "running")}
+        onResume={(task) => void runTaskAction(task, resumeTranslationTask, "running")}
+        onPause={(task) => void runTaskAction(task, pauseTranslationTask, "interrupted-pending")}
+        onRetranslate={(task) => void runTaskAction(task, retranslateTranslationTask, "running", true)}
         onProofread={(task) => onOpenProofreading?.(task.id)}
         onRename={(task) => setRenameState({ task, name: task.name })}
         onOpenFolder={(task) => {
@@ -1055,23 +1183,42 @@ function TasksTable({
 }
 
 function TaskStats({ task }: { task: TranslationTaskView }) {
+  const status = taskStatusMessage(task);
   return (
-    <div className="grid min-w-0 gap-1">
-      <div className="flex min-w-0 items-center gap-2">
-        <Badge variant="outline" className={cn("rounded-full", statusBadgeClass(task.status))}>
-          {statusLabel(task.status)}
-        </Badge>
-        <span className="truncate text-2xs text-muted-foreground">
-          {task.completedChunks}/{task.totalChunks} 块 · {formatPercent(task.progress)}
+    <div className="grid min-w-0 gap-1.5">
+      <div className="flex min-w-0 items-center gap-1.5">
+        {liveTaskStatus(task.status) && (
+          <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />
+        )}
+        <span className={cn("truncate text-2xs", taskStatusTextClass(status.severity))}>
+          {status.text}
         </span>
       </div>
       <div className="flex min-w-0 items-center gap-2">
         <Progress value={Math.round(Math.max(0, Math.min(1, task.progress)) * 100)} className="h-1.5 min-w-16 flex-1" />
         <span className="shrink-0 text-2xs text-muted-foreground">
-          {formatTokenK(task.tokenStats.totalTokens)} · {formatErrorRate(task.errorRate)}
+          {formatTokenK(task.tokenStats.totalTokens)} · {formatPercent(task.progress)}
         </span>
       </div>
     </div>
+  );
+}
+
+function taskStatusTextClass(severity: ReturnType<typeof taskStatusMessage>["severity"]): string {
+  if (severity === "danger") return "text-[var(--task-status-danger)]";
+  if (severity === "warning") return "text-[var(--task-status-warning)]";
+  return "text-muted-foreground";
+}
+
+function ProgressStepPill({ step }: { step: ProgressStep }) {
+  return (
+    <Badge
+      variant="outline"
+      className="max-w-full rounded-[6px] border-border bg-muted/35 px-1.5 py-0 text-2xs font-normal text-muted-foreground"
+      title={`${step.label} · ${formatPercent(step.percent)}`}
+    >
+      <span className="truncate">{step.label}</span>
+    </Badge>
   );
 }
 
@@ -1160,6 +1307,12 @@ function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetrans
         <Item disabled={busy} onSelect={() => onPause(task)}>
           <Pause className="size-3.5" />
           暂停任务
+        </Item>
+      )}
+      {task.status === "interrupted-pending" && (
+        <Item disabled>
+          <Loader2 className="size-3.5 animate-spin" />
+          正在中断
         </Item>
       )}
       {(task.status === "success" || task.status === "failed") && (

@@ -1,4 +1,4 @@
-import { Monitor, Moon, Palette, Settings, Sun, Type } from "lucide-react";
+import { Monitor, Moon, Palette, Settings, Sun, Terminal, Type } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,8 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { useToast } from "@/components/ui/toast-stack";
+import { openBackendConsole } from "@/features/appearance/api";
 import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
 import { CustomThemeColorPicker } from "@/features/appearance/CustomThemeColorPicker";
 import { FontPicker } from "@/features/appearance/FontPicker";
@@ -35,6 +37,12 @@ const colorModes: readonly {
   { value: "dark", label: "深色模式", icon: Moon },
   { value: "system", label: "跟随系统", icon: Monitor },
 ];
+
+function getErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  return "打开后端控制台失败";
+}
 
 function ThemeSwatches({ swatches }: { swatches: readonly [string, string, string, string] }) {
   return (
@@ -116,6 +124,8 @@ function CustomThemeOption({
 }
 
 export default function AppearanceSettingsPage() {
+  const { pushToast } = useToast();
+  const [openingConsole, setOpeningConsole] = useState(false);
   const {
     preferences,
     setColorMode,
@@ -128,6 +138,19 @@ export default function AppearanceSettingsPage() {
       ? SYSTEM_FONT_STACK
       : `"${preferences.fontFamily.replaceAll('"', '\\"')}", ${SYSTEM_FONT_STACK}`;
   const customThemeSwatches = getCustomThemeSwatches(preferences.customThemeColor);
+
+  async function handleOpenBackendConsole(): Promise<void> {
+    if (openingConsole) return;
+    setOpeningConsole(true);
+    try {
+      await openBackendConsole();
+      pushToast("后端控制台已打开", "success");
+    } catch (error) {
+      pushToast(getErrorMessage(error), "error");
+    } finally {
+      setOpeningConsole(false);
+    }
+  }
 
   return (
     <main className="flex min-w-0 flex-1 flex-col overflow-hidden p-3">
@@ -218,6 +241,33 @@ export default function AppearanceSettingsPage() {
               >
                 海浪的声音平静了我的心灵。The sound of waves calms my soul.
               </div>
+            </CardContent>
+          </Card>
+
+          <Card size="sm" className="gap-3 rounded-[6px] py-3">
+            <CardHeader className="px-3">
+              <div className="flex items-center gap-2">
+                <Terminal className="size-4 text-primary" />
+                <CardTitle>诊断</CardTitle>
+              </div>
+            </CardHeader>
+            <CardContent className="flex flex-wrap items-center justify-between gap-3 px-3">
+              <div className="min-w-0">
+                <div className="text-sm font-medium">后端控制台</div>
+                <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+                  打开 PowerShell 实时查看任务重试、限流和 API 错误日志。
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={openingConsole}
+                onClick={handleOpenBackendConsole}
+              >
+                <Terminal className="size-4" />
+                {openingConsole ? "正在打开" : "打开控制台"}
+              </Button>
             </CardContent>
           </Card>
         </div>

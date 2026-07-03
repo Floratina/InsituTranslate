@@ -24,12 +24,13 @@ use super::context::estimate_tokens;
 use super::db::{
     connect_inp, content_format_from_source_path, document_format_from_source_path, finalize_task,
     get_task_from_index, get_translation_config, glossary_source_chunks, metadata_task,
-    refresh_task_stats, set_task_glossary_id, task_glossary_config,
+    progress_detail_for_config, refresh_task_stats, set_progress_detail_and_emit,
+    set_task_glossary_id, task_glossary_config,
 };
 use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter};
 use super::types::ChunkRecord;
 use super::{
-    GlossaryMode, RateLimitStrategy, TranslationConfigView, TranslationInterrupt,
+    GlossaryMode, ProgressStep, RateLimitStrategy, TranslationConfigView, TranslationInterrupt,
     TranslationProgressPayload, TranslationTaskStatus, TranslationTaskView,
     AUTO_GLOSSARY_FAILURE_THRESHOLD, TRANSLATION_PROGRESS_EVENT,
 };
@@ -160,6 +161,35 @@ enum AutoGlossaryGeneration {
     Interrupted(String),
 }
 
+async fn emit_glossary_progress(
+    app: &AppHandle,
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    current: u64,
+    total: u64,
+    state: &str,
+) -> Result<(), String> {
+    let metadata = metadata_task(inp_pool, inp_path).await?;
+    let glossary_config = task_glossary_config(inp_pool).await?;
+    let total_chunks = metadata.total_chunks.max(0) as u64;
+    let completed_chunks = metadata.completed_chunks.max(0) as u64;
+    let status = metadata.status;
+    let existing_detail = metadata.progress_detail;
+    let mut detail = existing_detail.unwrap_or_else(|| {
+        progress_detail_for_config(total_chunks, completed_chunks, &glossary_config)
+    });
+    detail.glossary = ProgressStep::new(
+        state,
+        current,
+        total,
+        format!("术语表建立 ({current}/{total})"),
+    );
+    set_progress_detail_and_emit(app, inp_pool, config_pool, inp_path, &detail, Some(status))
+        .await?;
+    Ok(())
+}
+
 pub async fn prepare_auto_glossary_for_task(
     app: &AppHandle,
     provider_pool: &SqlitePool,
@@ -193,10 +223,14 @@ pub async fn prepare_auto_glossary_for_task(
     let config = get_translation_config(config_pool).await?;
     let interrupt = TranslationInterrupt::new();
     let result = generate_auto_glossary(
+        app,
         provider_pool,
         glossary_config_pool,
         glossary_workspace_root,
         client,
+        &inp_pool,
+        config_pool,
+        &inp_path,
         &task,
         &chunks,
         &config,
@@ -258,10 +292,14 @@ pub(super) async fn prepare_task_glossary(
             Some(id) => id,
             None => {
                 match generate_auto_glossary(
+                    app,
                     provider_pool,
                     glossary_config_pool,
                     glossary_workspace_root,
                     client,
+                    inp_pool,
+                    config_pool,
+                    inp_path,
                     task,
                     pending_chunks,
                     config,
@@ -302,10 +340,14 @@ pub(super) async fn prepare_task_glossary(
 }
 
 async fn generate_auto_glossary(
+    app: &AppHandle,
     provider_pool: &SqlitePool,
     glossary_config_pool: &SqlitePool,
     glossary_workspace_root: &Path,
     client: &Client,
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
     task: &TranslationTaskView,
     pending_chunks: &[ChunkRecord],
     config: &TranslationConfigView,
@@ -318,6 +360,7 @@ async fn generate_auto_glossary(
         .cloned()
         .collect::<Vec<_>>();
     if chunks.is_empty() {
+        emit_glossary_progress(app, inp_pool, config_pool, inp_path, 0, 0, "success").await?;
         let view = glossaries::create_auto_glossary(
             glossary_config_pool,
             glossary_workspace_root,
@@ -352,8 +395,19 @@ async fn generate_auto_glossary(
     let document_format = document_format_from_source_path(&task.source_path)?;
     let content_format = content_format_from_source_path(&task.source_path)?;
     let runtime = Arc::new(glossary_runtime);
+    let total_chunks = chunks.len() as u64;
+    emit_glossary_progress(
+        app,
+        inp_pool,
+        config_pool,
+        inp_path,
+        0,
+        total_chunks,
+        "running",
+    )
+    .await?;
 
-    let mut outcomes = stream::iter(chunks.clone())
+    let mut outcome_stream = stream::iter(chunks.clone())
         .map(|chunk| {
             let runtime = runtime.clone();
             let limiter = limiter.clone();
@@ -377,9 +431,30 @@ async fn generate_auto_glossary(
                 .await
             }
         })
-        .buffer_unordered(max_concurrency)
-        .collect::<Vec<_>>()
-        .await;
+        .buffer_unordered(max_concurrency);
+    let mut outcomes = Vec::new();
+    let mut completed_chunks = 0_u64;
+    while let Some(outcome) = outcome_stream.next().await {
+        completed_chunks += 1;
+        let state = if matches!(outcome, AutoGlossaryChunkOutcome::Interrupted { .. }) {
+            "failed"
+        } else if completed_chunks >= total_chunks {
+            "success"
+        } else {
+            "running"
+        };
+        emit_glossary_progress(
+            app,
+            inp_pool,
+            config_pool,
+            inp_path,
+            completed_chunks,
+            total_chunks,
+            state,
+        )
+        .await?;
+        outcomes.push(outcome);
+    }
     outcomes.sort_by_key(|outcome| match outcome {
         AutoGlossaryChunkOutcome::Success { sequence, .. }
         | AutoGlossaryChunkOutcome::Failed { sequence, .. } => *sequence,
@@ -399,12 +474,32 @@ async fn generate_auto_glossary(
             AutoGlossaryChunkOutcome::Failed { error, .. } => {
                 failed_chunks += 1;
                 if failed_chunks as f64 / chunks.len() as f64 > AUTO_GLOSSARY_FAILURE_THRESHOLD {
+                    emit_glossary_progress(
+                        app,
+                        inp_pool,
+                        config_pool,
+                        inp_path,
+                        completed_chunks,
+                        total_chunks,
+                        "failed",
+                    )
+                    .await?;
                     return Ok(AutoGlossaryGeneration::Interrupted(format!(
                         "Auto glossary generation failed for more than 40% of chunks: {error}"
                     )));
                 }
             }
             AutoGlossaryChunkOutcome::Interrupted { error } => {
+                emit_glossary_progress(
+                    app,
+                    inp_pool,
+                    config_pool,
+                    inp_path,
+                    completed_chunks,
+                    total_chunks,
+                    "failed",
+                )
+                .await?;
                 return Ok(AutoGlossaryGeneration::Interrupted(error));
             }
         }
@@ -508,6 +603,7 @@ async fn generate_glossary_for_chunk(
             messages,
             tools: Vec::new(),
             tool_choice: UnifiedToolChoice::None,
+            web_search: false,
             thinking: None,
             max_output_tokens: None,
             temperature: Some(0.0),

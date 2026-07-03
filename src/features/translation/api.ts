@@ -4,6 +4,7 @@ import type {
   CreateTranslationTaskInput,
   ExportTranslationTaskInput,
   ImportTranslationTaskInput,
+  StartTranslationTaskCreationResult,
   TranslationConfigView,
   TranslationTaskFilters,
   TranslationTaskDetail,
@@ -24,6 +25,22 @@ export function createTranslationTask(
   input: CreateTranslationTaskInput,
 ): Promise<TranslationTaskView> {
   return invoke<TranslationTaskView>("create_translation_task", { input });
+}
+
+export function startTranslationTaskCreation(
+  input: CreateTranslationTaskInput,
+): Promise<StartTranslationTaskCreationResult> {
+  return invoke<StartTranslationTaskCreationResult>("start_translation_task_creation", { input });
+}
+
+export function cancelTranslationTaskCreation(clientTaskId: string): Promise<void> {
+  return invoke("cancel_translation_task_creation", { clientTaskId });
+}
+
+export function publishTranslationTaskCreation(
+  clientTaskId: string,
+): Promise<TranslationTaskView> {
+  return invoke<TranslationTaskView>("publish_translation_task_creation", { clientTaskId });
 }
 
 export function pickTranslationTaskFile(): Promise<string | null> {
@@ -56,6 +73,12 @@ export function startTranslationTasksBatch(
   input: TranslationTaskIdsInput,
 ): Promise<TranslationTaskView[]> {
   return invoke<TranslationTaskView[]>("start_translation_tasks_batch", { input });
+}
+
+export function retranslateTranslationTasksBatch(
+  input: TranslationTaskIdsInput,
+): Promise<TranslationTaskView[]> {
+  return invoke<TranslationTaskView[]>("retranslate_translation_tasks_batch", { input });
 }
 
 export function pauseTranslationTasksBatch(): Promise<void> {

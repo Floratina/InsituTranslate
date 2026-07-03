@@ -674,6 +674,7 @@ const PROTECTED_CUSTOM_PARAMETER_KEYS: &[&str] = &[
     "systemPrompt",
     "prompt",
     "tools",
+    "insituTools",
     "tool_choice",
     "toolChoice",
     "toolConfig",
@@ -1275,10 +1276,20 @@ pub fn build_openai_responses_body(base_url: &str, request: &UnifiedChatRequest)
             body["thinking"] = json!({"type": if disabled { "disabled" } else { "enabled" }});
         }
     }
-    if !request.tools.is_empty() {
-        body["tools"] = Value::Array(request.tools.iter().map(|tool| json!({
+    let mut tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|tool| json!({
             "type": "function", "name": tool.name, "description": tool.description, "parameters": tool.input_schema
-        })).collect());
+        }))
+        .collect();
+    if request.web_search {
+        tools.push(json!({"type": "web_search"}));
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+    if !request.tools.is_empty() {
         body["tool_choice"] = json!(match request.tool_choice {
             UnifiedToolChoice::Required => "required",
             UnifiedToolChoice::None => "none",
@@ -1398,12 +1409,15 @@ pub fn build_anthropic_body(request: &UnifiedChatRequest) -> Value {
             json!({"type": "disabled"})
         };
     }
-    if !request.tools.is_empty() {
+    if !request.tools.is_empty() || request.web_search {
         let mut tools: Vec<Value> = request.tools.iter().map(|tool| json!({
             "name": tool.name, "description": tool.description, "input_schema": tool.input_schema
         })).collect();
         if let Some(last) = tools.last_mut() {
             last["cache_control"] = json!({"type": "ephemeral"});
+        }
+        if request.web_search {
+            tools.push(json!({"type": "web_search_20250305", "name": "web_search"}));
         }
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = if thinking_enabled {
@@ -1413,7 +1427,10 @@ pub fn build_anthropic_body(request: &UnifiedChatRequest) -> Value {
                 UnifiedToolChoice::Required if request.tools.len() == 1 => {
                     json!({"type": "tool", "name": request.tools[0].name})
                 }
-                UnifiedToolChoice::Required => json!({"type": "any"}),
+                UnifiedToolChoice::Required if !request.tools.is_empty() => {
+                    json!({"type": "any"})
+                }
+                UnifiedToolChoice::Required => json!({"type": "auto"}),
                 UnifiedToolChoice::None => json!({"type": "none"}),
                 UnifiedToolChoice::Auto => json!({"type": "auto"}),
             }
@@ -1454,10 +1471,25 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
     if let Some(thinking) = &request.thinking {
         let enabled = thinking.mode != ThinkingMode::Disabled
             && thinking.effort != Some(ThinkingEffort::None);
-        generation["thinkingConfig"] = json!({
-            "includeThoughts": enabled,
-            "thinkingBudget": if enabled { thinking.budget_tokens.map(Value::from).unwrap_or(json!(-1)) } else { json!(0) }
-        });
+        generation["thinkingConfig"] = if is_feature_supported(
+            FeatureId::GeminiThinkingLevel,
+            "",
+            &request.model,
+        ) {
+            json!({
+                "includeThoughts": enabled,
+                "thinkingLevel": if enabled {
+                    gemini_thinking_level(thinking.effort)
+                } else {
+                    "minimal"
+                }
+            })
+        } else {
+            json!({
+                "includeThoughts": enabled,
+                "thinkingBudget": if enabled { thinking.budget_tokens.map(Value::from).unwrap_or(json!(-1)) } else { json!(0) }
+            })
+        };
     }
     if request.logprobs {
         generation["responseLogprobs"] = json!(true);
@@ -1466,15 +1498,33 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
     if !system_parts.is_empty() {
         body["systemInstruction"] = json!({"parts": system_parts});
     }
+    let mut tools = Vec::new();
     if !request.tools.is_empty() {
-        body["tools"] = json!([{"functionDeclarations": request.tools.iter().map(|tool| json!({
+        tools.push(json!({"functionDeclarations": request.tools.iter().map(|tool| json!({
             "name": tool.name, "description": tool.description, "parametersJsonSchema": tool.input_schema
-        })).collect::<Vec<_>>()}]);
+        })).collect::<Vec<_>>()}));
+    }
+    if request.web_search {
+        tools.push(json!({"googleSearch": {}}));
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+    if !request.tools.is_empty() {
         if request.tool_choice == UnifiedToolChoice::Required {
             body["toolConfig"] = json!({"functionCallingConfig": {"mode": "ANY"}});
         }
     }
     body
+}
+
+fn gemini_thinking_level(effort: Option<ThinkingEffort>) -> &'static str {
+    match effort.unwrap_or(ThinkingEffort::Medium) {
+        ThinkingEffort::None | ThinkingEffort::Minimal => "minimal",
+        ThinkingEffort::Low => "low",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::High | ThinkingEffort::Xhigh | ThinkingEffort::Max => "high",
+    }
 }
 
 pub fn build_ollama_body(request: &UnifiedChatRequest) -> Value {
@@ -2216,6 +2266,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
             }],
             tool_choice: UnifiedToolChoice::Auto,
+            web_search: false,
             thinking: Some(ThinkingConfig {
                 mode: ThinkingMode::Enabled,
                 budget_tokens: Some(2048),
@@ -2249,6 +2300,7 @@ mod tests {
             ],
             tools: Vec::new(),
             tool_choice: UnifiedToolChoice::None,
+            web_search: false,
             thinking: None,
             max_output_tokens: None,
             temperature: Some(0.0),
@@ -2303,6 +2355,7 @@ mod tests {
             "systemPrompt": "custom system prompt",
             "prompt": "custom prompt",
             "tools": [{"type": "function", "function": {"name": "custom_tool"}}],
+            "insituTools": {"tools": [{"name": "lookup", "description": "Lookup", "inputSchema": {"type": "object"}}]},
             "tool_choice": "required",
             "toolChoice": {"functionCallingConfig": {"mode": "ANY"}},
             "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
@@ -2321,6 +2374,7 @@ mod tests {
             "system_prompt",
             "systemPrompt",
             "prompt",
+            "insituTools",
             "toolChoice",
             "tool_config",
             "streamOptions",
@@ -2642,6 +2696,61 @@ mod tests {
     }
 
     #[test]
+    fn gemini_three_uses_thinking_level() {
+        let mut request = request();
+        request.model = "gemini-3-pro".into();
+        request.thinking = Some(ThinkingConfig {
+            mode: ThinkingMode::Enabled,
+            budget_tokens: Some(32_000),
+            effort: Some(ThinkingEffort::Max),
+            summary: None,
+        });
+
+        let body = build_gemini_body(&request);
+
+        assert_eq!(
+            body.pointer("/generationConfig/thinkingConfig/includeThoughts"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            body.pointer("/generationConfig/thinkingConfig/thinkingLevel"),
+            Some(&json!("high"))
+        );
+        assert!(body
+            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+            .is_none());
+    }
+
+    #[test]
+    fn vertex_ai_keeps_gemini_body_for_tools_and_thinking() {
+        let adapter = adapter_for(
+            ProviderProtocol::VertexAi,
+            "https://aiplatform.googleapis.com",
+        );
+        let mut request = request();
+        request.model = "gemini-3-pro".into();
+        request.stream = false;
+
+        let (url, body) = adapter
+            .build_chat_request(&request)
+            .expect("vertex request");
+
+        assert!(url.contains(
+            "/projects/project-1/locations/global/publishers/google/models/gemini-3-pro:generateContent"
+        ));
+        assert_eq!(
+            body.pointer("/tools/0/functionDeclarations/0/name"),
+            Some(&json!("lookup"))
+        );
+        assert_eq!(
+            body.pointer("/generationConfig/thinkingConfig/thinkingLevel"),
+            Some(&json!("high"))
+        );
+        assert!(body.get("messages").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
     fn raw_base_url_skips_openai_version_injection() {
         let adapter = RuntimeAdapter::new(
             Client::new(),
@@ -2713,6 +2822,76 @@ mod tests {
         assert!(input
             .iter()
             .any(|item| item.get("type") == Some(&json!("function_call_output"))));
+    }
+
+    #[test]
+    fn openai_responses_appends_web_search_tool() {
+        let mut request = request();
+        request.stream = false;
+        request.web_search = true;
+
+        let body = build_openai_responses_body("https://api.openai.com", &request);
+        let tools = body.get("tools").and_then(Value::as_array).expect("tools");
+
+        assert!(tools
+            .iter()
+            .any(|tool| tool.get("type") == Some(&json!("function"))));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.get("type") == Some(&json!("web_search"))));
+    }
+
+    #[test]
+    fn openai_chat_search_model_does_not_inject_responses_tool() {
+        let mut request = prompt_request();
+        request.model = "gpt-5-search-api".into();
+        request.web_search = true;
+
+        let body = build_openai_chat_body("https://api.openai.com", &request);
+
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn anthropic_appends_web_search_server_tool() {
+        let mut request = prompt_request();
+        request.model = "claude-sonnet-4-20250514".into();
+        request.web_search = true;
+
+        let body = build_anthropic_body(&request);
+
+        assert_eq!(
+            body.pointer("/tools/0/type"),
+            Some(&json!("web_search_20250305"))
+        );
+        assert_eq!(body.pointer("/tools/0/name"), Some(&json!("web_search")));
+    }
+
+    #[test]
+    fn gemini_and_vertex_append_google_search_tool() {
+        for protocol in [ProviderProtocol::Gemini, ProviderProtocol::VertexAi] {
+            let adapter = adapter_for(
+                protocol,
+                if protocol == ProviderProtocol::VertexAi {
+                    "https://aiplatform.googleapis.com"
+                } else {
+                    "https://generativelanguage.googleapis.com"
+                },
+            );
+            let mut request = prompt_request();
+            request.model = "gemini-2.5-pro".into();
+            request.web_search = true;
+
+            let (url, body) = adapter.build_chat_request(&request).expect("request");
+
+            if protocol == ProviderProtocol::VertexAi {
+                assert!(url.contains(
+                    "/projects/project-1/locations/global/publishers/google/models/gemini-2.5-pro:generateContent"
+                ));
+            }
+            assert_eq!(body.pointer("/tools/0/googleSearch"), Some(&json!({})));
+        }
     }
 
     #[test]

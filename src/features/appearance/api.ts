@@ -26,6 +26,10 @@ export function updateAppearancePreferences(
   return invoke<AppearancePreferences>("update_appearance_preferences", { input });
 }
 
+export function openBackendConsole(): Promise<void> {
+  return invoke<void>("open_backend_console");
+}
+
 export function getCachedSystemFonts(): Promise<string[]> {
   return invoke<string[]>("get_cached_system_fonts");
 }

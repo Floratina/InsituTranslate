@@ -6,11 +6,12 @@ use scraper::{Html, Node, StrTendril};
 use crate::task_prompt::{ContentFormat, DocumentFormat};
 
 use super::types::{
-    BlockRef, ParsedChunk, PlaceholderEntry, PlaceholderMap, RenderInput, RenderedChunk,
-    PLACEHOLDER_MAP_VERSION,
+    BlockRef, ParsedChunk, ParserProgress, PlaceholderEntry, PlaceholderMap, RenderInput,
+    RenderedChunk, PLACEHOLDER_MAP_VERSION,
 };
 use super::{
-    chunk_raw_block_refs, token_limit_usize, ChunkedRawBlock, DocumentParser, RawBlockRef,
+    chunk_raw_block_refs, chunk_raw_block_refs_with_progress, token_limit_usize, ChunkedRawBlock,
+    DocumentParser, RawBlockRef,
 };
 
 const HTML_DOM_CHUNK_KIND: &str = "html-dom-chunk";
@@ -22,10 +23,15 @@ const TRANSLATABLE_ATTRIBUTES: &[&str] = &["alt", "title", "placeholder"];
 pub struct HtmlParser;
 
 impl DocumentParser for HtmlParser {
-    fn parse(&self, input: super::types::ParserInput<'_>) -> Result<Vec<ParsedChunk>, String> {
+    fn parse(&self, input: super::types::ParserInput<'_, '_>) -> Result<Vec<ParsedChunk>, String> {
         let text = std::fs::read_to_string(input.source_path)
             .map_err(|error| format!("Unable to read HTML source: {error}"))?;
-        parse_html_text(&text, input.token_limit)
+        match input.progress {
+            Some(progress) => {
+                parse_html_text_with_progress(&text, input.token_limit, Some(progress))
+            }
+            None => parse_html_text(&text, input.token_limit),
+        }
     }
 
     fn restore_chunk(&self, map_json: &str, after_translate_text: &str) -> Result<String, String> {
@@ -44,8 +50,16 @@ impl DocumentParser for HtmlParser {
 }
 
 fn parse_html_text(text: &str, token_limit: i64) -> Result<Vec<ParsedChunk>, String> {
+    parse_html_text_with_progress(text, token_limit, None)
+}
+
+fn parse_html_text_with_progress(
+    text: &str,
+    token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
+) -> Result<Vec<ParsedChunk>, String> {
     let document = Html::parse_document(text);
-    let mut chunks = html_text_chunks(&document, token_limit)?;
+    let mut chunks = html_text_chunks(&document, token_limit, progress)?;
     let attributes = html_attribute_chunks(&document, chunks.len())?;
     chunks.extend(attributes);
     Ok(chunks)
@@ -80,7 +94,11 @@ struct HtmlAttributeReplacement {
     text: String,
 }
 
-fn html_text_chunks(document: &Html, token_limit: i64) -> Result<Vec<ParsedChunk>, String> {
+fn html_text_chunks(
+    document: &Html,
+    token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
+) -> Result<Vec<ParsedChunk>, String> {
     let raw_blocks = collect_html_text_blocks(document)
         .into_iter()
         .map(|block| {
@@ -98,7 +116,15 @@ fn html_text_chunks(document: &Html, token_limit: i64) -> Result<Vec<ParsedChunk
         return Ok(Vec::new());
     }
 
-    chunk_raw_block_refs(raw_blocks, token_limit_usize(token_limit))
+    let chunked_blocks = match progress {
+        Some(progress) => chunk_raw_block_refs_with_progress(
+            raw_blocks,
+            token_limit_usize(token_limit),
+            Some(progress),
+        ),
+        None => chunk_raw_block_refs(raw_blocks, token_limit_usize(token_limit)),
+    };
+    chunked_blocks
         .into_iter()
         .enumerate()
         .filter(|(_, blocks)| !blocks.is_empty())

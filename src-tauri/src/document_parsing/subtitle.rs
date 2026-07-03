@@ -8,10 +8,12 @@ use crate::task_prompt::{ContentFormat, DocumentFormat};
 
 use super::placeholders::{protect_html, restore_with_map};
 use super::types::{
-    BlockRef, ParsedChunk, PlaceholderEntry, PlaceholderMap, RenderInput, RenderedChunk,
+    BlockRef, ParsedChunk, ParserProgress, PlaceholderEntry, PlaceholderMap, RenderInput,
+    RenderedChunk,
 };
 use super::{
-    chunk_raw_block_refs, token_limit_usize, ChunkedRawBlock, DocumentParser, RawBlockRef,
+    chunk_raw_block_refs, chunk_raw_block_refs_with_progress, token_limit_usize, ChunkedRawBlock,
+    DocumentParser, RawBlockRef,
 };
 
 const TIMED_TEXT_CHUNK_KIND: &str = "timed-text-chunk";
@@ -26,14 +28,19 @@ pub struct SubtitleParser {
 }
 
 impl DocumentParser for SubtitleParser {
-    fn parse(&self, input: super::types::ParserInput<'_>) -> Result<Vec<ParsedChunk>, String> {
+    fn parse(&self, input: super::types::ParserInput<'_, '_>) -> Result<Vec<ParsedChunk>, String> {
         let text = std::fs::read_to_string(input.source_path)
             .map_err(|error| format!("Unable to read subtitle source: {error}"))?;
+        let progress = input.progress;
         match self.format {
-            DocumentFormat::Srt | DocumentFormat::Ass => {
-                parse_subtitle_text(&text, self.format, self.content_format, input.token_limit)
-            }
-            DocumentFormat::Lrc => parse_lrc_text(&text, input.token_limit),
+            DocumentFormat::Srt | DocumentFormat::Ass => parse_subtitle_text(
+                &text,
+                self.format,
+                self.content_format,
+                input.token_limit,
+                progress,
+            ),
+            DocumentFormat::Lrc => parse_lrc_text(&text, input.token_limit, progress),
             _ => Err("Unsupported subtitle parser format".into()),
         }
     }
@@ -109,6 +116,7 @@ fn parse_subtitle_text(
     format: DocumentFormat,
     content_format: ContentFormat,
     token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
 ) -> Result<Vec<ParsedChunk>, String> {
     let subtitle_format = subtitle_format(format)?;
     let subtitle_file = parse_str(subtitle_format, text, SUBPARSE_FPS)
@@ -151,10 +159,14 @@ fn parse_subtitle_text(
         });
     }
 
-    build_timed_chunks(units, format, content_format, token_limit)
+    build_timed_chunks(units, format, content_format, token_limit, progress)
 }
 
-fn parse_lrc_text(text: &str, token_limit: i64) -> Result<Vec<ParsedChunk>, String> {
+fn parse_lrc_text(
+    text: &str,
+    token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
+) -> Result<Vec<ParsedChunk>, String> {
     Lyrics::from_str(text)
         .map_err(|error| format!("Unable to parse LRC source with lrc: {error}"))?;
     let units = lrc_lyric_ranges(text)?
@@ -174,7 +186,13 @@ fn parse_lrc_text(text: &str, token_limit: i64) -> Result<Vec<ParsedChunk>, Stri
         })
         .collect::<Vec<_>>();
 
-    build_timed_chunks(units, DocumentFormat::Lrc, ContentFormat::Lrc, token_limit)
+    build_timed_chunks(
+        units,
+        DocumentFormat::Lrc,
+        ContentFormat::Lrc,
+        token_limit,
+        progress,
+    )
 }
 
 fn build_timed_chunks(
@@ -182,6 +200,7 @@ fn build_timed_chunks(
     format: DocumentFormat,
     content_format: ContentFormat,
     token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
 ) -> Result<Vec<ParsedChunk>, String> {
     let raw_blocks = units
         .into_iter()
@@ -193,7 +212,15 @@ fn build_timed_chunks(
             )
         })
         .collect::<Vec<_>>();
-    chunk_raw_block_refs(raw_blocks, token_limit_usize(token_limit))
+    let chunked_blocks = match progress {
+        Some(progress) => chunk_raw_block_refs_with_progress(
+            raw_blocks,
+            token_limit_usize(token_limit),
+            Some(progress),
+        ),
+        None => chunk_raw_block_refs(raw_blocks, token_limit_usize(token_limit)),
+    };
+    chunked_blocks
         .into_iter()
         .enumerate()
         .map(|(sequence, units)| timed_chunk_from_units(sequence, units, format, content_format))
@@ -881,7 +908,7 @@ mod tests {
             "Gamma\n\n",
         );
 
-        let chunks = parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 2)
+        let chunks = parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 2, None)
             .expect("parse srt");
 
         assert_eq!(chunks.len(), 2);
@@ -900,8 +927,8 @@ mod tests {
             "00:00:03,000 --> 00:00:04,000\r\n",
             "Second line\r\n\r\n",
         );
-        let chunks =
-            parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 100).expect("parse");
+        let chunks = parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 100, None)
+            .expect("parse");
         let after = "<it0>Hola <t1>mundo</t1></it0>\n<it1>Segunda linea</it1>";
         let rendered_chunk = rendered_chunk(&chunks[0], after);
 
@@ -924,8 +951,8 @@ mod tests {
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
             "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,banner,Hello {\\i1}world{\\i0}\\NNext\n",
         );
-        let chunks =
-            parse_subtitle_text(ass, DocumentFormat::Ass, ContentFormat::Ass, 100).expect("parse");
+        let chunks = parse_subtitle_text(ass, DocumentFormat::Ass, ContentFormat::Ass, 100, None)
+            .expect("parse");
         let after = chunks[0]
             .source_text
             .replace("Hello", "Hola")
@@ -951,7 +978,7 @@ mod tests {
             "[:] keep this comment\n",
             "[00:03.00]Second\n",
         );
-        let chunks = parse_lrc_text(lrc, 100).expect("parse lrc");
+        let chunks = parse_lrc_text(lrc, 100, None).expect("parse lrc");
         let after = "<it0>Hola</it0>\n<it1>letra simple</it1>\n<it2>Segundo</it2>";
         let rendered_chunk = rendered_chunk(&chunks[0], after);
 
@@ -967,8 +994,8 @@ mod tests {
     #[test]
     fn restore_fails_when_translated_timed_unit_tags_are_missing() {
         let srt = concat!("1\n", "00:00:01,000 --> 00:00:02,000\n", "Hello\n\n",);
-        let chunks =
-            parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 100).expect("parse");
+        let chunks = parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 100, None)
+            .expect("parse");
         let map = crate::document_parsing::parse_map(&chunks[0].map_json).expect("map");
 
         let error = restore_timed_text_chunk(&map, "Hola").expect_err("missing unit tag");
@@ -979,8 +1006,8 @@ mod tests {
     #[test]
     fn render_fails_when_timed_unit_reference_is_out_of_range() {
         let srt = concat!("1\n", "00:00:01,000 --> 00:00:02,000\n", "Hello\n\n",);
-        let chunks =
-            parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 100).expect("parse");
+        let chunks = parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 100, None)
+            .expect("parse");
         let mut chunk = rendered_chunk(&chunks[0], "<it0>Hola</it0>");
         let mut map = crate::document_parsing::parse_map(&chunk.map_json).expect("map");
         for entry in &mut map.entries {

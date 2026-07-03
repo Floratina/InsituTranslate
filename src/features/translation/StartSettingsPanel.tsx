@@ -7,6 +7,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  useEffect,
   useMemo,
   useState,
   type Dispatch,
@@ -31,6 +32,7 @@ import type {
   ContextHandlingMode,
   PdfParsingMode,
   RateLimitStrategy,
+  ThinkingEffort,
   TranslationConfigView,
 } from "@/features/translation/types";
 import { cn } from "@/lib/utils";
@@ -161,6 +163,19 @@ const PDF_PARSING_OPTIONS: Array<{
     label: "仅 MinerU",
     description: "仅使用 MinerU，失败则中断任务",
   },
+];
+
+const THINKING_EFFORT_OPTIONS: Array<{
+  value: ThinkingEffort;
+  label: string;
+}> = [
+  { value: "none", label: "None" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Xhigh" },
+  { value: "max", label: "Max" },
 ];
 
 const PROOFREADING_OPTIONS: ProofreadingOption[] = [
@@ -345,6 +360,38 @@ export function StartSettingsPanel({
     () => glossarySelectedValue(config, glossaries),
     [config, glossaries],
   );
+  const selectedModel = useMemo(
+    () => models.find((model) => model.id === modelId) ?? null,
+    [modelId, models],
+  );
+  const reasoningAvailable = Boolean(selectedModel?.capabilityReasoning);
+  const webSearchAvailable = Boolean(selectedModel?.capabilityWeb);
+  const toolsAvailable = Boolean(selectedModel?.capabilityTools);
+
+  useEffect(() => {
+    if (!reasoningAvailable && config.thinkingEffort !== "none") {
+      onConfigChange((current) => ({ ...current, thinkingEffort: "none" }));
+    }
+  }, [config.thinkingEffort, onConfigChange, reasoningAvailable]);
+
+  useEffect(() => {
+    if (
+      (!webSearchAvailable && config.useWebSearch)
+      || (!toolsAvailable && config.useTools)
+    ) {
+      onConfigChange((current) => ({
+        ...current,
+        useWebSearch: webSearchAvailable ? current.useWebSearch : false,
+        useTools: toolsAvailable ? current.useTools : false,
+      }));
+    }
+  }, [
+    config.useTools,
+    config.useWebSearch,
+    onConfigChange,
+    toolsAvailable,
+    webSearchAvailable,
+  ]);
 
   function updateGlossaryEnabled(enabled: boolean): void {
     onConfigChange((current) => {
@@ -501,6 +548,65 @@ export function StartSettingsPanel({
                     ))}
                   </SelectContent>
                 </Select>
+              </FieldBlock>
+
+              <FieldBlock label="思考强度">
+                <Select
+                  value={reasoningAvailable ? config.thinkingEffort : "none"}
+                  onValueChange={(value) =>
+                    onConfigChange((current) => ({
+                      ...current,
+                      thinkingEffort: value as ThinkingEffort,
+                    }))
+                  }
+                  disabled={loading || !reasoningAvailable}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择思考强度" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(reasoningAvailable
+                      ? THINKING_EFFORT_OPTIONS
+                      : THINKING_EFFORT_OPTIONS.slice(0, 1)
+                    ).map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldBlock>
+
+              <FieldBlock label="联网搜索">
+                <div className="flex h-8 items-center">
+                  <Switch
+                    size="sm"
+                    checked={webSearchAvailable ? config.useWebSearch : false}
+                    disabled={loading || !webSearchAvailable}
+                    onCheckedChange={(checked) =>
+                      onConfigChange((current) => ({
+                        ...current,
+                        useWebSearch: checked,
+                      }))
+                    }
+                  />
+                </div>
+              </FieldBlock>
+
+              <FieldBlock label="工具调用">
+                <div className="flex h-8 items-center">
+                  <Switch
+                    size="sm"
+                    checked={toolsAvailable ? config.useTools : false}
+                    disabled={loading || !toolsAvailable}
+                    onCheckedChange={(checked) =>
+                      onConfigChange((current) => ({
+                        ...current,
+                        useTools: checked,
+                      }))
+                    }
+                  />
+                </div>
               </FieldBlock>
             </div>
           )}

@@ -1,6 +1,7 @@
 export type TranslationTaskStatus =
   | "pending"
   | "running"
+  | "interrupted-pending"
   | "interrupted"
   | "failed"
   | "success";
@@ -17,6 +18,46 @@ export interface TokenStats {
   cachedTokens: number;
   thinkingTokens: number;
   totalTokens: number;
+}
+
+export type ProgressStepState = "pending" | "running" | "success" | "failed";
+
+export interface ProgressStep {
+  state: ProgressStepState;
+  current: number;
+  total: number;
+  percent: number;
+  label: string;
+}
+
+export interface ProgressDetail {
+  ast: ProgressStep;
+  chunking: ProgressStep;
+  glossary: ProgressStep;
+  translating: ProgressStep;
+  restore: ProgressStep;
+}
+
+export interface StartTranslationTaskCreationResult {
+  clientTaskId: string;
+}
+
+export type TranslationTaskCreationStage = "ast" | "chunking" | "glossary";
+export type TranslationTaskCreationStatus =
+  | "queued"
+  | "running"
+  | "success"
+  | "failed"
+  | "cancelled";
+
+export interface TranslationTaskCreationProgressPayload {
+  clientTaskId: string;
+  filePath: string;
+  stage: TranslationTaskCreationStage;
+  step: ProgressStep;
+  status: TranslationTaskCreationStatus;
+  task: TranslationTaskView | null;
+  error: string | null;
 }
 
 export interface TranslationConfigView {
@@ -38,6 +79,9 @@ export interface TranslationConfigView {
   useGlossary: boolean;
   glossaryMode: GlossaryMode;
   glossaryId: string | null;
+  thinkingEffort: ThinkingEffort;
+  useWebSearch: boolean;
+  useTools: boolean;
   confidenceMode: ConfidenceMode;
   pdfParsingMode: PdfParsingMode;
 }
@@ -49,6 +93,14 @@ export type ContextHandlingMode =
   | "sliding-window-source"
   | "global-background";
 export type GlossaryMode = "auto" | "existing";
+export type ThinkingEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
 export type ConfidenceMode = "off" | "confidence-index";
 export type PdfParsingMode = "local-first" | "mineru-first" | "local-only" | "mineru-only";
 
@@ -125,6 +177,7 @@ export interface TranslationTaskView {
   errorRate: number;
   lastError: string | null;
   rateLimitStatus: string | null;
+  progressDetail: ProgressDetail | null;
   createdAt: string;
   updatedAt: string;
 }

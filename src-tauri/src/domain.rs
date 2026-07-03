@@ -351,6 +351,12 @@ pub enum ThinkingEffort {
     Max,
 }
 
+impl Default for ThinkingEffort {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThinkingSummary {
@@ -420,6 +426,8 @@ pub struct UnifiedChatRequest {
     pub messages: Vec<UnifiedMessage>,
     pub tools: Vec<UnifiedTool>,
     pub tool_choice: UnifiedToolChoice,
+    #[serde(default)]
+    pub web_search: bool,
     pub thinking: Option<ThinkingConfig>,
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f64>,

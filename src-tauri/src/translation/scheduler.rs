@@ -4,17 +4,18 @@ use std::time::Duration;
 
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use serde_json::Value;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
 use crate::adapters::{
-    finish_reason_is_truncation, ProviderChatError, ProviderChatMeta, RuntimeAdapter,
+    finish_reason_is_truncation, ProviderChatError, ProviderChatMeta, RateLimitTelemetry,
+    RuntimeAdapter,
 };
 use crate::db as app_db;
+use crate::diagnostics::BackendLog;
 use crate::document_parsing::restore_chunk_for_map;
-use crate::domain::{UnifiedChatRequest, UnifiedToolChoice};
+use crate::domain::UnifiedChatRequest;
 use crate::pdf_parsing::PdfParsingMode;
 use crate::task_prompt::{ContentFormat, DocumentFormat, TaskChunkInput};
 use crate::translation_prompt::{
@@ -30,22 +31,98 @@ use super::db::{
     content_format_from_source_path, document_format_from_source_path,
     effective_translation_concurrency, finalize_task, get_task_from_index, get_translation_config,
     glossary_source_chunks, insert_assets, metadata_task, parse_source_file_for_task,
-    pending_chunks, refresh_task_stats, resolve_source_file, task_assistant_custom_parameters,
-    task_assistant_prompt,
+    pending_chunks, progress_detail_for_config, progress_detail_for_translation_stats,
+    refresh_task_stats, resolve_source_file, set_progress_detail, set_progress_detail_and_emit,
+    task_assistant_custom_parameters, task_assistant_prompt, task_glossary_config,
 };
 use super::glossary::{prepare_task_glossary, TaskGlossaryMatcher, TaskGlossaryPreparation};
 use super::limiter::{
     current_rate_limit_status, AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter,
 };
+use super::request_options::{resolve_translation_request_options, TranslationRequestOptions};
 use super::types::{ChunkOutcome, ChunkRecord};
 use super::{
-    ConfidenceMode, ContextHandlingMode, PreparedRun, RateLimitStrategy, RunMode, TokenStats,
-    TranslationChunkStatus, TranslationInterrupt, TranslationProgressPayload,
-    TranslationTaskStatus, TranslationTaskView, ERROR_RATE_FAILURE_THRESHOLD,
-    TRANSLATION_PROGRESS_EVENT,
+    ConfidenceMode, ContextHandlingMode, PreparedRun, ProgressDetail, ProgressStep,
+    RateLimitStrategy, RunMode, TokenStats, TranslationChunkStatus, TranslationInterrupt,
+    TranslationProgressPayload, TranslationTaskStatus, TranslationTaskView,
+    ERROR_RATE_FAILURE_THRESHOLD, TRANSLATION_PROGRESS_EVENT,
 };
 
+fn count_label(name: &str, current: u64, total: u64) -> String {
+    format!("{name} ({current}/{total})")
+}
+
+fn write_translation_log(log: &Option<BackendLog>, level: &str, message: impl AsRef<str>) {
+    if let Some(log) = log {
+        log.write(level, "translation", message);
+    }
+}
+
+fn rate_limit_summary(rate_limits: &RateLimitTelemetry) -> String {
+    let mut parts = Vec::new();
+    if let Some(value) = rate_limits.request_remaining {
+        parts.push(format!("request_remaining={value}"));
+    }
+    if let Some(value) = rate_limits.request_limit {
+        parts.push(format!("request_limit={value}"));
+    }
+    if let Some(value) = rate_limits.request_reset_ms {
+        parts.push(format!("request_reset_ms={value}"));
+    }
+    if let Some(value) = rate_limits.token_remaining {
+        parts.push(format!("token_remaining={value}"));
+    }
+    if let Some(value) = rate_limits.token_limit {
+        parts.push(format!("token_limit={value}"));
+    }
+    if let Some(value) = rate_limits.token_reset_ms {
+        parts.push(format!("token_reset_ms={value}"));
+    }
+    if let Some(value) = rate_limits.retry_after_ms {
+        parts.push(format!("retry_after_ms={value}"));
+    }
+    if let Some(value) = rate_limits.source.as_deref() {
+        parts.push(format!("rate_limit_source={value}"));
+    }
+    if parts.is_empty() {
+        "rate_limit_headers=none".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn log_chunk_issue(
+    log: &Option<BackendLog>,
+    level: &str,
+    chunk: &ChunkRecord,
+    attempt: u32,
+    max_retries: u32,
+    message: impl AsRef<str>,
+) {
+    write_translation_log(
+        log,
+        level,
+        format!(
+            "chunk={} sequence={} attempt={}/{} {}",
+            chunk.id,
+            chunk.sequence,
+            attempt + 1,
+            max_retries + 1,
+            message.as_ref()
+        ),
+    );
+}
+
+fn retry_action(attempt: u32, max_retries: u32) -> &'static str {
+    if attempt == max_retries {
+        "no retries left"
+    } else {
+        "will retry"
+    }
+}
+
 pub async fn prepare_translation_run(
+    app: &AppHandle,
     provider_pool: &SqlitePool,
     client: &Client,
     config_pool: &SqlitePool,
@@ -53,13 +130,23 @@ pub async fn prepare_translation_run(
     id: &str,
     mode: RunMode,
 ) -> Result<PreparedRun, String> {
+    let backend_log = BackendLog::from_app(app).ok();
     let indexed = get_task_from_index(config_pool, id).await?;
+    write_translation_log(
+        &backend_log,
+        "INFO",
+        format!(
+            "Preparing task id={} name=\"{}\" mode={mode:?} current_status={:?}",
+            indexed.id, indexed.name, indexed.status
+        ),
+    );
     let inp_path = PathBuf::from(&indexed.inp_path);
     if !inp_path.starts_with(workspace_root) {
         return Err("Task file is outside the configured workspace".into());
     }
     let inp_pool = connect_inp(&inp_path).await?;
     let config = get_translation_config(config_pool).await?;
+    let glossary_config = task_glossary_config(&inp_pool).await?;
     let now = unix_timestamp();
     match mode {
         RunMode::Start => {
@@ -83,7 +170,23 @@ pub async fn prepare_translation_run(
             .map_err(|error| error.to_string())?;
         }
         RunMode::Retranslate => {
-            rebuild_chunks_for_retranslate(
+            let parsing_detail = ProgressDetail {
+                ast: ProgressStep::running(0, 0, "AST 处理中"),
+                chunking: ProgressStep::pending(0, 0, count_label("分块", 0, 0)),
+                glossary: progress_detail_for_config(0, 0, &glossary_config).glossary,
+                translating: ProgressStep::pending(0, 0, count_label("翻译", 0, 0)),
+                restore: ProgressStep::pending(0, 0, count_label("占位符恢复", 0, 0)),
+            };
+            set_progress_detail_and_emit(
+                app,
+                &inp_pool,
+                config_pool,
+                &inp_path,
+                &parsing_detail,
+                Some(TranslationTaskStatus::Running),
+            )
+            .await?;
+            let rebuilt_chunks = match rebuild_chunks_for_retranslate(
                 provider_pool,
                 client,
                 &inp_pool,
@@ -92,7 +195,37 @@ pub async fn prepare_translation_run(
                 config.pdf_parsing_mode,
                 &now,
             )
-            .await?;
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    write_translation_log(
+                        &backend_log,
+                        "ERROR",
+                        format!("Task id={} chunk rebuild failed: {error}", indexed.id),
+                    );
+                    let failed_detail = ProgressDetail {
+                        ast: ProgressStep::failed(0, 0, "AST 处理失败"),
+                        chunking: ProgressStep::failed(0, 0, count_label("分块", 0, 0)),
+                        glossary: progress_detail_for_config(0, 0, &glossary_config).glossary,
+                        translating: ProgressStep::pending(0, 0, count_label("翻译", 0, 0)),
+                        restore: ProgressStep::pending(0, 0, count_label("占位符恢复", 0, 0)),
+                    };
+                    set_progress_detail_and_emit(
+                        app,
+                        &inp_pool,
+                        config_pool,
+                        &inp_path,
+                        &failed_detail,
+                        Some(TranslationTaskStatus::Failed),
+                    )
+                    .await?;
+                    inp_pool.close().await;
+                    return Err(error);
+                }
+            };
+            let rebuilt_detail = progress_detail_for_config(rebuilt_chunks, 0, &glossary_config);
+            set_progress_detail(&inp_pool, &rebuilt_detail).await?;
         }
     }
     sqlx::query(
@@ -115,7 +248,36 @@ pub async fn prepare_translation_run(
     .execute(&inp_pool)
     .await
     .map_err(|error| error.to_string())?;
-    let task = refresh_task_stats(&inp_pool, config_pool, &inp_path, None).await?;
+    let stats = aggregate_chunk_stats(&inp_pool).await?;
+    let current_task = metadata_task(&inp_pool, &inp_path).await?;
+    let detail = progress_detail_for_translation_stats(
+        current_task.progress_detail,
+        stats.total_chunks.max(0) as u64,
+        stats.completed_chunks.max(0) as u64,
+        TranslationTaskStatus::Running,
+        &glossary_config,
+    );
+    let task = set_progress_detail_and_emit(
+        app,
+        &inp_pool,
+        config_pool,
+        &inp_path,
+        &detail,
+        Some(TranslationTaskStatus::Running),
+    )
+    .await?;
+    write_translation_log(
+        &backend_log,
+        "INFO",
+        format!(
+            "Task id={} prepared: total_chunks={} completed_chunks={} concurrency={} retries={}",
+            task.id,
+            stats.total_chunks,
+            stats.completed_chunks,
+            config.max_concurrency,
+            config.max_retries
+        ),
+    );
     inp_pool.close().await;
     Ok(PreparedRun {
         task,
@@ -132,7 +294,7 @@ async fn rebuild_chunks_for_retranslate(
     token_limit: i64,
     pdf_parsing_mode: PdfParsingMode,
     now: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let source_path = PathBuf::from(&indexed.source_path);
     let resolved_source = resolve_source_file(inp_pool, &source_path).await?;
     let parsed_source = parse_source_file_for_task(
@@ -154,6 +316,7 @@ async fn rebuild_chunks_for_retranslate(
         .await
         .map_err(|error| error.to_string())?;
     insert_assets(&mut transaction, &parsed_source.assets, now).await?;
+    let total_chunks = parsed_source.chunks.len() as u64;
     for chunk in parsed_source.chunks {
         sqlx::query(
             "INSERT INTO chunks (
@@ -181,7 +344,7 @@ async fn rebuild_chunks_for_retranslate(
         .commit()
         .await
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(total_chunks)
 }
 
 pub async fn run_translation_task(
@@ -194,10 +357,30 @@ pub async fn run_translation_task(
     prepared: PreparedRun,
     interrupt: TranslationInterrupt,
 ) -> Result<(), String> {
+    let backend_log = BackendLog::from_app(&app).ok();
     let inp_pool = connect_inp(&prepared.inp_path).await?;
     let task = metadata_task(&inp_pool, &prepared.inp_path).await?;
     let pending_chunks = pending_chunks(&inp_pool).await?;
+    write_translation_log(
+        &backend_log,
+        "INFO",
+        format!(
+            "Task id={} run started: pending_chunks={} max_concurrency={} retries={}",
+            task.id,
+            pending_chunks.len(),
+            prepared.config.max_concurrency,
+            prepared.config.max_retries
+        ),
+    );
     if pending_chunks.is_empty() {
+        write_translation_log(
+            &backend_log,
+            "INFO",
+            format!(
+                "Task id={} has no pending chunks; finalizing success",
+                task.id
+            ),
+        );
         finalize_task(
             &app,
             &inp_pool,
@@ -236,6 +419,14 @@ pub async fn run_translation_task(
     {
         TaskGlossaryPreparation::Ready(entries) => Arc::new(TaskGlossaryMatcher::new(entries)?),
         TaskGlossaryPreparation::Interrupted => {
+            write_translation_log(
+                &backend_log,
+                "WARN",
+                format!(
+                    "Task id={} interrupted during glossary preparation",
+                    task.id
+                ),
+            );
             inp_pool.close().await;
             return Ok(());
         }
@@ -243,9 +434,15 @@ pub async fn run_translation_task(
 
     let model = app_db::get_model(&provider_pool, &task.model_id).await?;
     let config = app_db::runtime_config(&provider_pool, &task.provider_id).await?;
-    let adapter = Arc::new(RuntimeAdapter::new(client, config));
     let assistant_prompt = task_assistant_prompt(&inp_pool).await?;
     let assistant_custom_parameters = task_assistant_custom_parameters(&inp_pool).await?;
+    let request_options = resolve_translation_request_options(
+        &prepared.config,
+        &config,
+        &model,
+        assistant_custom_parameters,
+    )?;
+    let adapter = Arc::new(RuntimeAdapter::new(client, config));
     let dynamic_rate_limit = prepared.config.rate_limit_strategy == RateLimitStrategy::Dynamic;
     let context_handling_mode = prepared.config.context_handling_mode;
     let effective_max_concurrency = effective_translation_concurrency(&prepared.config);
@@ -268,6 +465,14 @@ pub async fn run_translation_task(
     let target_language = task.target_language.clone();
     let document_format = document_format_from_source_path(&task.source_path)?;
     let content_format = content_format_from_source_path(&task.source_path)?;
+    write_translation_log(
+        &backend_log,
+        "INFO",
+        format!(
+            "Task id={} translation requests ready: model=\"{}\" effective_concurrency={} context_mode={:?}",
+            task.id, model.request_name, max_concurrency, context_handling_mode
+        ),
+    );
 
     if context_handling_mode == ContextHandlingMode::SlidingWindowTarget {
         run_sliding_window_translation(
@@ -279,7 +484,7 @@ pub async fn run_translation_task(
             model.request_name.clone(),
             target_language,
             assistant_prompt,
-            assistant_custom_parameters,
+            request_options,
             global_background,
             glossary_matcher,
             document_format,
@@ -290,6 +495,7 @@ pub async fn run_translation_task(
             quota,
             limiter,
             manual_limiter,
+            backend_log,
             &interrupt,
         )
         .await?;
@@ -303,6 +509,7 @@ pub async fn run_translation_task(
     let writer_path = prepared.inp_path.clone();
     let writer_app = app.clone();
     let writer_interrupted = interrupt.clone();
+    let writer_backend_log = backend_log.clone();
     let writer = tokio::spawn(async move {
         writer_loop(
             writer_app,
@@ -311,6 +518,7 @@ pub async fn run_translation_task(
             writer_path,
             rx,
             writer_interrupted,
+            writer_backend_log,
         )
         .await
     });
@@ -323,10 +531,11 @@ pub async fn run_translation_task(
             let limiter = limiter.clone();
             let quota = quota.clone();
             let manual_limiter = manual_limiter.clone();
+            let backend_log = backend_log.clone();
             let model_request_name = model.request_name.clone();
             let target_language = target_language.clone();
             let assistant_prompt = assistant_prompt.clone();
-            let assistant_custom_parameters = assistant_custom_parameters.clone();
+            let request_options = request_options.clone();
             let glossary_matcher = glossary_matcher.clone();
             let global_background = global_background.clone();
             let inp_pool = inp_pool.clone();
@@ -339,6 +548,14 @@ pub async fn run_translation_task(
                         match previous_source_context(&inp_pool, chunk.sequence).await {
                             Ok(context) => context,
                             Err(error) => {
+                                log_chunk_issue(
+                                    &backend_log,
+                                    "ERROR",
+                                    &chunk,
+                                    0,
+                                    max_retries,
+                                    format!("previous source context failed: {error}"),
+                                );
                                 let outcome = failed_outcome(
                                     chunk,
                                     TranslationChunkStatus::Failed,
@@ -367,7 +584,7 @@ pub async fn run_translation_task(
                     model_request_name,
                     target_language,
                     assistant_prompt,
-                    assistant_custom_parameters,
+                    request_options,
                     global_background,
                     previous_context,
                     glossary_matcher,
@@ -379,6 +596,7 @@ pub async fn run_translation_task(
                     quota,
                     limiter.clone(),
                     manual_limiter,
+                    backend_log,
                 )
                 .await;
                 if outcome.interrupt_task {
@@ -404,7 +622,7 @@ async fn run_sliding_window_translation(
     model_request_name: String,
     target_language: String,
     assistant_prompt: Option<String>,
-    assistant_custom_parameters: Value,
+    request_options: TranslationRequestOptions,
     global_background: Option<String>,
     glossary_matcher: Arc<TaskGlossaryMatcher>,
     document_format: DocumentFormat,
@@ -415,13 +633,27 @@ async fn run_sliding_window_translation(
     quota: Arc<HeaderQuotaPolicy>,
     limiter: Arc<AdaptiveLimiter>,
     manual_limiter: Option<Arc<ManualRateLimiter>>,
+    backend_log: Option<BackendLog>,
     interrupt: &TranslationInterrupt,
 ) -> Result<(), String> {
     for chunk in pending_chunks {
         if interrupt.is_interrupted() {
             break;
         }
-        let previous_context = previous_translation_context(inp_pool, chunk.sequence).await?;
+        let previous_context = match previous_translation_context(inp_pool, chunk.sequence).await {
+            Ok(context) => context,
+            Err(error) => {
+                log_chunk_issue(
+                    &backend_log,
+                    "ERROR",
+                    &chunk,
+                    0,
+                    max_retries,
+                    format!("previous translation context failed: {error}"),
+                );
+                return Err(error);
+            }
+        };
         let Some(_permit) = limiter.acquire(&interrupt.flag).await else {
             break;
         };
@@ -433,7 +665,7 @@ async fn run_sliding_window_translation(
             model_request_name.clone(),
             target_language.clone(),
             assistant_prompt.clone(),
-            assistant_custom_parameters.clone(),
+            request_options.clone(),
             global_background.clone(),
             previous_context,
             glossary_matcher.clone(),
@@ -445,6 +677,7 @@ async fn run_sliding_window_translation(
             quota.clone(),
             limiter.clone(),
             manual_limiter.clone(),
+            backend_log.clone(),
         )
         .await;
         let interrupt_task = outcome.interrupt_task;
@@ -454,7 +687,15 @@ async fn run_sliding_window_translation(
             limiter.notify_waiters();
         }
     }
-    finalize_translation_run(app, inp_pool, config_pool, inp_path, interrupt).await
+    finalize_translation_run(
+        app,
+        inp_pool,
+        config_pool,
+        inp_path,
+        interrupt,
+        &backend_log,
+    )
+    .await
 }
 
 async fn writer_loop(
@@ -464,11 +705,20 @@ async fn writer_loop(
     inp_path: PathBuf,
     mut rx: mpsc::Receiver<ChunkOutcome>,
     interrupted: TranslationInterrupt,
+    backend_log: Option<BackendLog>,
 ) -> Result<(), String> {
     while let Some(outcome) = rx.recv().await {
         apply_and_emit_chunk_outcome(&app, &inp_pool, &config_pool, &inp_path, outcome).await?;
     }
-    finalize_translation_run(&app, &inp_pool, &config_pool, &inp_path, &interrupted).await
+    finalize_translation_run(
+        &app,
+        &inp_pool,
+        &config_pool,
+        &inp_path,
+        &interrupted,
+        &backend_log,
+    )
+    .await
 }
 
 async fn apply_and_emit_chunk_outcome(
@@ -479,6 +729,19 @@ async fn apply_and_emit_chunk_outcome(
     outcome: ChunkOutcome,
 ) -> Result<(), String> {
     apply_chunk_outcome(inp_pool, outcome).await?;
+    let stats = aggregate_chunk_stats(inp_pool).await?;
+    let metadata = metadata_task(inp_pool, inp_path).await?;
+    let glossary_config = task_glossary_config(inp_pool).await?;
+    let task_status = metadata.status;
+    let existing_detail = metadata.progress_detail;
+    let detail = progress_detail_for_translation_stats(
+        existing_detail,
+        stats.total_chunks.max(0) as u64,
+        stats.completed_chunks.max(0) as u64,
+        task_status,
+        &glossary_config,
+    );
+    set_progress_detail(inp_pool, &detail).await?;
     let task = refresh_task_stats(inp_pool, config_pool, inp_path, None).await?;
     let _ = app.emit(
         TRANSLATION_PROGRESS_EVENT,
@@ -493,6 +756,7 @@ async fn finalize_translation_run(
     config_pool: &SqlitePool,
     inp_path: &Path,
     interrupted: &TranslationInterrupt,
+    backend_log: &Option<BackendLog>,
 ) -> Result<(), String> {
     let stats = aggregate_chunk_stats(inp_pool).await?;
     let (status, last_error) = if interrupted.is_interrupted() {
@@ -515,6 +779,36 @@ async fn finalize_translation_run(
     } else {
         (TranslationTaskStatus::Success, None)
     };
+    let metadata = metadata_task(inp_pool, inp_path).await?;
+    let glossary_config = task_glossary_config(inp_pool).await?;
+    let detail = progress_detail_for_translation_stats(
+        metadata.progress_detail,
+        stats.total_chunks.max(0) as u64,
+        stats.completed_chunks.max(0) as u64,
+        status,
+        &glossary_config,
+    );
+    set_progress_detail(inp_pool, &detail).await?;
+    let log_level = match status {
+        TranslationTaskStatus::Success => "INFO",
+        TranslationTaskStatus::Interrupted | TranslationTaskStatus::InterruptedPending => "WARN",
+        TranslationTaskStatus::Failed => "ERROR",
+        TranslationTaskStatus::Pending | TranslationTaskStatus::Running => "INFO",
+    };
+    write_translation_log(
+        backend_log,
+        log_level,
+        format!(
+            "Task id={} finalized status={:?} completed_chunks={} failed_chunks={} interrupted_chunks={} error_rate={:.1}% last_error={}",
+            metadata.id,
+            status,
+            stats.completed_chunks,
+            stats.failed_chunks,
+            stats.interrupted_chunks,
+            stats.error_rate * 100.0,
+            last_error.as_deref().unwrap_or("none")
+        ),
+    );
     finalize_task(
         &app,
         &inp_pool,
@@ -532,7 +826,7 @@ async fn translate_chunk(
     model_request_name: String,
     target_language: String,
     assistant_prompt: Option<String>,
-    assistant_custom_parameters: Value,
+    request_options: TranslationRequestOptions,
     global_background: Option<String>,
     previous_context: Option<String>,
     glossary_matcher: Arc<TaskGlossaryMatcher>,
@@ -544,6 +838,7 @@ async fn translate_chunk(
     quota: Arc<HeaderQuotaPolicy>,
     limiter: Arc<AdaptiveLimiter>,
     manual_limiter: Option<Arc<ManualRateLimiter>>,
+    backend_log: Option<BackendLog>,
 ) -> ChunkOutcome {
     let mut retry_count = 0_i64;
     let mut last_error = None;
@@ -568,6 +863,14 @@ async fn translate_chunk(
                 let translated_text = match restore_chunk_for_map(&chunk.map_json, &text) {
                     Ok(restored) => restored,
                     Err(error) => {
+                        log_chunk_issue(
+                            &backend_log,
+                            "ERROR",
+                            &chunk,
+                            attempt,
+                            max_retries,
+                            format!("placeholder restore failed in passthrough: {error}"),
+                        );
                         return failed_outcome(
                             chunk,
                             TranslationChunkStatus::Failed,
@@ -595,6 +898,14 @@ async fn translate_chunk(
             }
             Ok(TranslationPromptBuildResult::Request { messages }) => messages,
             Err(error) => {
+                log_chunk_issue(
+                    &backend_log,
+                    "ERROR",
+                    &chunk,
+                    attempt,
+                    max_retries,
+                    format!("prompt build failed: {error}"),
+                );
                 return failed_outcome(
                     chunk,
                     TranslationChunkStatus::Failed,
@@ -610,14 +921,15 @@ async fn translate_chunk(
         let request = UnifiedChatRequest {
             model: model_request_name.clone(),
             messages,
-            tools: Vec::new(),
-            tool_choice: UnifiedToolChoice::None,
-            thinking: None,
+            tools: request_options.tools.clone(),
+            tool_choice: request_options.tool_choice,
+            web_search: request_options.web_search,
+            thinking: request_options.thinking.clone(),
             max_output_tokens: None,
             temperature: Some(0.0),
             stream: false,
             logprobs: confidence_mode.enabled(),
-            custom_parameters: assistant_custom_parameters.clone(),
+            custom_parameters: request_options.custom_parameters.clone(),
         };
         let estimated_tokens = estimate_tokens(&chunk.source_text)
             + global_background
@@ -677,11 +989,26 @@ async fn translate_chunk(
                 });
                 if meta.status == 429 || finish_reason_is_truncation(meta.finish_reason.as_deref())
                 {
-                    last_error = Some(format!(
-                        "Interrupted by finish reason: {}",
-                        meta.finish_reason
-                            .unwrap_or_else(|| "rate-limit".to_string())
-                    ));
+                    let finish_reason = meta.finish_reason.as_deref().unwrap_or("rate-limit");
+                    last_error = Some(format!("Interrupted by finish reason: {finish_reason}"));
+                    log_chunk_issue(
+                        &backend_log,
+                        if attempt == max_retries {
+                            "ERROR"
+                        } else {
+                            "WARN"
+                        },
+                        &chunk,
+                        attempt,
+                        max_retries,
+                        format!(
+                            "provider returned status={} finish_reason={} {}; {}",
+                            meta.status,
+                            finish_reason,
+                            retry_action(attempt, max_retries),
+                            rate_limit_summary(&meta.rate_limits)
+                        ),
+                    );
                     if attempt == max_retries {
                         return failed_outcome(
                             chunk,
@@ -698,6 +1025,22 @@ async fn translate_chunk(
                 }
                 if text.trim().is_empty() {
                     last_error = Some("Model returned empty content".to_string());
+                    log_chunk_issue(
+                        &backend_log,
+                        if attempt == max_retries {
+                            "ERROR"
+                        } else {
+                            "WARN"
+                        },
+                        &chunk,
+                        attempt,
+                        max_retries,
+                        format!(
+                            "model returned empty content; {}; {}",
+                            retry_action(attempt, max_retries),
+                            rate_limit_summary(&meta.rate_limits)
+                        ),
+                    );
                     if attempt == max_retries {
                         return failed_outcome(
                             chunk,
@@ -714,6 +1057,22 @@ async fn translate_chunk(
                 }
                 if text.trim() == chunk.source_text.trim() && !chunk.source_text.trim().is_empty() {
                     last_error = Some("Model returned unchanged source text".to_string());
+                    log_chunk_issue(
+                        &backend_log,
+                        if attempt == max_retries {
+                            "ERROR"
+                        } else {
+                            "WARN"
+                        },
+                        &chunk,
+                        attempt,
+                        max_retries,
+                        format!(
+                            "model returned unchanged source text; {}; {}",
+                            retry_action(attempt, max_retries),
+                            rate_limit_summary(&meta.rate_limits)
+                        ),
+                    );
                     if attempt == max_retries {
                         return failed_outcome(
                             chunk,
@@ -732,6 +1091,23 @@ async fn translate_chunk(
                     Ok(restored) => restored,
                     Err(error) => {
                         last_error = Some(error);
+                        log_chunk_issue(
+                            &backend_log,
+                            if attempt == max_retries {
+                                "ERROR"
+                            } else {
+                                "WARN"
+                            },
+                            &chunk,
+                            attempt,
+                            max_retries,
+                            format!(
+                                "placeholder restore failed after model response: {}; {}; {}",
+                                last_error.as_deref().unwrap_or("unknown"),
+                                retry_action(attempt, max_retries),
+                                rate_limit_summary(&meta.rate_limits)
+                            ),
+                        );
                         if attempt == max_retries {
                             return failed_outcome(
                                 chunk,
@@ -747,6 +1123,16 @@ async fn translate_chunk(
                         continue;
                     }
                 };
+                if attempt > 0 {
+                    log_chunk_issue(
+                        &backend_log,
+                        "INFO",
+                        &chunk,
+                        attempt,
+                        max_retries,
+                        "chunk recovered after retry",
+                    );
+                }
                 return ChunkOutcome {
                     chunk_id: chunk.id,
                     status: TranslationChunkStatus::Success,
@@ -772,6 +1158,28 @@ async fn translate_chunk(
                 let rate_status =
                     current_rate_limit_status(&error.rate_limits, &limiter, &manual_limiter).await;
                 last_error = Some(error.to_string());
+                log_chunk_issue(
+                    &backend_log,
+                    if error.is_rate_limited() || attempt == max_retries {
+                        "ERROR"
+                    } else {
+                        "WARN"
+                    },
+                    &chunk,
+                    attempt,
+                    max_retries,
+                    format!(
+                        "provider request failed status={} rate_limited={} {}; {}; error={}",
+                        error
+                            .status
+                            .map(|status| status.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        error.is_rate_limited(),
+                        retry_action(attempt, max_retries),
+                        rate_limit_summary(&error.rate_limits),
+                        error
+                    ),
+                );
                 if error.is_rate_limited() {
                     return failed_outcome(
                         chunk,
@@ -919,6 +1327,17 @@ pub async fn mark_task_failed_after_runtime_error(
         .execute(&inp_pool)
         .await
         .map_err(|error| error.to_string())?;
+    let stats = aggregate_chunk_stats(&inp_pool).await?;
+    let metadata = metadata_task(&inp_pool, inp_path).await?;
+    let glossary_config = task_glossary_config(&inp_pool).await?;
+    let detail = progress_detail_for_translation_stats(
+        metadata.progress_detail,
+        stats.total_chunks.max(0) as u64,
+        stats.completed_chunks.max(0) as u64,
+        TranslationTaskStatus::Failed,
+        &glossary_config,
+    );
+    set_progress_detail(&inp_pool, &detail).await?;
     let task = refresh_task_stats(
         &inp_pool,
         config_pool,

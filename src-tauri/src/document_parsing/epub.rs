@@ -15,11 +15,12 @@ use xml5ever::tendril::{StrTendril, TendrilSink};
 use crate::task_prompt::{ContentFormat, DocumentFormat};
 
 use super::types::{
-    BlockRef, ParsedChunk, PlaceholderEntry, PlaceholderMap, RenderInput, RenderedChunk,
-    PLACEHOLDER_MAP_VERSION,
+    BlockRef, ParsedChunk, ParserProgress, PlaceholderEntry, PlaceholderMap, RenderInput,
+    RenderedChunk, PLACEHOLDER_MAP_VERSION,
 };
 use super::{
-    chunk_raw_block_refs, token_limit_usize, ChunkedRawBlock, DocumentParser, RawBlockRef,
+    chunk_raw_block_refs, chunk_raw_block_refs_with_progress, token_limit_usize, ChunkedRawBlock,
+    DocumentParser, RawBlockRef,
 };
 
 const EPUB_DOM_CHUNK_KIND: &str = "epub-xhtml-dom-chunk";
@@ -31,14 +32,20 @@ const TRANSLATABLE_ATTRIBUTES: &[&str] = &["alt", "title", "placeholder"];
 pub struct EpubParser;
 
 impl DocumentParser for EpubParser {
-    fn parse(&self, input: super::types::ParserInput<'_>) -> Result<Vec<ParsedChunk>, String> {
+    fn parse(&self, input: super::types::ParserInput<'_, '_>) -> Result<Vec<ParsedChunk>, String> {
         let doc = EpubDoc::new(input.source_path)
             .map_err(|error| format!("Unable to open EPUB source: {error}"))?;
         let mut chunks = Vec::new();
+        let mut progress = input.progress;
         for page in epub_page_refs(&doc) {
             let text = read_manifest_text(&doc, &page.id)?;
             let document = parse_xhtml_document(&text)?;
-            let mut parsed = parse_epub_xhtml_page(&page.path, &document, input.token_limit)?;
+            let mut parsed = parse_epub_xhtml_page(
+                &page.path,
+                &document,
+                input.token_limit,
+                progress.as_deref_mut(),
+            )?;
             chunks.append(&mut parsed);
         }
         resequence(&mut chunks);
@@ -175,8 +182,9 @@ fn parse_epub_xhtml_page(
     path: &str,
     document: &RcDom,
     token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
 ) -> Result<Vec<ParsedChunk>, String> {
-    let mut chunks = epub_text_chunks(path, document, token_limit)?;
+    let mut chunks = epub_text_chunks(path, document, token_limit, progress)?;
     let attributes = epub_attribute_chunks(path, document, chunks.len())?;
     chunks.extend(attributes);
     Ok(chunks)
@@ -186,6 +194,7 @@ fn epub_text_chunks(
     path: &str,
     document: &RcDom,
     token_limit: i64,
+    progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
 ) -> Result<Vec<ParsedChunk>, String> {
     let raw_blocks = collect_epub_text_blocks(document)
         .into_iter()
@@ -205,7 +214,15 @@ fn epub_text_chunks(
         return Ok(Vec::new());
     }
 
-    chunk_raw_block_refs(raw_blocks, token_limit_usize(token_limit))
+    let chunked_blocks = match progress {
+        Some(progress) => chunk_raw_block_refs_with_progress(
+            raw_blocks,
+            token_limit_usize(token_limit),
+            Some(progress),
+        ),
+        None => chunk_raw_block_refs(raw_blocks, token_limit_usize(token_limit)),
+    };
+    chunked_blocks
         .into_iter()
         .enumerate()
         .filter(|(_, blocks)| !blocks.is_empty())
@@ -894,6 +911,7 @@ mod tests {
             .parse(super::super::types::ParserInput {
                 source_path: &path,
                 token_limit: 800,
+                progress: None,
             })
             .expect("parse epub");
         let sources = chunks
@@ -931,7 +949,7 @@ mod tests {
         );
         let document = parse_xhtml_document(xhtml).expect("parse xhtml");
         let chunks =
-            parse_epub_xhtml_page("OEBPS/chapter.xhtml", &document, 800).expect("parse page");
+            parse_epub_xhtml_page("OEBPS/chapter.xhtml", &document, 800, None).expect("parse page");
         let sources = chunks
             .iter()
             .map(|chunk| chunk.source_text.as_str())
@@ -969,6 +987,7 @@ mod tests {
             .parse(super::super::types::ParserInput {
                 source_path: &path,
                 token_limit: 800,
+                progress: None,
             })
             .expect("parse epub");
         let rendered_chunks = parsed

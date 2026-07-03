@@ -6,7 +6,10 @@ import type {
 } from "@/features/glossary/types";
 import type { ProviderPurpose, ProviderView } from "@/features/providers/types";
 import type {
+  ProgressStep,
   TranslationConfigView,
+  TranslationTaskCreationStage,
+  TranslationTaskCreationStatus,
   TranslationTaskDetail,
   TranslationTaskView,
 } from "@/features/translation/types";
@@ -82,6 +85,15 @@ export interface StartPageDraft {
   config: TranslationConfigView;
 }
 
+export interface StartCreationJob {
+  clientTaskId: string;
+  filePath: string;
+  status: TranslationTaskCreationStatus;
+  stages: Record<TranslationTaskCreationStage, ProgressStep>;
+  taskId: string | null;
+  error: string | null;
+}
+
 export interface GlossaryIndexCache {
   glossaries: GlossaryView[];
   filterSeed: GlossaryView[];
@@ -97,6 +109,66 @@ export interface GlossaryIndexCache {
   listPage: number;
   listPageSize: number;
   listWidths: number[];
+}
+
+type StartCreationJobListener = () => void;
+
+class StartCreationJobStore {
+  private jobs: StartCreationJob[] = [];
+  private listeners = new Set<StartCreationJobListener>();
+
+  read(): StartCreationJob[] {
+    return this.jobs;
+  }
+
+  subscribe(listener: StartCreationJobListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  set(jobs: StartCreationJob[]): void {
+    this.jobs = jobs;
+    this.notify();
+  }
+
+  upsert(job: StartCreationJob): void {
+    const index = this.jobs.findIndex(
+      (item) => item.clientTaskId === job.clientTaskId || item.filePath === job.filePath,
+    );
+    if (index === -1) {
+      this.set([...this.jobs, job]);
+      return;
+    }
+    this.set(this.jobs.map((item, itemIndex) => (itemIndex === index ? job : item)));
+  }
+
+  update(
+    clientTaskId: string,
+    updater: (job: StartCreationJob) => StartCreationJob,
+  ): void {
+    this.set(
+      this.jobs.map((job) => (job.clientTaskId === clientTaskId ? updater(job) : job)),
+    );
+  }
+
+  updateByFilePath(
+    filePath: string,
+    updater: (job: StartCreationJob) => StartCreationJob,
+  ): void {
+    this.set(this.jobs.map((job) => (job.filePath === filePath ? updater(job) : job)));
+  }
+
+  remove(clientTaskId: string): void {
+    this.set(this.jobs.filter((job) => job.clientTaskId !== clientTaskId));
+  }
+
+  removeByFilePath(filePath: string): void {
+    this.set(this.jobs.filter((job) => job.filePath !== filePath));
+  }
+
+  private notify(): void {
+    this.listeners.forEach((listener) => listener());
+  }
 }
 
 const providerResources = new Map<ProviderPurpose, SessionResource<ProviderView[]>>();
@@ -127,6 +199,7 @@ function proofreadingDetailResource(id: string): SessionResource<TranslationTask
 export const appSessionCache = {
   translationConfig: new SessionResource<TranslationConfigView>(),
   startDraft: new SessionResource<StartPageDraft>(),
+  startCreationJobs: new StartCreationJobStore(),
   glossaryIndex: new SessionResource<GlossaryIndexCache>(),
   proofreadingTasks: new SessionResource<TranslationTaskView[]>(),
   providerSelectedIds: new Map<ProviderPurpose, string>(),

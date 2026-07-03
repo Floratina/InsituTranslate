@@ -6,10 +6,23 @@ use crate::task_prompt::{ContentFormat, DocumentFormat};
 
 pub const PLACEHOLDER_MAP_VERSION: u32 = 1;
 
-#[derive(Debug, Clone)]
-pub struct ParserInput<'a> {
-    pub source_path: &'a Path,
+pub struct ParserInput<'path, 'progress> {
+    pub source_path: &'path Path,
     pub token_limit: i64,
+    pub progress: Option<&'progress mut (dyn FnMut(ParserProgress) + Send + 'progress)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserProgressStage {
+    Chunking,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParserProgress {
+    pub stage: ParserProgressStage,
+    pub current: u64,
+    pub total: u64,
+    pub label: String,
 }
 
 #[derive(Debug, Clone)]

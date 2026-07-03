@@ -1,6 +1,8 @@
 use crate::adapters::{ProviderChatError, RateLimitTelemetry};
 use crate::db as app_db;
-use crate::domain::{AddModelInput, CreateProviderInput, ProviderProtocol, ProviderPurpose};
+use crate::domain::{
+    AddModelInput, CreateProviderInput, ProviderProtocol, ProviderPurpose, ThinkingEffort,
+};
 use crate::glossary_prompt::GlossaryEntry;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
 use crate::pdf_parsing::PdfParsingMode;
@@ -337,6 +339,18 @@ fn glossary_matcher_outputs_original_glossary_order() {
     );
 }
 
+#[test]
+fn translation_task_status_roundtrips_interrupted_pending() {
+    assert_eq!(
+        TranslationTaskStatus::InterruptedPending.as_str(),
+        "interrupted-pending"
+    );
+    assert_eq!(
+        TranslationTaskStatus::parse("interrupted-pending").expect("parse status"),
+        TranslationTaskStatus::InterruptedPending
+    );
+}
+
 #[tokio::test]
 async fn create_task_freezes_glossary_config_in_inp_metadata() {
     let root = temp_root("glossary-freeze");
@@ -387,6 +401,9 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
             use_glossary: true,
             glossary_mode: GlossaryMode::Existing,
             glossary_id: Some("glossary-freeze-id".into()),
+            thinking_effort: ThinkingEffort::None,
+            use_web_search: false,
+            use_tools: false,
             confidence_mode: ConfidenceMode::Off,
             pdf_parsing_mode: PdfParsingMode::LocalFirst,
         },
@@ -517,6 +534,60 @@ async fn inp_migration_adds_global_background_column_as_null() {
     assert_eq!(schema_version, INP_SCHEMA_VERSION);
     assert_eq!(background, None);
     migrated.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn inp_migration_adds_progress_detail_column_as_null() {
+    let root = temp_root("progress-detail-migration");
+    let inp_path = root.join("legacy-v7.inp");
+    write_test_inp(&inp_path, "task-progress-detail-v7", "Progress Detail")
+        .await
+        .expect("write inp");
+    let pool = connect_inp(&inp_path).await.expect("open inp");
+    sqlx::query("ALTER TABLE metadata DROP COLUMN progress_detail_json")
+        .execute(&pool)
+        .await
+        .expect("drop progress detail");
+    sqlx::query("UPDATE metadata SET schema_version = 7")
+        .execute(&pool)
+        .await
+        .expect("mark v7");
+    pool.close().await;
+
+    let migrated = connect_inp(&inp_path).await.expect("migrate");
+    let schema_version: i64 = sqlx::query_scalar("SELECT schema_version FROM metadata LIMIT 1")
+        .fetch_one(&migrated)
+        .await
+        .expect("schema version");
+    let progress_detail: Option<String> =
+        sqlx::query_scalar("SELECT progress_detail_json FROM metadata LIMIT 1")
+            .fetch_one(&migrated)
+            .await
+            .expect("progress detail");
+    assert_eq!(schema_version, INP_SCHEMA_VERSION);
+    assert_eq!(progress_detail, None);
+    migrated.close().await;
+
+    let task = validate_inp_file(&inp_path)
+        .await
+        .expect("validate migrated");
+    assert!(task.progress_detail.is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn config_migration_adds_task_index_progress_detail_column() {
+    let root = temp_root("task-index-progress-detail");
+    let pool = connect_config_db(&root).await.expect("connect config");
+    let columns = sqlx::query("PRAGMA table_info(task_index)")
+        .fetch_all(&pool)
+        .await
+        .expect("columns");
+    assert!(columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "progress_detail_json"));
+    pool.close().await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -943,6 +1014,49 @@ async fn imports_rejects_duplicates_and_renames_metadata_and_index() {
 }
 
 #[tokio::test]
+async fn staged_task_publish_controls_task_index_visibility() {
+    let root = temp_root("staged-publish");
+    let pool = connect_config_db(&root).await.expect("connect config");
+    let staged_path = root.join(TASKS_DIR).join("staged.inp");
+    write_test_inp(&staged_path, "task-staged", "Staged Task")
+        .await
+        .expect("write staged inp");
+
+    let before_publish = list_translation_tasks(&pool, None)
+        .await
+        .expect("list before publish");
+    assert!(before_publish.is_empty());
+
+    let published = publish_staged_translation_task(&pool, &root, "task-staged", &staged_path)
+        .await
+        .expect("publish staged task");
+    assert_eq!(published.id, "task-staged");
+
+    let after_publish = list_translation_tasks(&pool, None)
+        .await
+        .expect("list after publish");
+    assert_eq!(after_publish.len(), 1);
+    assert_eq!(after_publish[0].id, "task-staged");
+
+    let discard_path = root.join(TASKS_DIR).join("discarded.inp");
+    write_test_inp(&discard_path, "task-discarded", "Discarded Task")
+        .await
+        .expect("write discarded inp");
+    discard_staged_translation_task(&root, &discard_path)
+        .await
+        .expect("discard staged task");
+    assert!(!discard_path.exists());
+
+    let after_discard = list_translation_tasks(&pool, None)
+        .await
+        .expect("list after discard");
+    assert_eq!(after_discard.len(), 1);
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn translated_source_text_uses_translations_and_falls_back_to_source() {
     let root = temp_root("source-export");
     let inp_path = root.join("source.inp");
@@ -1225,6 +1339,9 @@ async fn migrates_legacy_defaults_only_once() {
             use_glossary: true,
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
+            thinking_effort: ThinkingEffort::None,
+            use_web_search: false,
+            use_tools: false,
             confidence_mode: ConfidenceMode::ConfidenceIndex,
             pdf_parsing_mode: PdfParsingMode::MineruFirst,
         },

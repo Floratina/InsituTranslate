@@ -1,5 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -10,7 +12,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::db as app_db;
 use crate::document_parsing;
-use crate::document_parsing::types::RenderedChunk;
+use crate::document_parsing::types::{ParserProgress, ParserProgressStage, RenderedChunk};
 use crate::languages::{
     normalize_source_language, normalize_target_language, DEFAULT_SOURCE_LANGUAGE,
     DEFAULT_TARGET_LANGUAGE,
@@ -22,7 +24,11 @@ use super::context::{
     display_name_from_path, global_background_from_texts, next_inp_path, sanitize_file_stem,
     unix_timestamp,
 };
-use super::types::{ChunkOutcome, ChunkRecord, TaskGlossaryConfig};
+use super::types::{
+    ChunkOutcome, ChunkRecord, ProgressDetail, ProgressStep, TaskGlossaryConfig,
+    TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
+    TranslationTaskCreationStatus,
+};
 use super::{
     ContextHandlingMode, CreateTranslationTaskInput, ExportTranslationTaskInput, GlossaryMode,
     ImportTranslationTaskInput, RateLimitStrategy, TokenStats, TranslationChunkStatus,
@@ -33,7 +39,7 @@ use super::{
     DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TOKENS_PER_MINUTE, INP_FILE_DAMAGED, INP_SCHEMA_VERSION, MAX_TASK_NAME_LENGTH,
     MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH, SOURCE_FILE_UNAVAILABLE, TASKS_DIR,
-    TRANSLATION_PROGRESS_EVENT,
+    TRANSLATION_PROGRESS_EVENT, TRANSLATION_TASK_CREATION_PROGRESS_EVENT,
 };
 
 #[derive(Debug, Clone)]
@@ -155,6 +161,7 @@ async fn migrate_config_db(pool: &SqlitePool) -> Result<(), String> {
             error_rate REAL NOT NULL DEFAULT 0,
             last_error TEXT,
             rate_limit_status TEXT,
+            progress_detail_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )"#,
@@ -214,6 +221,7 @@ async fn migrate_config_db(pool: &SqlitePool) -> Result<(), String> {
         "INTEGER NOT NULL DEFAULT 60000",
     )
     .await?;
+    add_column_if_missing(pool, "task_index", "progress_detail_json", "TEXT").await?;
     sqlx::query(
         "INSERT INTO translation_config (
             id, chunk_token_limit, max_concurrency, max_retries, rate_limit_strategy,
@@ -489,6 +497,14 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
     if schema_version >= 7 {
         require_columns(pool, "metadata", &["global_background"]).await?;
     }
+    if schema_version >= 8 {
+        require_columns(pool, "metadata", &["progress_detail_json"]).await?;
+        let progress_detail_json = row
+            .try_get::<Option<String>, _>("progress_detail_json")
+            .unwrap_or(None);
+        parse_progress_detail_json(progress_detail_json)
+            .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+    }
     TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     parse_tags_json(row.get("tags_json")).map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -535,8 +551,9 @@ async fn require_columns(
 }
 
 async fn recover_running_tasks(config_pool: &SqlitePool) -> Result<(), String> {
-    let rows = sqlx::query("SELECT id, inp_path FROM task_index WHERE status = ?")
+    let rows = sqlx::query("SELECT id, inp_path FROM task_index WHERE status IN (?, ?)")
         .bind(TranslationTaskStatus::Running.as_str())
+        .bind(TranslationTaskStatus::InterruptedPending.as_str())
         .fetch_all(config_pool)
         .await
         .map_err(|error| error.to_string())?;
@@ -608,6 +625,7 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             error_rate REAL NOT NULL DEFAULT 0,
             last_error TEXT,
             rate_limit_status TEXT,
+            progress_detail_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )"#,
@@ -676,6 +694,7 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
     .await?;
     add_column_if_missing(pool, "metadata", "glossary_id", "TEXT").await?;
     add_column_if_missing(pool, "metadata", "global_background", "TEXT").await?;
+    add_column_if_missing(pool, "metadata", "progress_detail_json", "TEXT").await?;
     add_column_if_missing(pool, "chunks", "map_json", "TEXT NOT NULL DEFAULT '{}'").await?;
     add_column_if_missing(
         pool,
@@ -1001,6 +1020,9 @@ pub async fn update_translation_config(
             .glossary_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        thinking_effort: input.thinking_effort,
+        use_web_search: input.use_web_search,
+        use_tools: input.use_tools,
         confidence_mode: input.confidence_mode,
         pdf_parsing_mode: input.pdf_parsing_mode,
     };
@@ -1058,6 +1080,51 @@ pub(super) async fn parse_source_file_for_task(
 
     Ok(ParsedTaskSource {
         chunks: document_parsing::parse_source_file(task_id, source_path, token_limit)?,
+        assets: Vec::new(),
+    })
+}
+
+pub(super) async fn parse_source_file_for_task_with_progress<'progress>(
+    provider_pool: &SqlitePool,
+    client: &Client,
+    task_id: &str,
+    source_path: &Path,
+    token_limit: i64,
+    pdf_parsing_mode: PdfParsingMode,
+    progress: Option<&'progress mut (dyn FnMut(ParserProgress) + Send + 'progress)>,
+) -> Result<ParsedTaskSource, String> {
+    if source_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("pdf"))
+        == Some(true)
+    {
+        let parsed_pdf = pdf_parsing::parse_pdf_for_task(
+            provider_pool,
+            client,
+            task_id,
+            source_path,
+            pdf_parsing_mode,
+        )
+        .await?;
+        let chunks = document_parsing::parse_pdf_markdown_text_with_progress(
+            &parsed_pdf.markdown,
+            token_limit,
+            progress,
+        )?;
+        return Ok(ParsedTaskSource {
+            chunks,
+            assets: parsed_pdf.assets,
+        });
+    }
+
+    Ok(ParsedTaskSource {
+        chunks: document_parsing::parse_source_file_with_progress(
+            task_id,
+            source_path,
+            token_limit,
+            progress,
+        )?,
         assets: Vec::new(),
     })
 }
@@ -1146,6 +1213,16 @@ pub async fn create_translation_task(
     let created_at = unix_timestamp();
     let inp_pool = connect_inp(&inp_path).await?;
     let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
+    let progress_detail = progress_detail_for_config(
+        parsed_source.chunks.len() as u64,
+        0,
+        &TaskGlossaryConfig {
+            use_glossary: config.use_glossary,
+            glossary_mode: config.glossary_mode,
+            glossary_id: config.glossary_id.clone(),
+        },
+    );
+    let progress_detail_json = serialize_progress_detail(Some(&progress_detail))?;
     let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query(
         "INSERT INTO metadata (
@@ -1153,9 +1230,9 @@ pub async fn create_translation_task(
             progress, provider_id, model_id, model_request_name, assistant_id, assistant_system_prompt,
             assistant_custom_parameters_json, use_glossary, glossary_mode, glossary_id, tags_json,
             token_limit, max_concurrency, max_retries, config_snapshot_json, global_background,
-            total_chunks,
+            total_chunks, progress_detail_json,
             created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&task_id)
     .bind(INP_SCHEMA_VERSION)
@@ -1180,6 +1257,7 @@ pub async fn create_translation_task(
     .bind(config_snapshot)
     .bind(global_background.as_deref())
     .bind(parsed_source.chunks.len() as i64)
+    .bind(progress_detail_json)
     .bind(&created_at)
     .bind(&created_at)
     .execute(&mut *transaction)
@@ -1223,6 +1301,373 @@ pub async fn create_translation_task(
     Ok(view)
 }
 
+async fn cleanup_partial_task_creation(
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    task_id: Option<&str>,
+    inp_path: Option<&Path>,
+) {
+    if let Some(id) = task_id {
+        let _ = sqlx::query("DELETE FROM task_index WHERE id = ?")
+            .bind(id)
+            .execute(config_pool)
+            .await;
+    }
+    if let Some(path) = inp_path.filter(|path| path.starts_with(workspace_root)) {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
+fn emit_creation_progress(
+    app: &AppHandle,
+    client_task_id: &str,
+    file_path: &str,
+    stage: TranslationTaskCreationStage,
+    step: ProgressStep,
+    status: TranslationTaskCreationStatus,
+    task: Option<TranslationTaskView>,
+    error: Option<String>,
+) {
+    let _ = app.emit(
+        TRANSLATION_TASK_CREATION_PROGRESS_EVENT,
+        TranslationTaskCreationProgressPayload {
+            client_task_id: client_task_id.to_string(),
+            file_path: file_path.to_string(),
+            stage,
+            step,
+            status,
+            task,
+            error,
+        },
+    );
+}
+
+pub async fn create_translation_task_with_progress(
+    app: AppHandle,
+    provider_pool: SqlitePool,
+    client: Client,
+    config_pool: SqlitePool,
+    workspace_root: PathBuf,
+    input: CreateTranslationTaskInput,
+    client_task_id: String,
+    cancel: Arc<AtomicBool>,
+) -> Result<Option<TranslationTaskView>, String> {
+    let source_file_path = input.file_path.clone();
+    let mut task_id_for_cleanup: Option<String> = None;
+    let mut inp_path_for_cleanup: Option<PathBuf> = None;
+    let mut current_stage = TranslationTaskCreationStage::Ast;
+
+    macro_rules! fail_creation {
+        ($error:expr) => {{
+            let error = $error;
+            cleanup_partial_task_creation(
+                &config_pool,
+                &workspace_root,
+                task_id_for_cleanup.as_deref(),
+                inp_path_for_cleanup.as_deref(),
+            )
+            .await;
+            emit_creation_progress(
+                &app,
+                &client_task_id,
+                &source_file_path,
+                current_stage,
+                ProgressStep::failed(0, 0, "创建任务失败"),
+                TranslationTaskCreationStatus::Failed,
+                None,
+                Some(error.clone()),
+            );
+            return Err(error);
+        }};
+    }
+
+    macro_rules! try_creation {
+        ($expr:expr) => {
+            match $expr {
+                Ok(value) => value,
+                Err(error) => fail_creation!(error),
+            }
+        };
+    }
+
+    macro_rules! cancel_creation {
+        () => {
+            if cancel.load(Ordering::SeqCst) {
+                cleanup_partial_task_creation(
+                    &config_pool,
+                    &workspace_root,
+                    task_id_for_cleanup.as_deref(),
+                    inp_path_for_cleanup.as_deref(),
+                )
+                .await;
+                emit_creation_progress(
+                    &app,
+                    &client_task_id,
+                    &source_file_path,
+                    current_stage,
+                    ProgressStep::failed(0, 0, "已取消"),
+                    TranslationTaskCreationStatus::Cancelled,
+                    None,
+                    None,
+                );
+                return Ok(None);
+            }
+        };
+    }
+
+    emit_creation_progress(
+        &app,
+        &client_task_id,
+        &source_file_path,
+        TranslationTaskCreationStage::Ast,
+        ProgressStep::pending(0, 0, "等待预处理"),
+        TranslationTaskCreationStatus::Queued,
+        None,
+        None,
+    );
+    cancel_creation!();
+
+    let source_language = try_creation!(normalize_source_language(&input.source_language));
+    let target_language = try_creation!(normalize_target_language(&input.target_language));
+    let tags = try_creation!(normalize_tags(input.tags));
+    let tags_json = try_creation!(serialize_tags(&tags));
+    let source_path = PathBuf::from(input.file_path.trim());
+    try_creation!(validate_supported_source_file(&source_path));
+    cancel_creation!();
+
+    let source_bytes = try_creation!(tokio::fs::read(&source_path)
+        .await
+        .map_err(|error| format!("Unable to read source document: {error}")));
+    let source_file_name = source_file_name_from_path(&source_path);
+    let materialized_source = try_creation!(
+        materialize_source_bytes(&source_file_name, &source_bytes, &source_path).await
+    );
+    cancel_creation!();
+
+    let model = try_creation!(app_db::get_model(&provider_pool, &input.model_id).await);
+    if model.provider_id != input.provider_id {
+        fail_creation!("Selected model does not belong to the selected provider".to_string());
+    }
+    let (assistant_prompt, assistant_custom_parameters) = match input
+        .assistant_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(id) => {
+            let assistant = try_creation!(app_db::get_assistant(&provider_pool, id).await);
+            (Some(assistant.system_prompt), assistant.custom_parameters)
+        }
+        None => (None, json!({})),
+    };
+    let config = try_creation!(get_translation_config(&config_pool).await);
+    let task_id = app_db::new_id("task");
+    task_id_for_cleanup = Some(task_id.clone());
+    let display_name = display_name_from_path(&source_path);
+    let inp_path = try_creation!(next_inp_path(&workspace_root, &display_name).await);
+    inp_path_for_cleanup = Some(inp_path.clone());
+
+    emit_creation_progress(
+        &app,
+        &client_task_id,
+        &source_file_path,
+        TranslationTaskCreationStage::Ast,
+        ProgressStep::running(1, 2, "AST 解析结构 (1/2)"),
+        TranslationTaskCreationStatus::Running,
+        None,
+        None,
+    );
+    let mut ast_finished = false;
+    let mut emit_parse_progress = |progress: ParserProgress| {
+        if progress.stage == ParserProgressStage::Chunking {
+            if !ast_finished {
+                ast_finished = true;
+                current_stage = TranslationTaskCreationStage::Chunking;
+                emit_creation_progress(
+                    &app,
+                    &client_task_id,
+                    &source_file_path,
+                    TranslationTaskCreationStage::Ast,
+                    ProgressStep::success(2, 2, "AST 已完成"),
+                    TranslationTaskCreationStatus::Running,
+                    None,
+                    None,
+                );
+            }
+            emit_creation_progress(
+                &app,
+                &client_task_id,
+                &source_file_path,
+                TranslationTaskCreationStage::Chunking,
+                ProgressStep::running(progress.current, progress.total, progress.label),
+                TranslationTaskCreationStatus::Running,
+                None,
+                None,
+            );
+        }
+    };
+    let parsed_source = try_creation!(
+        parse_source_file_for_task_with_progress(
+            &provider_pool,
+            &client,
+            &task_id,
+            materialized_source.path(),
+            config.chunk_token_limit,
+            config.pdf_parsing_mode,
+            Some(&mut emit_parse_progress),
+        )
+        .await
+    );
+    drop(emit_parse_progress);
+    cancel_creation!();
+    if !ast_finished {
+        emit_creation_progress(
+            &app,
+            &client_task_id,
+            &source_file_path,
+            TranslationTaskCreationStage::Ast,
+            ProgressStep::success(2, 2, "AST 已完成"),
+            TranslationTaskCreationStatus::Running,
+            None,
+            None,
+        );
+    }
+
+    current_stage = TranslationTaskCreationStage::Chunking;
+    let total_chunks = parsed_source.chunks.len() as u64;
+    emit_creation_progress(
+        &app,
+        &client_task_id,
+        &source_file_path,
+        TranslationTaskCreationStage::Chunking,
+        ProgressStep::success(
+            total_chunks,
+            total_chunks,
+            count_label("分块", total_chunks, total_chunks),
+        ),
+        TranslationTaskCreationStatus::Running,
+        None,
+        None,
+    );
+
+    let global_background = if config.context_handling_mode == ContextHandlingMode::GlobalBackground
+    {
+        Some(global_background_from_texts(
+            parsed_source
+                .chunks
+                .iter()
+                .map(|chunk| chunk.source_text.as_str()),
+        ))
+    } else {
+        None
+    };
+    cancel_creation!();
+
+    let created_at = unix_timestamp();
+    let inp_pool = try_creation!(connect_inp(&inp_path).await);
+    let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
+    let progress_detail = progress_detail_for_config(
+        total_chunks,
+        0,
+        &TaskGlossaryConfig {
+            use_glossary: config.use_glossary,
+            glossary_mode: config.glossary_mode,
+            glossary_id: config.glossary_id.clone(),
+        },
+    );
+    let progress_detail_json = try_creation!(serialize_progress_detail(Some(&progress_detail)));
+    let mut transaction = try_creation!(inp_pool.begin().await.map_err(|error| error.to_string()));
+    try_creation!(
+        sqlx::query(
+            "INSERT INTO metadata (
+                task_id, schema_version, name, source_path, source_language, target_language, status,
+                progress, provider_id, model_id, model_request_name, assistant_id, assistant_system_prompt,
+                assistant_custom_parameters_json, use_glossary, glossary_mode, glossary_id, tags_json,
+                token_limit, max_concurrency, max_retries, config_snapshot_json, global_background,
+                total_chunks, progress_detail_json,
+                created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id)
+        .bind(INP_SCHEMA_VERSION)
+        .bind(&display_name)
+        .bind(source_path.to_string_lossy().to_string())
+        .bind(&source_language)
+        .bind(&target_language)
+        .bind(TranslationTaskStatus::Pending.as_str())
+        .bind(&input.provider_id)
+        .bind(&model.id)
+        .bind(&model.request_name)
+        .bind(input.assistant_id.as_deref().filter(|value| !value.is_empty()))
+        .bind(assistant_prompt.as_deref())
+        .bind(assistant_custom_parameters.to_string())
+        .bind(config.use_glossary)
+        .bind(config.glossary_mode.as_str())
+        .bind(config.glossary_id.as_deref())
+        .bind(tags_json)
+        .bind(config.chunk_token_limit)
+        .bind(config.max_concurrency)
+        .bind(config.max_retries)
+        .bind(config_snapshot)
+        .bind(global_background.as_deref())
+        .bind(total_chunks as i64)
+        .bind(progress_detail_json)
+        .bind(&created_at)
+        .bind(&created_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())
+    );
+
+    try_creation!(
+        insert_source_file(
+            &mut transaction,
+            &source_file_name,
+            &source_bytes,
+            &created_at,
+        )
+        .await
+    );
+    try_creation!(insert_assets(&mut transaction, &parsed_source.assets, &created_at).await);
+
+    for chunk in parsed_source.chunks {
+        try_creation!(
+            sqlx::query(
+                "INSERT INTO chunks (
+                    id, sequence, map_json, preprocessed_text, source_text,
+                    after_translate_text, translated_text, status, retry_count,
+                    input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?)",
+            )
+            .bind(format!("{task_id}_chunk_{:06}", chunk.sequence))
+            .bind(chunk.sequence)
+            .bind(chunk.map_json)
+            .bind(chunk.preprocessed_text)
+            .bind(chunk.source_text)
+            .bind(TranslationChunkStatus::Pending.as_str())
+            .bind(&created_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())
+        );
+    }
+    try_creation!(transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string()));
+    cancel_creation!();
+
+    let view = try_creation!(
+        refresh_task_stats_without_index(&inp_pool, &config_pool, &inp_path, None).await
+    );
+    inp_pool.close().await;
+
+    Ok(Some(view))
+}
+
 pub async fn import_translation_task(
     config_pool: &SqlitePool,
     workspace_root: &Path,
@@ -1249,6 +1694,40 @@ pub async fn import_translation_task(
     upsert_task_index(config_pool, &task).await?;
     inp_pool.close().await;
     Ok(task)
+}
+
+pub async fn publish_staged_translation_task(
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    task_id: &str,
+    inp_path: &Path,
+) -> Result<TranslationTaskView, String> {
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Refusing to publish a task outside the workspace".into());
+    }
+    let inp_pool = connect_inp(inp_path).await?;
+    let metadata = metadata_task(&inp_pool, inp_path).await?;
+    if metadata.id != task_id {
+        inp_pool.close().await;
+        return Err("Staged task identity does not match its task file".into());
+    }
+    let task = refresh_task_stats(&inp_pool, config_pool, inp_path, None).await?;
+    inp_pool.close().await;
+    Ok(task)
+}
+
+pub async fn discard_staged_translation_task(
+    workspace_root: &Path,
+    inp_path: &Path,
+) -> Result<(), String> {
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Refusing to discard a task outside the workspace".into());
+    }
+    match tokio::fs::remove_file(inp_path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub async fn list_translation_tasks(
@@ -1523,6 +2002,55 @@ pub async fn get_translation_task_detail(
     Ok(TranslationTaskDetail { task, chunks })
 }
 
+pub async fn mark_task_interrupted_pending(
+    app: &AppHandle,
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    id: &str,
+) -> Result<TranslationTaskView, String> {
+    let task = get_task_from_index(config_pool, id).await?;
+    let inp_path = PathBuf::from(&task.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
+    let inp_pool = connect_inp(&inp_path).await?;
+    sqlx::query(
+        "UPDATE metadata
+         SET status = ?, updated_at = ?
+         WHERE task_id = ?",
+    )
+    .bind(TranslationTaskStatus::InterruptedPending.as_str())
+    .bind(unix_timestamp())
+    .bind(id)
+    .execute(&inp_pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let stats = aggregate_chunk_stats(&inp_pool).await?;
+    let metadata = metadata_task(&inp_pool, &inp_path).await?;
+    let glossary_config = task_glossary_config(&inp_pool).await?;
+    let detail = progress_detail_for_translation_stats(
+        metadata.progress_detail,
+        stats.total_chunks.max(0) as u64,
+        stats.completed_chunks.max(0) as u64,
+        TranslationTaskStatus::InterruptedPending,
+        &glossary_config,
+    );
+    set_progress_detail(&inp_pool, &detail).await?;
+    let task = refresh_task_stats(
+        &inp_pool,
+        config_pool,
+        &inp_path,
+        Some(TranslationTaskStatus::InterruptedPending),
+    )
+    .await?;
+    let _ = app.emit(
+        TRANSLATION_PROGRESS_EVENT,
+        TranslationProgressPayload { task: task.clone() },
+    );
+    inp_pool.close().await;
+    Ok(task)
+}
+
 pub async fn delete_translation_task(
     config_pool: &SqlitePool,
     workspace_root: &Path,
@@ -1530,6 +2058,12 @@ pub async fn delete_translation_task(
 ) -> Result<(), String> {
     let task = get_task_from_index(config_pool, id).await?;
     let inp_path = PathBuf::from(&task.inp_path);
+    if matches!(
+        task.status,
+        TranslationTaskStatus::Running | TranslationTaskStatus::InterruptedPending
+    ) {
+        return Err("Pause the running task before deleting it".into());
+    }
     if !inp_path.starts_with(workspace_root) {
         return Err("Refusing to delete a task outside the workspace".into());
     }
@@ -1552,7 +2086,10 @@ pub async fn delete_translation_tasks(
 ) -> Result<(), String> {
     for id in ids {
         let task = get_task_from_index(config_pool, id).await?;
-        if task.status == TranslationTaskStatus::Running {
+        if matches!(
+            task.status,
+            TranslationTaskStatus::Running | TranslationTaskStatus::InterruptedPending
+        ) {
             return Err("请先暂停正在运行的任务".into());
         }
     }
@@ -1630,11 +2167,12 @@ pub(super) async fn finalize_task(
     Ok(())
 }
 
-pub(super) async fn refresh_task_stats(
+async fn refresh_task_stats_internal(
     inp_pool: &SqlitePool,
     config_pool: &SqlitePool,
     inp_path: &Path,
     forced_status: Option<TranslationTaskStatus>,
+    update_index: bool,
 ) -> Result<TranslationTaskView, String> {
     let stats = aggregate_chunk_stats(inp_pool).await?;
     let metadata = metadata_task(inp_pool, inp_path).await?;
@@ -1665,8 +2203,28 @@ pub(super) async fn refresh_task_stats(
     .await
     .map_err(|error| error.to_string())?;
     let refreshed = metadata_task(inp_pool, inp_path).await?;
-    upsert_task_index(config_pool, &refreshed).await?;
+    if update_index {
+        upsert_task_index(config_pool, &refreshed).await?;
+    }
     Ok(refreshed)
+}
+
+pub(super) async fn refresh_task_stats(
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    forced_status: Option<TranslationTaskStatus>,
+) -> Result<TranslationTaskView, String> {
+    refresh_task_stats_internal(inp_pool, config_pool, inp_path, forced_status, true).await
+}
+
+async fn refresh_task_stats_without_index(
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    forced_status: Option<TranslationTaskStatus>,
+) -> Result<TranslationTaskView, String> {
+    refresh_task_stats_internal(inp_pool, config_pool, inp_path, forced_status, false).await
 }
 
 #[derive(Debug, Clone)]
@@ -1742,13 +2300,15 @@ pub(super) async fn upsert_task_index(
     task: &TranslationTaskView,
 ) -> Result<(), String> {
     let tags_json = serialize_tags(&task.tags)?;
+    let progress_detail_json = serialize_progress_detail(task.progress_detail.as_ref())?;
     sqlx::query(
         "INSERT INTO task_index (
             id, name, inp_path, source_path, source_language, target_language, status, progress,
             provider_id, model_id, model_request_name, assistant_id, tags_json, total_chunks, completed_chunks,
             failed_chunks, interrupted_chunks, input_tokens, output_tokens, cached_tokens,
-            thinking_tokens, total_tokens, error_rate, last_error, rate_limit_status, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            thinking_tokens, total_tokens, error_rate, last_error, rate_limit_status, progress_detail_json,
+            created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             inp_path = excluded.inp_path,
@@ -1774,6 +2334,7 @@ pub(super) async fn upsert_task_index(
             error_rate = excluded.error_rate,
             last_error = excluded.last_error,
             rate_limit_status = excluded.rate_limit_status,
+            progress_detail_json = excluded.progress_detail_json,
             updated_at = excluded.updated_at",
     )
     .bind(&task.id)
@@ -1801,6 +2362,7 @@ pub(super) async fn upsert_task_index(
     .bind(task.error_rate)
     .bind(task.last_error.as_deref())
     .bind(task.rate_limit_status.as_deref())
+    .bind(progress_detail_json)
     .bind(&task.created_at)
     .bind(&task.updated_at)
     .execute(pool)
@@ -1851,6 +2413,7 @@ fn task_from_index_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranslationTaskV
         error_rate: row.get("error_rate"),
         last_error: row.get("last_error"),
         rate_limit_status: row.get("rate_limit_status"),
+        progress_detail: row_progress_detail(row)?,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -1892,6 +2455,7 @@ pub(super) async fn metadata_task(
         error_rate: row.get("error_rate"),
         last_error: row.get("last_error"),
         rate_limit_status: row.get("rate_limit_status"),
+        progress_detail: row_progress_detail(&row)?,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -2033,6 +2597,9 @@ pub(super) fn config_snapshot_json(
         "useGlossary": config.use_glossary,
         "glossaryMode": config.glossary_mode,
         "glossaryId": config.glossary_id,
+        "thinkingEffort": config.thinking_effort,
+        "useWebSearch": config.use_web_search,
+        "useTools": config.use_tools,
         "confidenceMode": config.confidence_mode,
         "pdfParsingMode": config.pdf_parsing_mode,
         "providerId": provider_id,
@@ -2110,6 +2677,150 @@ fn parse_tags_json(tags_json: String) -> Result<Vec<String>, String> {
     let tags = serde_json::from_str::<Vec<String>>(&tags_json)
         .map_err(|error| format!("Stored task tags are invalid: {error}"))?;
     normalize_tags(tags)
+}
+
+fn serialize_progress_detail(detail: Option<&ProgressDetail>) -> Result<Option<String>, String> {
+    detail
+        .map(|value| serde_json::to_string(value).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn parse_progress_detail_json(
+    progress_detail_json: Option<String>,
+) -> Result<Option<ProgressDetail>, String> {
+    progress_detail_json
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            serde_json::from_str::<ProgressDetail>(&value)
+                .map_err(|error| format!("Stored task progress detail is invalid: {error}"))
+        })
+        .transpose()
+}
+
+fn row_progress_detail(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProgressDetail>, String> {
+    parse_progress_detail_json(
+        row.try_get::<Option<String>, _>("progress_detail_json")
+            .unwrap_or(None),
+    )
+}
+
+fn count_label(name: &str, current: u64, total: u64) -> String {
+    format!("{name} ({current}/{total})")
+}
+
+fn glossary_step_for_config(config: &TaskGlossaryConfig, current: u64, total: u64) -> ProgressStep {
+    if !config.use_glossary {
+        return ProgressStep::success(1, 1, "术语表已忽略");
+    }
+    if config.glossary_mode == GlossaryMode::Existing || config.glossary_id.is_some() {
+        return ProgressStep::success(1, 1, "术语表已选择");
+    }
+    if current == 0 {
+        ProgressStep::pending(current, total, count_label("术语表建立", current, total))
+    } else if current >= total && total > 0 {
+        ProgressStep::success(current, total, count_label("术语表建立", current, total))
+    } else {
+        ProgressStep::running(current, total, count_label("术语表建立", current, total))
+    }
+}
+
+pub(super) fn progress_detail_for_config(
+    total_chunks: u64,
+    completed_chunks: u64,
+    config: &TaskGlossaryConfig,
+) -> ProgressDetail {
+    ProgressDetail {
+        ast: ProgressStep::success(1, 1, "AST 已完成"),
+        chunking: ProgressStep::success(
+            total_chunks,
+            total_chunks,
+            count_label("分块", total_chunks, total_chunks),
+        ),
+        glossary: glossary_step_for_config(config, 0, total_chunks),
+        translating: ProgressStep::pending(
+            completed_chunks,
+            total_chunks,
+            count_label("翻译", completed_chunks, total_chunks),
+        ),
+        restore: ProgressStep::pending(
+            completed_chunks,
+            total_chunks,
+            count_label("占位符恢复", completed_chunks, total_chunks),
+        ),
+    }
+}
+
+pub(super) fn progress_detail_for_translation_stats(
+    existing: Option<ProgressDetail>,
+    total_chunks: u64,
+    completed_chunks: u64,
+    task_status: TranslationTaskStatus,
+    config: &TaskGlossaryConfig,
+) -> ProgressDetail {
+    let mut detail = existing
+        .unwrap_or_else(|| progress_detail_for_config(total_chunks, completed_chunks, config));
+    if matches!(detail.glossary.state.as_str(), "pending" | "running") && !config.use_glossary {
+        detail.glossary = ProgressStep::success(1, 1, "术语表已忽略");
+    } else if matches!(detail.glossary.state.as_str(), "pending" | "running")
+        && config.glossary_mode == GlossaryMode::Existing
+    {
+        detail.glossary = ProgressStep::success(1, 1, "术语表已选择");
+    }
+    let step_state = match task_status {
+        TranslationTaskStatus::Failed | TranslationTaskStatus::Interrupted => "failed",
+        TranslationTaskStatus::Success if completed_chunks >= total_chunks => "success",
+        TranslationTaskStatus::Success => "failed",
+        TranslationTaskStatus::Pending => "pending",
+        TranslationTaskStatus::Running | TranslationTaskStatus::InterruptedPending => "running",
+    };
+    detail.translating = ProgressStep::new(
+        step_state,
+        completed_chunks,
+        total_chunks,
+        count_label("翻译", completed_chunks, total_chunks),
+    );
+    detail.restore = ProgressStep::new(
+        step_state,
+        completed_chunks,
+        total_chunks,
+        count_label("占位符恢复", completed_chunks, total_chunks),
+    );
+    detail
+}
+
+pub(super) async fn set_progress_detail(
+    pool: &SqlitePool,
+    detail: &ProgressDetail,
+) -> Result<(), String> {
+    let progress_detail_json = serialize_progress_detail(Some(detail))?;
+    sqlx::query(
+        "UPDATE metadata
+         SET progress_detail_json = ?, updated_at = ?
+         WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
+    )
+    .bind(progress_detail_json)
+    .bind(unix_timestamp())
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(super) async fn set_progress_detail_and_emit(
+    app: &AppHandle,
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    detail: &ProgressDetail,
+    forced_status: Option<TranslationTaskStatus>,
+) -> Result<TranslationTaskView, String> {
+    set_progress_detail(inp_pool, detail).await?;
+    let task = refresh_task_stats(inp_pool, config_pool, inp_path, forced_status).await?;
+    let _ = app.emit(
+        TRANSLATION_PROGRESS_EVENT,
+        TranslationProgressPayload { task: task.clone() },
+    );
+    Ok(task)
 }
 
 pub(super) fn validate_task_name(value: &str) -> Result<String, String> {

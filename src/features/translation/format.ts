@@ -35,6 +35,64 @@ function hasRateLimitSignal(value: string): boolean {
   return /HTTP\s*429|RESOURCE_EXHAUSTED|rate_limited=true|Rate limit reached|quota|配额|频率/i.test(value);
 }
 
+const httpErrorMessages: Partial<Record<number, TaskStatusMessage>> = {
+  400: {
+    text: "400：请求参数不被服务接受，请检查模型或自定义参数配置",
+    severity: "danger",
+  },
+  401: {
+    text: "401：认证失败，请检查 API Key 或登录凭证",
+    severity: "danger",
+  },
+  403: {
+    text: "403：权限不足或当前账号无模型访问权限",
+    severity: "danger",
+  },
+  404: {
+    text: "404：接口或模型不存在，请检查 Base URL 和模型名称",
+    severity: "danger",
+  },
+  408: {
+    text: "408：请求超时，可稍后重试或降低并发",
+    severity: "warning",
+  },
+  413: {
+    text: "413：请求内容过大，请降低分块大小后重试",
+    severity: "danger",
+  },
+  422: {
+    text: "422：请求内容无法被服务处理，请检查模型参数",
+    severity: "danger",
+  },
+  429: {
+    text: "429：请求频率或配额达到限制，可稍后继续",
+    severity: "warning",
+  },
+  500: {
+    text: "500：服务商接口暂时异常，可稍后重试",
+    severity: "warning",
+  },
+  502: {
+    text: "502：服务商接口暂时异常，可稍后重试",
+    severity: "warning",
+  },
+  503: {
+    text: "503：服务商接口暂时异常，可稍后重试",
+    severity: "warning",
+  },
+  504: {
+    text: "504：服务商接口暂时异常，可稍后重试",
+    severity: "warning",
+  },
+};
+
+function httpStatusMessage(value: string): TaskStatusMessage | null {
+  const match = /\bHTTP\s*(\d{3})\b/i.exec(value);
+  if (!match) return null;
+  const status = Number(match[1]);
+  return httpErrorMessages[status] ?? null;
+}
+
 function failedProgressStep(task: TranslationTaskView): ProgressStep | null {
   if (!task.progressDetail) return null;
   const steps = [
@@ -47,6 +105,9 @@ function failedProgressStep(task: TranslationTaskView): ProgressStep | null {
 }
 
 function localizeTaskError(value: string): TaskStatusMessage {
+  const httpMessage = httpStatusMessage(value);
+  if (httpMessage) return httpMessage;
+
   if (hasRateLimitSignal(value)) {
     return {
       text: "请求频率或配额达到限制，可稍后继续",

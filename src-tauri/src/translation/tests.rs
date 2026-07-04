@@ -1062,7 +1062,7 @@ async fn validates_inp_files_and_rejects_damaged_shapes() {
 }
 
 #[tokio::test]
-async fn imports_rejects_duplicates_and_renames_metadata_and_index() {
+async fn imports_rejects_duplicates_and_updates_metadata_and_index() {
     let root = temp_root("inp-import");
     let external_root = temp_root("inp-external");
     let external_path = external_root.join("incoming.inp");
@@ -1120,6 +1120,47 @@ async fn imports_rejects_duplicates_and_renames_metadata_and_index() {
         .await
         .expect("read metadata name");
     assert_eq!(metadata_name, "Renamed Task");
+    inp_pool.close().await;
+
+    let updated = update_translation_task_info(
+        &pool,
+        &root,
+        UpdateTranslationTaskInfoInput {
+            id: imported.id.clone(),
+            name: "Tagged Task".into(),
+            tags: vec![
+                " Batch ".into(),
+                "urgent".into(),
+                "batch".into(),
+                "".into(),
+                "校对".into(),
+            ],
+        },
+    )
+    .await
+    .expect("update task info");
+    assert_eq!(updated.name, "Tagged Task");
+    assert_eq!(updated.tags, vec!["Batch", "urgent", "校对"]);
+
+    let indexed = get_task_from_index(&pool, &imported.id)
+        .await
+        .expect("read updated index");
+    assert_eq!(indexed.name, "Tagged Task");
+    assert_eq!(indexed.tags, vec!["Batch", "urgent", "校对"]);
+    let inp_pool = connect_inp(Path::new(&updated.inp_path))
+        .await
+        .expect("open updated inp");
+    let metadata_row = sqlx::query("SELECT name, tags_json FROM metadata LIMIT 1")
+        .fetch_one(&inp_pool)
+        .await
+        .expect("read updated metadata");
+    let metadata_name: String = metadata_row.get("name");
+    let metadata_tags: String = metadata_row.get("tags_json");
+    assert_eq!(metadata_name, "Tagged Task");
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&metadata_tags).expect("parse metadata tags"),
+        vec!["Batch", "urgent", "校对"]
+    );
     inp_pool.close().await;
     pool.close().await;
 

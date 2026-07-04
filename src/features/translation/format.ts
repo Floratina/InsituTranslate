@@ -32,7 +32,7 @@ export function statusLabel(status: TranslationTaskStatus): string {
 }
 
 function hasRateLimitSignal(value: string): boolean {
-  return /HTTP\s*429|RESOURCE_EXHAUSTED|rate_limited=true|Rate limit reached|quota|配额|频率/i.test(value);
+  return /RESOURCE_EXHAUSTED|rate_limited=true|Rate limit reached|quota|配额|频率/i.test(value);
 }
 
 const httpErrorMessages: Partial<Record<number, TaskStatusMessage>> = {
@@ -149,8 +149,10 @@ export function taskStatusMessage(task: TranslationTaskView): TaskStatusMessage 
   if (lastError) return localizeTaskError(lastError);
 
   const rateLimitStatus = task.rateLimitStatus?.trim();
-  if (rateLimitStatus && hasRateLimitSignal(rateLimitStatus)) {
-    return localizeTaskError(rateLimitStatus);
+  if (rateLimitStatus) {
+    const httpMessage = httpStatusMessage(rateLimitStatus);
+    if (httpMessage) return httpMessage;
+    if (hasRateLimitSignal(rateLimitStatus)) return localizeTaskError(rateLimitStatus);
   }
 
   const failedStep = failedProgressStep(task);

@@ -34,11 +34,11 @@ use super::{
     ImportTranslationTaskInput, RateLimitStrategy, TokenStats, TranslationChunkStatus,
     TranslationChunkView, TranslationConfigView, TranslationProgressPayload, TranslationTaskDetail,
     TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskStatus,
-    TranslationTaskView, UpdateTranslationConfigInput, UpdateTranslationTaskNameInput,
-    UpdateTranslationTaskTagsInput, CONFIG_DB_FILE, DEFAULT_CHUNK_TOKEN_LIMIT,
-    DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_MAX_RETRIES,
-    DEFAULT_MAX_TOKENS_PER_MINUTE, INP_FILE_DAMAGED, INP_SCHEMA_VERSION, MAX_TASK_NAME_LENGTH,
-    MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH, SOURCE_FILE_UNAVAILABLE, TASKS_DIR,
+    TranslationTaskView, UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput,
+    UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput, CONFIG_DB_FILE,
+    DEFAULT_CHUNK_TOKEN_LIMIT, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE,
+    DEFAULT_MAX_RETRIES, DEFAULT_MAX_TOKENS_PER_MINUTE, INP_FILE_DAMAGED, INP_SCHEMA_VERSION,
+    MAX_TASK_NAME_LENGTH, MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH, SOURCE_FILE_UNAVAILABLE, TASKS_DIR,
     TRANSLATION_PROGRESS_EVENT, TRANSLATION_TASK_CREATION_PROGRESS_EVENT,
 };
 
@@ -1810,6 +1810,36 @@ pub async fn update_translation_task_tags(
     let now = unix_timestamp();
     let inp_pool = connect_inp(&inp_path).await?;
     sqlx::query("UPDATE metadata SET tags_json = ?, updated_at = ? WHERE task_id = ?")
+        .bind(tags_json)
+        .bind(&now)
+        .bind(&input.id)
+        .execute(&inp_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let task = metadata_task(&inp_pool, &inp_path).await?;
+    upsert_task_index(config_pool, &task).await?;
+    inp_pool.close().await;
+    Ok(task)
+}
+
+pub async fn update_translation_task_info(
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    input: UpdateTranslationTaskInfoInput,
+) -> Result<TranslationTaskView, String> {
+    let name = validate_task_name(&input.name)?;
+    let tags = normalize_tags(input.tags)?;
+    let tags_json = serialize_tags(&tags)?;
+    let indexed = get_task_from_index(config_pool, &input.id).await?;
+    let inp_path = PathBuf::from(&indexed.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
+
+    let now = unix_timestamp();
+    let inp_pool = connect_inp(&inp_path).await?;
+    sqlx::query("UPDATE metadata SET name = ?, tags_json = ?, updated_at = ? WHERE task_id = ?")
+        .bind(name)
         .bind(tags_json)
         .bind(&now)
         .bind(&input.id)

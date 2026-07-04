@@ -36,7 +36,7 @@ use crate::translation_tasks::{
     TranslationInterrupt, TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
     TranslationTaskCreationStatus, TranslationTaskDetail, TranslationTaskFilters,
     TranslationTaskIdsInput, TranslationTaskView, UpdateTranslationConfigInput,
-    UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
+    UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
 };
 
 #[derive(Debug, Clone)]
@@ -617,6 +617,19 @@ pub async fn update_translation_task_tags(
     input: UpdateTranslationTaskTagsInput,
 ) -> Result<TranslationTaskView, String> {
     translation_tasks::update_translation_task_tags(
+        &state.translation_config_pool,
+        &state.translation_workspace_root,
+        input,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn update_translation_task_info(
+    state: State<'_, AppState>,
+    input: UpdateTranslationTaskInfoInput,
+) -> Result<TranslationTaskView, String> {
+    translation_tasks::update_translation_task_info(
         &state.translation_config_pool,
         &state.translation_workspace_root,
         input,

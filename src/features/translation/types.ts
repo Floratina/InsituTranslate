@@ -136,6 +136,12 @@ export interface UpdateTranslationTaskNameInput {
   name: string;
 }
 
+export interface UpdateTranslationTaskInfoInput {
+  id: string;
+  name: string;
+  tags: string[];
+}
+
 export interface TranslationTaskIdsInput {
   ids: string[];
 }

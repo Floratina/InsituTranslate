@@ -80,7 +80,7 @@ import {
   resumeTranslationTask,
   startTranslationTask,
   startTranslationTasksBatch,
-  updateTranslationTaskName,
+  updateTranslationTaskInfo,
 } from "@/features/translation/api";
 import {
   formatPercent,
@@ -135,9 +135,10 @@ interface TaskSortState {
   mode: SortMode;
 }
 
-interface RenameState {
+interface TaskInfoState {
   task: TranslationTaskView;
   name: string;
+  tags: string;
 }
 
 interface ExportState {
@@ -178,6 +179,13 @@ function isTauriRuntime(): boolean {
 
 function getErrorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function splitTags(value: string): string[] {
+  return value
+    .split(/[，,]/)
+    .map((tag) => tag.trim())
+    .filter(Boolean);
 }
 
 function taskTab(status: TranslationTaskStatus): TaskTab {
@@ -454,7 +462,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState("");
   const [batchBusy, setBatchBusy] = useState(false);
-  const [renameState, setRenameState] = useState<RenameState | null>(null);
+  const [taskInfoState, setTaskInfoState] = useState<TaskInfoState | null>(null);
   const [exportState, setExportState] = useState<ExportState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<TranslationTaskView | null>(null);
   const [clearTargets, setClearTargets] = useState<TranslationTaskView[] | null>(null);
@@ -619,20 +627,21 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     }
   }
 
-  async function saveRename(): Promise<void> {
-    if (!renameState) return;
-    if (!renameState.name.trim()) {
+  async function saveTaskInfo(): Promise<void> {
+    if (!taskInfoState) return;
+    if (!taskInfoState.name.trim()) {
       pushToast("任务名称不能为空", "warning");
       return;
     }
-    setBusyId(renameState.task.id);
+    setBusyId(taskInfoState.task.id);
     try {
-      mergeTask(await updateTranslationTaskName({
-        id: renameState.task.id,
-        name: renameState.name,
+      mergeTask(await updateTranslationTaskInfo({
+        id: taskInfoState.task.id,
+        name: taskInfoState.name,
+        tags: splitTags(taskInfoState.tags),
       }));
-      setRenameState(null);
-      pushToast("任务已重命名", "success");
+      setTaskInfoState(null);
+      pushToast("任务信息已更新", "success");
     } catch (error) {
       pushToast(getErrorMessage(error), "error");
     } finally {
@@ -926,7 +935,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         onPause={(task) => void runTaskAction(task, pauseTranslationTask, "interrupted-pending")}
         onRetranslate={(task) => void runTaskAction(task, retranslateTranslationTask, "running", true)}
         onProofread={(task) => onOpenProofreading?.(task.id)}
-        onRename={(task) => setRenameState({ task, name: task.name })}
+        onEditInfo={(task) => setTaskInfoState({ task, name: task.name, tags: task.tags.join("，") })}
         onOpenFolder={(task) => {
           void openTranslationTaskFolder(task.id).catch((error: unknown) => {
             pushToast(getErrorMessage(error), "error");
@@ -936,14 +945,15 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         onDelete={setDeleteTarget}
       />
 
-      <RenameDialog
-        state={renameState}
-        saving={busyId === renameState?.task.id}
+      <TaskInfoDialog
+        state={taskInfoState}
+        saving={busyId === taskInfoState?.task.id}
         onOpenChange={(open) => {
-          if (!open) setRenameState(null);
+          if (!open) setTaskInfoState(null);
         }}
-        onNameChange={(name) => setRenameState((current) => current ? { ...current, name } : current)}
-        onSubmit={() => void saveRename()}
+        onNameChange={(name) => setTaskInfoState((current) => current ? { ...current, name } : current)}
+        onTagsChange={(tags) => setTaskInfoState((current) => current ? { ...current, tags } : current)}
+        onSubmit={() => void saveTaskInfo()}
       />
       <ExportDialog
         state={exportState}
@@ -999,7 +1009,7 @@ interface TasksTableProps {
   onPause: (task: TranslationTaskView) => void;
   onRetranslate: (task: TranslationTaskView) => void;
   onProofread: (task: TranslationTaskView) => void;
-  onRename: (task: TranslationTaskView) => void;
+  onEditInfo: (task: TranslationTaskView) => void;
   onOpenFolder: (task: TranslationTaskView) => void;
   onExport: (task: TranslationTaskView) => void;
   onDelete: (task: TranslationTaskView) => void;
@@ -1026,7 +1036,7 @@ function TasksTable({
   onPause,
   onRetranslate,
   onProofread,
-  onRename,
+  onEditInfo,
   onOpenFolder,
   onExport,
   onDelete,
@@ -1143,7 +1153,7 @@ function TasksTable({
                           onPause={onPause}
                           onRetranslate={onRetranslate}
                           onProofread={onProofread}
-                          onRename={onRename}
+                          onEditInfo={onEditInfo}
                           onOpenFolder={onOpenFolder}
                           onExport={onExport}
                           onDelete={onDelete}
@@ -1159,7 +1169,7 @@ function TasksTable({
                     onPause={onPause}
                     onRetranslate={onRetranslate}
                     onProofread={onProofread}
-                    onRename={onRename}
+                    onEditInfo={onEditInfo}
                     onOpenFolder={onOpenFolder}
                     onExport={onExport}
                     onDelete={onDelete}
@@ -1227,12 +1237,19 @@ function TaskTags({ tags }: { tags: string[] }) {
   return (
     <div className="flex min-w-0 flex-wrap gap-x-1 gap-y-1.5">
       {tags.slice(0, 3).map((tag) => (
-        <Badge key={tag} variant="outline" className="max-w-28 rounded-full bg-muted/35 text-2xs">
+        <Badge
+          key={tag}
+          variant="secondary"
+          className="max-w-24 rounded-full border-transparent bg-accent/45 text-accent-foreground dark:bg-accent/35"
+        >
           <span className="truncate">{tag}</span>
         </Badge>
       ))}
       {tags.length > 3 && (
-        <Badge variant="outline" className="rounded-full bg-muted/25 text-2xs">
+        <Badge
+          variant="secondary"
+          className="rounded-full border-transparent bg-accent/35 text-accent-foreground dark:bg-accent/30"
+        >
           +{tags.length - 3}
         </Badge>
       )}
@@ -1248,7 +1265,7 @@ interface TaskMenuProps {
   onPause: (task: TranslationTaskView) => void;
   onRetranslate: (task: TranslationTaskView) => void;
   onProofread: (task: TranslationTaskView) => void;
-  onRename: (task: TranslationTaskView) => void;
+  onEditInfo: (task: TranslationTaskView) => void;
   onOpenFolder: (task: TranslationTaskView) => void;
   onExport: (task: TranslationTaskView) => void;
   onDelete: (task: TranslationTaskView) => void;
@@ -1286,7 +1303,7 @@ function TaskActionDropdown(props: TaskMenuProps) {
   );
 }
 
-function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetranslate, onProofread, onRename, onOpenFolder, onExport, onDelete }: TaskMenuProps & { kind: "context" | "dropdown" }) {
+function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetranslate, onProofread, onEditInfo, onOpenFolder, onExport, onDelete }: TaskMenuProps & { kind: "context" | "dropdown" }) {
   const Item = kind === "context" ? ContextMenuItem : DropdownMenuItem;
   const Separator = kind === "context" ? ContextMenuSeparator : DropdownMenuSeparator;
   return (
@@ -1326,9 +1343,9 @@ function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetrans
         <FilePenLine className="size-3.5" />
         译后编辑和校对
       </Item>
-      <Item onSelect={() => onRename(task)}>
+      <Item onSelect={() => onEditInfo(task)}>
         <Pencil className="size-3.5" />
-        重命名任务
+        编辑任务信息
       </Item>
       <Separator />
       <Item onSelect={() => onOpenFolder(task)}>
@@ -1539,28 +1556,38 @@ function TableMessage({
   );
 }
 
-function RenameDialog({
+function TaskInfoDialog({
   state,
   saving,
   onOpenChange,
   onNameChange,
+  onTagsChange,
   onSubmit,
 }: {
-  state: RenameState | null;
+  state: TaskInfoState | null;
   saving: boolean;
   onOpenChange: (open: boolean) => void;
   onNameChange: (value: string) => void;
+  onTagsChange: (value: string) => void;
   onSubmit: () => void;
 }) {
   return (
     <Dialog open={state !== null} onOpenChange={onOpenChange}>
       <DialogContent open={state !== null} className="max-w-md">
         <DialogHeader>
-          <DialogTitle>重命名任务</DialogTitle>
+          <DialogTitle>编辑任务信息</DialogTitle>
         </DialogHeader>
         <DialogField>
           <Label>名称</Label>
           <Input value={state?.name ?? ""} onChange={(event) => onNameChange(event.target.value)} />
+        </DialogField>
+        <DialogField>
+          <Label>标签</Label>
+          <Input
+            value={state?.tags ?? ""}
+            onChange={(event) => onTagsChange(event.target.value)}
+            placeholder="多个标签用逗号分隔"
+          />
         </DialogField>
         <DialogFooter>
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>

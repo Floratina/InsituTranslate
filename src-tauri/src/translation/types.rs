@@ -428,6 +428,14 @@ pub struct UpdateTranslationTaskNameInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdateTranslationTaskInfoInput {
+    pub id: String,
+    pub name: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TranslationTaskIdsInput {
     pub ids: Vec<String>,
 }

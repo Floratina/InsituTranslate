@@ -38,7 +38,7 @@ pub use self::db::{
     get_translation_task_detail, import_translation_task, list_translation_tasks,
     mark_task_interrupted_pending, migrate_legacy_workspace, open_translation_task_folder,
     publish_staged_translation_task, rebase_task_index_paths, update_translation_config,
-    update_translation_task_name, update_translation_task_tags,
+    update_translation_task_info, update_translation_task_name, update_translation_task_tags,
 };
 
 #[allow(unused_imports)]
@@ -51,7 +51,8 @@ pub use self::types::{
     TranslationTaskCreationStage, TranslationTaskCreationStatus, TranslationTaskDetail,
     TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskIdsInput,
     TranslationTaskPdfOptions, TranslationTaskStatus, TranslationTaskView,
-    UpdateTranslationConfigInput, UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
+    UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput,
+    UpdateTranslationTaskTagsInput,
 };
 
 #[cfg(test)]

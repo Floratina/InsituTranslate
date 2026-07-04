@@ -124,6 +124,7 @@ pub fn run() {
             commands::import_translation_task,
             commands::update_translation_task_name,
             commands::update_translation_task_tags,
+            commands::update_translation_task_info,
             commands::open_translation_task_folder,
             commands::export_translation_task,
             commands::start_translation_task,

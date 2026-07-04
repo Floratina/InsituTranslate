@@ -11,6 +11,7 @@ import type {
   TranslationTaskIdsInput,
   TranslationTaskView,
   UpdateTranslationConfigInput,
+  UpdateTranslationTaskInfoInput,
   UpdateTranslationTaskNameInput,
   UpdateTranslationTaskTagsInput,
 } from "./types";
@@ -103,6 +104,12 @@ export function updateTranslationTaskTags(
   input: UpdateTranslationTaskTagsInput,
 ): Promise<TranslationTaskView> {
   return invoke<TranslationTaskView>("update_translation_task_tags", { input });
+}
+
+export function updateTranslationTaskInfo(
+  input: UpdateTranslationTaskInfoInput,
+): Promise<TranslationTaskView> {
+  return invoke<TranslationTaskView>("update_translation_task_info", { input });
 }
 
 export function openTranslationTaskFolder(id: string): Promise<void> {

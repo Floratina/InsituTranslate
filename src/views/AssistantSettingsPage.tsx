@@ -70,8 +70,6 @@ function settingsFromAssistant(assistant: AssistantView): AssistantSettingsDraft
     temperature: assistant.temperature,
     topPEnabled: assistant.topPEnabled,
     topP: assistant.topP,
-    toolMode: assistant.toolMode,
-    maxToolCalls: assistant.maxToolCalls,
   };
 }
 

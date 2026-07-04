@@ -312,7 +312,7 @@ pub struct TranslationConfigView {
     pub glossary_id: Option<String>,
     pub thinking_effort: ThinkingEffort,
     pub use_web_search: bool,
-    pub use_tools: bool,
+    pub use_custom_parameters: bool,
     pub confidence_mode: ConfidenceMode,
     pub pdf_parsing_mode: PdfParsingMode,
 }
@@ -340,7 +340,7 @@ impl Default for TranslationConfigView {
             glossary_id: None,
             thinking_effort: ThinkingEffort::None,
             use_web_search: false,
-            use_tools: false,
+            use_custom_parameters: false,
             confidence_mode: ConfidenceMode::Off,
             pdf_parsing_mode: PdfParsingMode::LocalFirst,
         }
@@ -375,7 +375,7 @@ pub struct UpdateTranslationConfigInput {
     #[serde(default)]
     pub use_web_search: bool,
     #[serde(default)]
-    pub use_tools: bool,
+    pub use_custom_parameters: bool,
     #[serde(default)]
     pub confidence_mode: ConfidenceMode,
     #[serde(default)]

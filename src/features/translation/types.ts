@@ -81,7 +81,7 @@ export interface TranslationConfigView {
   glossaryId: string | null;
   thinkingEffort: ThinkingEffort;
   useWebSearch: boolean;
-  useTools: boolean;
+  useCustomParameters: boolean;
   confidenceMode: ConfidenceMode;
   pdfParsingMode: PdfParsingMode;
 }

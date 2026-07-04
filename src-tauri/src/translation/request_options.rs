@@ -1,20 +1,16 @@
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::domain::{
     ModelView, ProviderProtocol, ProviderRuntimeConfig, ThinkingConfig, ThinkingEffort,
-    ThinkingMode, UnifiedTool, UnifiedToolChoice,
+    ThinkingMode,
 };
 use crate::features::{is_feature_supported, native_web_search_supported, FeatureId};
 
 use super::TranslationConfigView;
 
-const INSITU_TOOLS_KEY: &str = "insituTools";
-
 #[derive(Debug, Clone)]
 pub(super) struct TranslationRequestOptions {
     pub custom_parameters: Value,
-    pub tools: Vec<UnifiedTool>,
-    pub tool_choice: UnifiedToolChoice,
     pub web_search: bool,
     pub thinking: Option<ThinkingConfig>,
 }
@@ -25,30 +21,26 @@ pub(super) fn resolve_translation_request_options(
     model: &ModelView,
     custom_parameters: Value,
 ) -> Result<TranslationRequestOptions, String> {
-    let (custom_parameters, tools, tool_choice) = if config.use_tools {
-        if !model.capability_tools {
-            return Err(
-                "Tool calling is enabled, but the selected model does not have tool calling capability enabled."
-                    .into(),
-            );
-        }
-        extract_insitu_tools(custom_parameters)?
+    let custom_parameters = if config.use_custom_parameters {
+        validate_custom_parameters(custom_parameters)?
     } else {
-        (
-            remove_insitu_tools(custom_parameters)?,
-            Vec::new(),
-            UnifiedToolChoice::Auto,
-        )
+        Value::Object(serde_json::Map::new())
     };
     let thinking = resolve_translation_thinking(config.thinking_effort, runtime, model)?;
     let web_search = resolve_translation_web_search(config.use_web_search, runtime, model)?;
     Ok(TranslationRequestOptions {
         custom_parameters,
-        tools,
-        tool_choice,
         web_search,
         thinking,
     })
+}
+
+fn validate_custom_parameters(custom_parameters: Value) -> Result<Value, String> {
+    match custom_parameters {
+        Value::Null => Ok(Value::Object(serde_json::Map::new())),
+        Value::Object(object) => Ok(Value::Object(object)),
+        _ => Err("Assistant custom parameters must be a JSON object".into()),
+    }
 }
 
 fn resolve_translation_web_search(
@@ -135,95 +127,6 @@ fn resolve_translation_thinking(
     Ok(Some(thinking))
 }
 
-fn remove_insitu_tools(custom_parameters: Value) -> Result<Value, String> {
-    let mut custom = match custom_parameters {
-        Value::Null => Map::new(),
-        Value::Object(object) => object,
-        _ => return Err("Assistant custom parameters must be a JSON object".into()),
-    };
-    custom.remove(INSITU_TOOLS_KEY);
-    Ok(Value::Object(custom))
-}
-
-fn extract_insitu_tools(
-    custom_parameters: Value,
-) -> Result<(Value, Vec<UnifiedTool>, UnifiedToolChoice), String> {
-    let mut custom = match custom_parameters {
-        Value::Null => Map::new(),
-        Value::Object(object) => object,
-        _ => return Err("Assistant custom parameters must be a JSON object".into()),
-    };
-    let Some(insitu_tools) = custom.remove(INSITU_TOOLS_KEY) else {
-        return Ok((Value::Object(custom), Vec::new(), UnifiedToolChoice::Auto));
-    };
-    if insitu_tools.is_null() {
-        return Ok((Value::Object(custom), Vec::new(), UnifiedToolChoice::Auto));
-    }
-    let object = insitu_tools
-        .as_object()
-        .ok_or_else(|| "customParameters.insituTools must be a JSON object".to_string())?;
-    let choice = parse_tool_choice(object.get("choice"))?;
-    let tools = parse_tools(object.get("tools"))?;
-
-    Ok((Value::Object(custom), tools, choice))
-}
-
-fn parse_tool_choice(value: Option<&Value>) -> Result<UnifiedToolChoice, String> {
-    let Some(value) = value else {
-        return Ok(UnifiedToolChoice::Auto);
-    };
-    match value.as_str() {
-        Some("auto") => Ok(UnifiedToolChoice::Auto),
-        Some("required") => Ok(UnifiedToolChoice::Required),
-        Some("none") => Ok(UnifiedToolChoice::None),
-        _ => Err("customParameters.insituTools.choice must be auto, required, or none".into()),
-    }
-}
-
-fn parse_tools(value: Option<&Value>) -> Result<Vec<UnifiedTool>, String> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let tools = value
-        .as_array()
-        .ok_or_else(|| "customParameters.insituTools.tools must be a JSON array".to_string())?;
-    let mut output = Vec::with_capacity(tools.len());
-    for (index, tool) in tools.iter().enumerate() {
-        let object = tool.as_object().ok_or_else(|| {
-            format!("customParameters.insituTools.tools[{index}] must be a JSON object")
-        })?;
-        let name = required_string(object, "name", index)?;
-        let description = required_string(object, "description", index)?;
-        let input_schema = object
-            .get("inputSchema")
-            .filter(|value| value.is_object())
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "customParameters.insituTools.tools[{index}].inputSchema must be a JSON object"
-                )
-            })?;
-        output.push(UnifiedTool {
-            name,
-            description,
-            input_schema,
-        });
-    }
-    Ok(output)
-}
-
-fn required_string(object: &Map<String, Value>, key: &str, index: usize) -> Result<String, String> {
-    let value = object
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            format!("customParameters.insituTools.tools[{index}].{key} must be a non-empty string")
-        })?;
-    Ok(value.to_string())
-}
-
 fn openai_reasoning_effort(effort: ThinkingEffort) -> ThinkingEffort {
     match effort {
         ThinkingEffort::Max => ThinkingEffort::Xhigh,
@@ -301,7 +204,7 @@ mod tests {
         }
     }
 
-    fn model(request_name: &str, reasoning: bool, tools: bool) -> ModelView {
+    fn model(request_name: &str, reasoning: bool) -> ModelView {
         ModelView {
             id: "model-1".into(),
             provider_id: "provider-1".into(),
@@ -309,8 +212,8 @@ mod tests {
             alias: String::new(),
             source: "custom".into(),
             capability_reasoning: reasoning,
+            supported_thinking_efforts: Vec::new(),
             capability_web: false,
-            capability_tools: tools,
             test_status: "untested".into(),
             latency_ms: None,
             tested_at: None,
@@ -325,9 +228,9 @@ mod tests {
         }
     }
 
-    fn config_with_tools() -> TranslationConfigView {
+    fn config_with_custom_parameters() -> TranslationConfigView {
         TranslationConfigView {
-            use_tools: true,
+            use_custom_parameters: true,
             ..config(ThinkingEffort::None)
         }
     }
@@ -342,7 +245,7 @@ mod tests {
     fn web_model(request_name: &str) -> ModelView {
         ModelView {
             capability_web: true,
-            ..model(request_name, false, false)
+            ..model(request_name, false)
         }
     }
 
@@ -351,7 +254,7 @@ mod tests {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::None),
             &runtime(ProviderProtocol::OpenaiResponses, "https://api.openai.com"),
-            &model("gpt-5", false, false),
+            &model("gpt-5", false),
             json!({}),
         )
         .expect("options");
@@ -364,7 +267,7 @@ mod tests {
         let error = resolve_translation_request_options(
             &config(ThinkingEffort::Low),
             &runtime(ProviderProtocol::OpenaiResponses, "https://api.openai.com"),
-            &model("gpt-5", false, false),
+            &model("gpt-5", false),
             json!({}),
         )
         .expect_err("reasoning capability error");
@@ -377,7 +280,7 @@ mod tests {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::Low),
             &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
-            &model("deepseek-v4", true, false),
+            &model("deepseek-v4", true),
             json!({}),
         )
         .expect("low options");
@@ -389,7 +292,7 @@ mod tests {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::Xhigh),
             &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
-            &model("deepseek-v4", true, false),
+            &model("deepseek-v4", true),
             json!({}),
         )
         .expect("xhigh options");
@@ -407,7 +310,7 @@ mod tests {
                 ProviderProtocol::OpenaiChat,
                 "https://open.bigmodel.cn/api/paas/v4",
             ),
-            &model("glm-5.2", true, false),
+            &model("glm-5.2", true),
             json!({}),
         )
         .expect("glm options");
@@ -423,7 +326,7 @@ mod tests {
                 ProviderProtocol::OpenaiChat,
                 "https://open.bigmodel.cn/api/paas/v4",
             ),
-            &model("glm-5.2", true, false),
+            &model("glm-5.2", true),
             json!({}),
         )
         .expect("glm max options");
@@ -442,7 +345,7 @@ mod tests {
                 ProviderProtocol::OpenaiChat,
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
             ),
-            &model("qwen3-235b-a22b", true, false),
+            &model("qwen3-235b-a22b", true),
             json!({}),
         )
         .expect("qwen options");
@@ -457,14 +360,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_removes_insitu_tools() {
+    fn custom_parameters_are_disabled_by_default() {
         let options = resolve_translation_request_options(
-            &config_with_tools(),
+            &config(ThinkingEffort::None),
             &runtime(
                 ProviderProtocol::Gemini,
                 "https://generativelanguage.googleapis.com",
             ),
-            &model("gemini-2.5-pro", false, true),
+            &model("gemini-2.5-pro", false),
             json!({
                 "temperature": 0.2,
                 "insituTools": {
@@ -477,50 +380,62 @@ mod tests {
                 }
             }),
         )
-        .expect("tool options");
+        .expect("options");
 
-        assert_eq!(options.custom_parameters, json!({"temperature": 0.2}));
-        assert_eq!(options.tools.len(), 1);
-        assert_eq!(options.tool_choice, UnifiedToolChoice::Required);
+        assert_eq!(options.custom_parameters, json!({}));
     }
 
     #[test]
-    fn tools_require_model_capability() {
-        let error = resolve_translation_request_options(
-            &config_with_tools(),
+    fn custom_parameters_enable_without_parsing_insitu_tools() {
+        let parameters = json!({
+            "temperature": 0.2,
+            "insituTools": {
+                "choice": "definitely-not-tool-protocol-anymore",
+                "tools": [{
+                    "name": "lookup_term",
+                    "description": "Look up a term",
+                    "inputSchema": {"type": "object"}
+                }]
+            }
+        });
+        let options = resolve_translation_request_options(
+            &config_with_custom_parameters(),
             &runtime(ProviderProtocol::Anthropic, "https://api.anthropic.com"),
-            &model("claude-sonnet-4", false, false),
-            json!({
-                "insituTools": {
-                    "tools": [{
-                        "name": "lookup_term",
-                        "description": "Look up a term",
-                        "inputSchema": {"type": "object"}
-                    }]
-                }
-            }),
+            &model("claude-sonnet-4", false),
+            parameters.clone(),
         )
-        .expect_err("tool capability error");
+        .expect("custom parameters");
 
-        assert!(error.contains("tool calling capability"));
+        assert_eq!(options.custom_parameters, parameters);
     }
 
     #[test]
-    fn disabled_tools_remove_invalid_insitu_tools_without_parsing() {
+    fn custom_parameters_require_json_object_when_enabled() {
+        let error = resolve_translation_request_options(
+            &config_with_custom_parameters(),
+            &runtime(ProviderProtocol::Anthropic, "https://api.anthropic.com"),
+            &model("claude-sonnet-4", false),
+            json!(["not-object"]),
+        )
+        .expect_err("custom parameter shape error");
+
+        assert!(error.contains("custom parameters must be a JSON object"));
+    }
+
+    #[test]
+    fn custom_parameters_disabled_ignores_invalid_shape() {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::None),
             &runtime(ProviderProtocol::Anthropic, "https://api.anthropic.com"),
-            &model("claude-sonnet-4", false, false),
+            &model("claude-sonnet-4", false),
             json!({
                 "temperature": 0.1,
                 "insituTools": {"choice": "definitely-not-valid"}
             }),
         )
-        .expect("tool config ignored");
+        .expect("custom parameters ignored");
 
-        assert_eq!(options.custom_parameters, json!({"temperature": 0.1}));
-        assert!(options.tools.is_empty());
-        assert_eq!(options.tool_choice, UnifiedToolChoice::Auto);
+        assert_eq!(options.custom_parameters, json!({}));
     }
 
     #[test]
@@ -528,7 +443,7 @@ mod tests {
         let error = resolve_translation_request_options(
             &config_with_web_search(),
             &runtime(ProviderProtocol::OpenaiResponses, "https://api.openai.com"),
-            &model("gpt-5", false, false),
+            &model("gpt-5", false),
             json!({}),
         )
         .expect_err("web capability error");

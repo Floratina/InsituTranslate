@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use crate::domain::{
     LogprobStats, ProviderProtocol, ProviderRuntimeConfig, RemoteModel, ThinkingConfig,
     ThinkingEffort, ThinkingMode, ThinkingSummary, UnifiedChatRequest, UnifiedChatResponse,
-    UnifiedContent, UnifiedMessage, UnifiedToolChoice, UnifiedUsage,
+    UnifiedContent, UnifiedMessage, UnifiedUsage,
 };
 use crate::features::{is_feature_supported, FeatureId};
 use crate::vertex_ai;
@@ -880,7 +880,6 @@ fn openai_messages(
     let mut output = Vec::new();
     for message in messages {
         let mut text_parts = Vec::new();
-        let mut tool_calls = Vec::new();
         let mut reasoning_texts = Vec::new();
         let mut reasoning_details = Vec::new();
         for content in &message.content {
@@ -899,20 +898,6 @@ fn openai_messages(
                     "type": "image_url",
                     "image_url": {"url": format!("data:{media_type};base64,{data}")}
                 })),
-                UnifiedContent::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => tool_calls.push(json!({
-                    "id": id, "type": "function",
-                    "function": {"name": name, "arguments": arguments.to_string()}
-                })),
-                UnifiedContent::ToolResult {
-                    call_id, content, ..
-                } => {
-                    output
-                        .push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
-                }
                 UnifiedContent::Thinking {
                     text,
                     signature,
@@ -945,9 +930,11 @@ fn openai_messages(
                 }
             }
         }
+        let supports_reasoning_text =
+            is_feature_supported(FeatureId::OpenAiReasoningField, base_url, model)
+                || is_feature_supported(FeatureId::OpenAiReasoningContent, base_url, model);
         if !text_parts.is_empty()
-            || !tool_calls.is_empty()
-            || !reasoning_texts.is_empty()
+            || (!reasoning_texts.is_empty() && supports_reasoning_text)
             || !reasoning_details.is_empty()
         {
             let content = if text_parts.is_empty() {
@@ -967,9 +954,6 @@ fn openai_messages(
                 "role": message.role,
                 "content": content
             });
-            if !tool_calls.is_empty() {
-                item["tool_calls"] = Value::Array(tool_calls);
-            }
             if !reasoning_details.is_empty() {
                 item["reasoning_details"] = Value::Array(reasoning_details);
             } else if !reasoning_texts.is_empty() {
@@ -978,14 +962,6 @@ fn openai_messages(
                     item["reasoning"] = json!(reasoning);
                 } else if is_feature_supported(FeatureId::OpenAiReasoningContent, base_url, model) {
                     item["reasoning_content"] = json!(reasoning);
-                } else {
-                    match item.get_mut("content") {
-                        Some(Value::String(text)) => text.push_str(&reasoning),
-                        Some(Value::Array(parts)) => {
-                            parts.push(json!({"type": "text", "text": reasoning}));
-                        }
-                        _ => item["content"] = json!(reasoning),
-                    }
                 }
             }
             output.push(item);
@@ -1029,27 +1005,6 @@ pub fn build_openai_chat_body(base_url: &str, request: &UnifiedChatRequest) -> V
     }
     if request.logprobs && openai_chat_logprobs_supported(base_url) {
         body["logprobs"] = json!(true);
-    }
-    let mut tools: Vec<Value> = request
-        .tools
-        .iter()
-        .map(|tool| json!({
-            "type": "function",
-            "function": {"name": tool.name, "description": tool.description, "parameters": tool.input_schema}
-        }))
-        .collect();
-    if cache_control {
-        if let Some(last) = tools.last_mut() {
-            last["cache_control"] = json!({"type": "ephemeral"});
-        }
-    }
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools);
-        body["tool_choice"] = match request.tool_choice {
-            UnifiedToolChoice::Required => json!("required"),
-            UnifiedToolChoice::None => json!("none"),
-            UnifiedToolChoice::Auto => json!("auto"),
-        };
     }
     if let Some(thinking) = &request.thinking {
         merge_object(
@@ -1219,31 +1174,6 @@ fn openai_responses_input(messages: &[UnifiedMessage]) -> Vec<Value> {
                         }));
                     }
                 }
-                UnifiedContent::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    push_responses_message(&mut output, role, &mut content);
-                    output.push(json!({
-                        "type": "function_call",
-                        "call_id": id,
-                        "name": name,
-                        "arguments": arguments.to_string()
-                    }));
-                }
-                UnifiedContent::ToolResult {
-                    call_id,
-                    content: tool_content,
-                    ..
-                } => {
-                    push_responses_message(&mut output, role, &mut content);
-                    output.push(json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": tool_content
-                    }));
-                }
             }
         }
         push_responses_message(&mut output, role, &mut content);
@@ -1276,25 +1206,8 @@ pub fn build_openai_responses_body(base_url: &str, request: &UnifiedChatRequest)
             body["thinking"] = json!({"type": if disabled { "disabled" } else { "enabled" }});
         }
     }
-    let mut tools: Vec<Value> = request
-        .tools
-        .iter()
-        .map(|tool| json!({
-            "type": "function", "name": tool.name, "description": tool.description, "parameters": tool.input_schema
-        }))
-        .collect();
     if request.web_search {
-        tools.push(json!({"type": "web_search"}));
-    }
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools);
-    }
-    if !request.tools.is_empty() {
-        body["tool_choice"] = json!(match request.tool_choice {
-            UnifiedToolChoice::Required => "required",
-            UnifiedToolChoice::None => "none",
-            UnifiedToolChoice::Auto => "auto",
-        });
+        body["tools"] = json!([{"type": "web_search"}]);
     }
     if request.logprobs {
         enable_openai_response_logprobs(&mut body);
@@ -1322,12 +1235,6 @@ fn anthropic_content(message: &UnifiedMessage) -> Vec<Value> {
                 } else {
                     json!({"type": "thinking", "thinking": text, "signature": signature.clone().unwrap_or_default()})
                 }
-            }
-            UnifiedContent::ToolCall { id, name, arguments } => {
-                json!({"type": "tool_use", "id": id, "name": name, "input": arguments})
-            }
-            UnifiedContent::ToolResult { call_id, content, is_error } => {
-                json!({"type": "tool_result", "tool_use_id": call_id, "content": content, "is_error": is_error})
             }
         })
         .collect()
@@ -1409,32 +1316,8 @@ pub fn build_anthropic_body(request: &UnifiedChatRequest) -> Value {
             json!({"type": "disabled"})
         };
     }
-    if !request.tools.is_empty() || request.web_search {
-        let mut tools: Vec<Value> = request.tools.iter().map(|tool| json!({
-            "name": tool.name, "description": tool.description, "input_schema": tool.input_schema
-        })).collect();
-        if let Some(last) = tools.last_mut() {
-            last["cache_control"] = json!({"type": "ephemeral"});
-        }
-        if request.web_search {
-            tools.push(json!({"type": "web_search_20250305", "name": "web_search"}));
-        }
-        body["tools"] = Value::Array(tools);
-        body["tool_choice"] = if thinking_enabled {
-            json!({"type": "auto"})
-        } else {
-            match request.tool_choice {
-                UnifiedToolChoice::Required if request.tools.len() == 1 => {
-                    json!({"type": "tool", "name": request.tools[0].name})
-                }
-                UnifiedToolChoice::Required if !request.tools.is_empty() => {
-                    json!({"type": "any"})
-                }
-                UnifiedToolChoice::Required => json!({"type": "auto"}),
-                UnifiedToolChoice::None => json!({"type": "none"}),
-                UnifiedToolChoice::Auto => json!({"type": "auto"}),
-            }
-        };
+    if request.web_search {
+        body["tools"] = json!([{"type": "web_search_20250305", "name": "web_search"}]);
     }
     body
 }
@@ -1449,10 +1332,19 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
             .map(|part| match part {
                 UnifiedContent::Text { text } => json!({"text": text}),
                 UnifiedContent::CacheableText { text } => json!({"text": text}),
-                UnifiedContent::Image { media_type, data } => json!({"inlineData": {"mimeType": media_type, "data": data}}),
-                UnifiedContent::ToolCall { id, name, arguments } => json!({"functionCall": {"id": id, "name": name, "args": arguments}}),
-                UnifiedContent::ToolResult { call_id, content, .. } => json!({"functionResponse": {"id": call_id, "name": call_id, "response": {"content": content}}}),
-                UnifiedContent::Thinking { text, .. } => json!({"text": text, "thought": true}),
+                UnifiedContent::Image { media_type, data } => {
+                    json!({"inlineData": {"mimeType": media_type, "data": data}})
+                }
+                UnifiedContent::Thinking {
+                    text, signature, ..
+                } => {
+                    let mut part = json!({"text": text, "thought": true});
+                    if let Some(signature) = signature.as_deref().filter(|value| !value.is_empty())
+                    {
+                        part["thoughtSignature"] = json!(signature);
+                    }
+                    part
+                }
             })
             .collect();
         if message.role == "system" {
@@ -1477,7 +1369,7 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
             &request.model,
         ) {
             json!({
-                "includeThoughts": enabled,
+                "includeThoughts": false,
                 "thinkingLevel": if enabled {
                     gemini_thinking_level(thinking.effort)
                 } else {
@@ -1486,7 +1378,7 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
             })
         } else {
             json!({
-                "includeThoughts": enabled,
+                "includeThoughts": false,
                 "thinkingBudget": if enabled { thinking.budget_tokens.map(Value::from).unwrap_or(json!(-1)) } else { json!(0) }
             })
         };
@@ -1498,22 +1390,8 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
     if !system_parts.is_empty() {
         body["systemInstruction"] = json!({"parts": system_parts});
     }
-    let mut tools = Vec::new();
-    if !request.tools.is_empty() {
-        tools.push(json!({"functionDeclarations": request.tools.iter().map(|tool| json!({
-            "name": tool.name, "description": tool.description, "parametersJsonSchema": tool.input_schema
-        })).collect::<Vec<_>>()}));
-    }
     if request.web_search {
-        tools.push(json!({"googleSearch": {}}));
-    }
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools);
-    }
-    if !request.tools.is_empty() {
-        if request.tool_choice == UnifiedToolChoice::Required {
-            body["toolConfig"] = json!({"functionCallingConfig": {"mode": "ANY"}});
-        }
+        body["tools"] = json!([{"googleSearch": {}}]);
     }
     body
 }
@@ -1570,11 +1448,6 @@ pub fn build_ollama_body(request: &UnifiedChatRequest) -> Value {
     if options.as_object().is_some_and(|object| !object.is_empty()) {
         body["options"] = options;
     }
-    if !request.tools.is_empty() {
-        body["tools"] = Value::Array(request.tools.iter().map(|tool| json!({
-            "type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.input_schema}
-        })).collect());
-    }
     body
 }
 
@@ -1604,6 +1477,38 @@ fn push_encrypted_thinking(thinking: &mut Vec<UnifiedContent>, encrypted_data: &
         signature: None,
         encrypted_data: Some(encrypted_data.to_string()),
     });
+}
+
+fn strip_leading_inline_thinking(
+    text: &mut String,
+    reasoning: &mut String,
+    thinking: &mut Vec<UnifiedContent>,
+) {
+    let trimmed = text.trim_start();
+    let leading_whitespace = text.len() - trimmed.len();
+    let lower = trimmed.to_ascii_lowercase();
+    let Some((open_tag, close_tag)) = [("<thinking>", "</thinking>"), ("<think>", "</think>")]
+        .into_iter()
+        .find(|(open, _)| lower.starts_with(open))
+    else {
+        return;
+    };
+
+    let content_start = leading_whitespace + open_tag.len();
+    let after_open = &text[content_start..];
+    let after_open_lower = after_open.to_ascii_lowercase();
+    let Some(close_start_relative) = after_open_lower.find(close_tag) else {
+        let thinking_text = after_open.to_string();
+        push_thinking_text(reasoning, thinking, thinking_text.trim(), None);
+        text.clear();
+        return;
+    };
+
+    let close_end = content_start + close_start_relative + close_tag.len();
+    let thinking_text = text[content_start..content_start + close_start_relative].to_string();
+    let remaining = text[close_end..].trim_start().to_string();
+    push_thinking_text(reasoning, thinking, thinking_text.trim(), None);
+    *text = remaining;
 }
 
 fn append_openai_reasoning_details(
@@ -1667,7 +1572,6 @@ fn append_responses_output_item(
     text: &mut String,
     reasoning: &mut String,
     thinking: &mut Vec<UnifiedContent>,
-    tool_calls: &mut Vec<UnifiedContent>,
 ) {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => {
@@ -1687,24 +1591,6 @@ fn append_responses_output_item(
                 }
             }
         }
-        Some("function_call") => tool_calls.push(UnifiedContent::ToolCall {
-            id: item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            name: item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            arguments: item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .and_then(|value| serde_json::from_str(value).ok())
-                .unwrap_or(json!({})),
-        }),
         Some("reasoning") => append_responses_reasoning_item(item, reasoning, thinking),
         _ => {}
     }
@@ -1774,7 +1660,6 @@ pub fn normalize_response(
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut thinking = Vec::new();
-    let mut tool_calls = Vec::new();
     let usage;
     match protocol {
         ProviderProtocol::OpenaiChat => {
@@ -1806,28 +1691,6 @@ pub fn normalize_response(
                 &mut reasoning,
                 &mut thinking,
             );
-            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
-                tool_calls = calls
-                    .iter()
-                    .map(|call| UnifiedContent::ToolCall {
-                        id: call
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        name: call
-                            .pointer("/function/name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        arguments: call
-                            .pointer("/function/arguments")
-                            .and_then(Value::as_str)
-                            .and_then(|value| serde_json::from_str(value).ok())
-                            .unwrap_or(json!({})),
-                    })
-                    .collect();
-            }
             usage = usage_from_openai(raw.get("usage"));
         }
         ProviderProtocol::OpenaiResponses => {
@@ -1851,7 +1714,6 @@ pub fn normalize_response(
                                 &mut text,
                                 &mut reasoning,
                                 &mut thinking,
-                                &mut tool_calls,
                             );
                         }
                     }
@@ -1864,7 +1726,6 @@ pub fn normalize_response(
                                         &mut text,
                                         &mut reasoning,
                                         &mut thinking,
-                                        &mut tool_calls,
                                     );
                                 }
                             }
@@ -1875,13 +1736,7 @@ pub fn normalize_response(
             }
             if let Some(output) = raw.get("output").and_then(Value::as_array) {
                 for item in output {
-                    append_responses_output_item(
-                        item,
-                        &mut text,
-                        &mut reasoning,
-                        &mut thinking,
-                        &mut tool_calls,
-                    );
+                    append_responses_output_item(item, &mut text, &mut reasoning, &mut thinking);
                 }
             }
             text.push_str(raw.get("delta").and_then(Value::as_str).unwrap_or_default());
@@ -1911,19 +1766,6 @@ pub fn normalize_response(
                                 push_encrypted_thinking(&mut thinking, data);
                             }
                         }
-                        Some("tool_use") => tool_calls.push(UnifiedContent::ToolCall {
-                            id: part
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            name: part
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            arguments: part.get("input").cloned().unwrap_or(json!({})),
-                        }),
                         _ => {}
                     }
                 }
@@ -1971,25 +1813,12 @@ pub fn normalize_response(
                             &mut reasoning,
                             &mut thinking,
                             part.get("text").and_then(Value::as_str).unwrap_or_default(),
-                            None,
+                            part.get("thoughtSignature")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
                         );
                     } else {
                         text.push_str(part.get("text").and_then(Value::as_str).unwrap_or_default());
-                    }
-                    if let Some(call) = part.get("functionCall") {
-                        tool_calls.push(UnifiedContent::ToolCall {
-                            id: call
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            name: call
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            arguments: call.get("args").cloned().unwrap_or(json!({})),
-                        });
                     }
                 }
             }
@@ -2040,12 +1869,12 @@ pub fn normalize_response(
             });
         }
     }
+    strip_leading_inline_thinking(&mut text, &mut reasoning, &mut thinking);
     let logprob_stats = logprob_stats_from_raw(protocol, &raw);
     Ok(UnifiedChatResponse {
         text,
         reasoning,
         thinking,
-        tool_calls,
         usage,
         logprob_stats,
         raw,
@@ -2244,7 +2073,7 @@ fn usage_from_openai(value: Option<&Value>) -> Option<UnifiedUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ThinkingSummary, UnifiedTool};
+    use crate::domain::ThinkingSummary;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -2260,12 +2089,6 @@ mod tests {
                     text: "hello".into(),
                 }],
             }],
-            tools: vec![UnifiedTool {
-                name: "lookup".into(),
-                description: "Lookup".into(),
-                input_schema: json!({"type": "object"}),
-            }],
-            tool_choice: UnifiedToolChoice::Auto,
             web_search: false,
             thinking: Some(ThinkingConfig {
                 mode: ThinkingMode::Enabled,
@@ -2298,8 +2121,6 @@ mod tests {
                     }],
                 },
             ],
-            tools: Vec::new(),
-            tool_choice: UnifiedToolChoice::None,
             web_search: false,
             thinking: None,
             max_output_tokens: None,
@@ -2671,7 +2492,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_alternates_and_forces_auto_tool_choice() {
+    fn anthropic_alternates_adjacent_same_roles() {
         let mut request = request();
         request.messages.insert(
             0,
@@ -2684,7 +2505,7 @@ mod tests {
         );
         let body = build_anthropic_body(&request);
         assert_eq!(body.pointer("/messages/0/role"), Some(&json!("user")));
-        assert_eq!(body.pointer("/tool_choice/type"), Some(&json!("auto")));
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]
@@ -2710,7 +2531,7 @@ mod tests {
 
         assert_eq!(
             body.pointer("/generationConfig/thinkingConfig/includeThoughts"),
-            Some(&json!(true))
+            Some(&json!(false))
         );
         assert_eq!(
             body.pointer("/generationConfig/thinkingConfig/thinkingLevel"),
@@ -2722,7 +2543,7 @@ mod tests {
     }
 
     #[test]
-    fn vertex_ai_keeps_gemini_body_for_tools_and_thinking() {
+    fn vertex_ai_keeps_gemini_body_for_thinking() {
         let adapter = adapter_for(
             ProviderProtocol::VertexAi,
             "https://aiplatform.googleapis.com",
@@ -2738,10 +2559,7 @@ mod tests {
         assert!(url.contains(
             "/projects/project-1/locations/global/publishers/google/models/gemini-3-pro:generateContent"
         ));
-        assert_eq!(
-            body.pointer("/tools/0/functionDeclarations/0/name"),
-            Some(&json!("lookup"))
-        );
+        assert!(body.get("tools").is_none());
         assert_eq!(
             body.pointer("/generationConfig/thinkingConfig/thinkingLevel"),
             Some(&json!("high"))
@@ -2770,7 +2588,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_responses_input_with_tools_and_thinking() {
+    fn builds_responses_input_with_thinking() {
         let mut request = request();
         request.stream = false;
         request.messages = vec![
@@ -2791,20 +2609,7 @@ mod tests {
                     UnifiedContent::Text {
                         text: "Need lookup".into(),
                     },
-                    UnifiedContent::ToolCall {
-                        id: "call_1".into(),
-                        name: "lookup".into(),
-                        arguments: json!({"term": "A"}),
-                    },
                 ],
-            },
-            UnifiedMessage {
-                role: "user".into(),
-                content: vec![UnifiedContent::ToolResult {
-                    call_id: "call_1".into(),
-                    content: "Result".into(),
-                    is_error: false,
-                }],
             },
         ];
         let body = build_openai_responses_body("https://api.openai.com", &request);
@@ -2816,12 +2621,9 @@ mod tests {
         assert!(input
             .iter()
             .any(|item| item.get("type") == Some(&json!("reasoning"))));
-        assert!(input
+        assert!(!input
             .iter()
             .any(|item| item.get("type") == Some(&json!("function_call"))));
-        assert!(input
-            .iter()
-            .any(|item| item.get("type") == Some(&json!("function_call_output"))));
     }
 
     #[test]
@@ -2833,9 +2635,6 @@ mod tests {
         let body = build_openai_responses_body("https://api.openai.com", &request);
         let tools = body.get("tools").and_then(Value::as_array).expect("tools");
 
-        assert!(tools
-            .iter()
-            .any(|tool| tool.get("type") == Some(&json!("function"))));
         assert!(tools
             .iter()
             .any(|tool| tool.get("type") == Some(&json!("web_search"))));
@@ -2915,6 +2714,112 @@ mod tests {
         assert_eq!(response.text, "ok");
         assert_eq!(response.reasoning, "think");
         assert_eq!(response.thinking.len(), 2);
+    }
+
+    #[test]
+    fn drops_unsupported_openai_history_thinking() {
+        let mut request = prompt_request();
+        request.messages.push(UnifiedMessage {
+            role: "assistant".into(),
+            content: vec![UnifiedContent::Thinking {
+                text: "hidden plan".into(),
+                signature: None,
+                encrypted_data: None,
+            }],
+        });
+
+        let body = build_openai_chat_body("https://api.openai.com", &request);
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
+
+        assert_eq!(messages.len(), 2);
+        assert!(!messages
+            .iter()
+            .any(|message| message.get("content") == Some(&json!("hidden plan"))));
+    }
+
+    #[test]
+    fn normalizes_gemini_thought_parts_without_text_leakage() {
+        let response = normalize_response(
+            ProviderProtocol::Gemini,
+            json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [
+                            {
+                                "text": "think",
+                                "thought": true,
+                                "thoughtSignature": "sig"
+                            },
+                            {"text": "translated"}
+                        ]
+                    }
+                }]
+            }),
+        )
+        .expect("gemini response");
+
+        assert_eq!(response.text, "translated");
+        assert_eq!(response.reasoning, "think");
+        assert_eq!(response.thinking.len(), 1);
+        assert!(matches!(
+            &response.thinking[0],
+            UnifiedContent::Thinking {
+                text,
+                signature: Some(signature),
+                ..
+            } if text == "think" && signature == "sig"
+        ));
+
+        let thought_only = normalize_response(
+            ProviderProtocol::Gemini,
+            json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{"text": "think", "thought": true}]
+                    }
+                }]
+            }),
+        )
+        .expect("gemini thought only");
+
+        assert!(thought_only.text.is_empty());
+        assert_eq!(thought_only.reasoning, "think");
+    }
+
+    #[test]
+    fn strips_leading_inline_thinking_tags() {
+        let response = normalize_response(
+            ProviderProtocol::OpenaiChat,
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "<think>plan</think>\ntranslated"
+                    }
+                }]
+            }),
+        )
+        .expect("tagged response");
+
+        assert_eq!(response.text, "translated");
+        assert_eq!(response.reasoning, "plan");
+
+        let unclosed = normalize_response(
+            ProviderProtocol::OpenaiChat,
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "<thinking>unfinished"
+                    }
+                }]
+            }),
+        )
+        .expect("unclosed tagged response");
+
+        assert!(unclosed.text.is_empty());
+        assert_eq!(unclosed.reasoning, "unfinished");
     }
 
     #[test]

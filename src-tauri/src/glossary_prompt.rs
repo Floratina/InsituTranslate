@@ -438,7 +438,7 @@ mod tests {
         build_anthropic_body, build_gemini_body, build_ollama_body, build_openai_chat_body,
         build_openai_responses_body,
     };
-    use crate::domain::{UnifiedChatRequest, UnifiedContent, UnifiedToolChoice};
+    use crate::domain::{UnifiedChatRequest, UnifiedContent};
     use crate::task_prompt::{ContentFormat, DocumentFormat, TARGET_LANGUAGE_PLACEHOLDER};
 
     const INJECTION_TEXT: &str =
@@ -474,8 +474,6 @@ mod tests {
         UnifiedChatRequest {
             model: "test-model".into(),
             messages,
-            tools: Vec::new(),
-            tool_choice: UnifiedToolChoice::None,
             web_search: false,
             thinking: None,
             max_output_tokens: None,

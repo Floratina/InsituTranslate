@@ -84,7 +84,7 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   glossaryId: null,
   thinkingEffort: "none",
   useWebSearch: false,
-  useTools: false,
+  useCustomParameters: false,
   confidenceMode: "off",
   pdfParsingMode: "local-first",
 };
@@ -372,7 +372,7 @@ function normalizeStartConfig(
     contextHandlingMode,
     thinkingEffort: config.thinkingEffort ?? "none",
     useWebSearch: config.useWebSearch ?? false,
-    useTools: config.useTools ?? false,
+    useCustomParameters: config.useCustomParameters ?? false,
     confidenceMode: config.confidenceMode ?? "off",
     pdfParsingMode: config.pdfParsingMode ?? "local-first",
   };

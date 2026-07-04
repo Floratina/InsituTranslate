@@ -20,16 +20,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
@@ -47,7 +39,6 @@ import { AssistantIcon } from "./AssistantIcon";
 import { AssistantPromptDialog } from "./AssistantPromptDialog";
 import type {
   AssistantSettingsDraft,
-  AssistantToolMode,
   AssistantView,
   CustomParameterPreset,
 } from "./types";
@@ -287,57 +278,6 @@ export function AssistantDetailsPanel({
               onValueChange={(topP) => onSettingsChange({ ...settings, topP })}
             />
           </div>
-
-          <section className="grid gap-2 rounded-[6px] border p-3">
-            <div className="grid grid-cols-2 gap-2 max-[820px]:grid-cols-1">
-              <div className="flex flex-col gap-1">
-                <Label className="h-5">工具调用方式</Label>
-                <Select
-                  value={settings.toolMode}
-                  onValueChange={(value) =>
-                    onSettingsChange({
-                      ...settings,
-                      toolMode: value as AssistantToolMode,
-                    })
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="function">函数</SelectItem>
-                    <SelectItem value="prompt">提示词</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="flex flex-col gap-1">
-                <div className="flex h-5 items-center gap-1">
-                  <Label>最大工具调用次数</Label>
-                  <HelpTooltip>
-                    每个翻译分块允许的最大工具调用次数。值越高Token消耗越大。
-                  </HelpTooltip>
-                </div>
-                <Input
-                  type="number"
-                  min={0}
-                  step={1}
-                  value={settings.maxToolCalls}
-                  onChange={(event) =>
-                    onSettingsChange({
-                      ...settings,
-                      maxToolCalls: Math.max(
-                        0,
-                        Math.trunc(Number(event.target.value) || 0),
-                      ),
-                    })
-                  }
-                />
-                <div className="px-1 text-2xs text-muted-foreground">
-                  填写 0 表示禁用工具调用
-                </div>
-              </div>
-            </div>
-          </section>
 
           <section className="overflow-hidden rounded-[6px] border">
             <button

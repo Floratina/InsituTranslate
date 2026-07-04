@@ -38,8 +38,10 @@ export interface ModelView {
   alias: string;
   source: string;
   capabilityReasoning: boolean;
+  supportedThinkingEfforts: Array<
+    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+  >;
   capabilityWeb: boolean;
-  capabilityTools: boolean;
   testStatus: string;
   latencyMs: number | null;
   testedAt: string | null;

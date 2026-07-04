@@ -921,8 +921,6 @@ async fn translate_chunk(
         let request = UnifiedChatRequest {
             model: model_request_name.clone(),
             messages,
-            tools: request_options.tools.clone(),
-            tool_choice: request_options.tool_choice,
             web_search: request_options.web_search,
             thinking: request_options.thinking.clone(),
             max_output_tokens: None,

@@ -806,7 +806,6 @@ function ProviderSettingsPage() {
           alias: settingsModel.alias,
           capabilityReasoning: settingsModel.capabilityReasoning,
           capabilityWeb: settingsModel.capabilityWeb,
-          capabilityTools: settingsModel.capabilityTools,
         },
       });
       setSettingsModel(null);
@@ -1409,17 +1408,6 @@ function ProviderSettingsPage() {
                         setSettingsModel({
                           ...settingsModel,
                           capabilityWeb: !settingsModel.capabilityWeb,
-                        })
-                      }
-                    />
-                    <CapabilityBadge
-                      icon="capabilities"
-                      label="工具调用"
-                      active={settingsModel.capabilityTools}
-                      onClick={() =>
-                        setSettingsModel({
-                          ...settingsModel,
-                          capabilityTools: !settingsModel.capabilityTools,
                         })
                       }
                     />

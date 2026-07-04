@@ -1022,7 +1022,7 @@ pub async fn update_translation_config(
             .filter(|value| !value.is_empty()),
         thinking_effort: input.thinking_effort,
         use_web_search: input.use_web_search,
-        use_tools: input.use_tools,
+        use_custom_parameters: input.use_custom_parameters,
         confidence_mode: input.confidence_mode,
         pdf_parsing_mode: input.pdf_parsing_mode,
     };
@@ -1175,6 +1175,7 @@ pub async fn create_translation_task(
     if model.provider_id != input.provider_id {
         return Err("Selected model does not belong to the selected provider".into());
     }
+    let config = get_translation_config(config_pool).await?;
     let (assistant_prompt, assistant_custom_parameters) = match input
         .assistant_id
         .as_deref()
@@ -1182,11 +1183,15 @@ pub async fn create_translation_task(
     {
         Some(id) => {
             let assistant = app_db::get_assistant(provider_pool, id).await?;
-            (Some(assistant.system_prompt), assistant.custom_parameters)
+            let custom_parameters = if config.use_custom_parameters {
+                assistant.custom_parameters
+            } else {
+                json!({})
+            };
+            (Some(assistant.system_prompt), custom_parameters)
         }
         None => (None, json!({})),
     };
-    let config = get_translation_config(config_pool).await?;
     let task_id = app_db::new_id("task");
     let display_name = display_name_from_path(&source_path);
     let inp_path = next_inp_path(workspace_root, &display_name).await?;
@@ -1452,6 +1457,7 @@ pub async fn create_translation_task_with_progress(
     if model.provider_id != input.provider_id {
         fail_creation!("Selected model does not belong to the selected provider".to_string());
     }
+    let config = try_creation!(get_translation_config(&config_pool).await);
     let (assistant_prompt, assistant_custom_parameters) = match input
         .assistant_id
         .as_deref()
@@ -1459,11 +1465,15 @@ pub async fn create_translation_task_with_progress(
     {
         Some(id) => {
             let assistant = try_creation!(app_db::get_assistant(&provider_pool, id).await);
-            (Some(assistant.system_prompt), assistant.custom_parameters)
+            let custom_parameters = if config.use_custom_parameters {
+                assistant.custom_parameters
+            } else {
+                json!({})
+            };
+            (Some(assistant.system_prompt), custom_parameters)
         }
         None => (None, json!({})),
     };
-    let config = try_creation!(get_translation_config(&config_pool).await);
     let task_id = app_db::new_id("task");
     task_id_for_cleanup = Some(task_id.clone());
     let display_name = display_name_from_path(&source_path);
@@ -2581,6 +2591,24 @@ pub(super) async fn task_assistant_custom_parameters(pool: &SqlitePool) -> Resul
     }
 }
 
+pub(super) async fn task_use_custom_parameters(pool: &SqlitePool) -> Result<bool, String> {
+    let json: Option<String> =
+        sqlx::query_scalar("SELECT config_snapshot_json FROM metadata LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| error.to_string())?
+            .flatten();
+    let Some(value) = json.filter(|value| !value.trim().is_empty()) else {
+        return Ok(false);
+    };
+    let parsed = serde_json::from_str::<Value>(&value)
+        .map_err(|error| format!("Task config snapshot JSON is invalid: {error}"))?;
+    Ok(parsed
+        .get("useCustomParameters")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
 pub(super) fn config_snapshot_json(
     config: &TranslationConfigView,
     provider_id: &str,
@@ -2599,7 +2627,7 @@ pub(super) fn config_snapshot_json(
         "glossaryId": config.glossary_id,
         "thinkingEffort": config.thinking_effort,
         "useWebSearch": config.use_web_search,
-        "useTools": config.use_tools,
+        "useCustomParameters": config.use_custom_parameters,
         "confidenceMode": config.confidence_mode,
         "pdfParsingMode": config.pdf_parsing_mode,
         "providerId": provider_id,

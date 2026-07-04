@@ -1,7 +1,6 @@
 import type { ProviderPurpose } from "@/features/providers/types";
 
 export type AssistantIconKind = "emoji" | "lucide";
-export type AssistantToolMode = "function" | "prompt";
 export type CustomParameterPresetGroup =
   | "通用"
   | "OpenAI Chat"
@@ -22,8 +21,6 @@ export interface AssistantView {
   temperature: number;
   topPEnabled: boolean;
   topP: number;
-  toolMode: AssistantToolMode;
-  maxToolCalls: number;
   customParameters: Record<string, unknown>;
 }
 
@@ -36,8 +33,6 @@ export interface AssistantSettingsDraft {
   temperature: number;
   topPEnabled: boolean;
   topP: number;
-  toolMode: AssistantToolMode;
-  maxToolCalls: number;
 }
 
 export interface CustomParameterPreset {

@@ -178,6 +178,16 @@ const THINKING_EFFORT_OPTIONS: Array<{
   { value: "max", label: "Max" },
 ];
 
+const THINKING_EFFORT_ORDER: ThinkingEffort[] = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
 const PROOFREADING_OPTIONS: ProofreadingOption[] = [
   {
     id: "rule",
@@ -298,6 +308,41 @@ function selectedPdfParsingLabel(mode: PdfParsingMode): string {
     ?? PDF_PARSING_OPTIONS[0].label;
 }
 
+function supportedThinkingEffortsForModel(model: ModelView | null): ThinkingEffort[] {
+  if (!model?.capabilityReasoning) {
+    return ["none"];
+  }
+  const supported = model.supportedThinkingEfforts;
+  if (Array.isArray(supported) && supported.length > 0) {
+    return supported.includes("none") ? supported : ["none", ...supported];
+  }
+  return THINKING_EFFORT_OPTIONS.map((option) => option.value);
+}
+
+function normalizeThinkingEffort(
+  effort: ThinkingEffort,
+  supportedEfforts: ThinkingEffort[],
+): ThinkingEffort {
+  if (supportedEfforts.includes(effort)) {
+    return effort;
+  }
+  if (effort === "none") {
+    return "none";
+  }
+  const candidates = supportedEfforts.filter((value) => value !== "none");
+  if (candidates.length === 0) {
+    return "none";
+  }
+  const effortIndex = THINKING_EFFORT_ORDER.indexOf(effort);
+  return candidates.reduce((best, candidate) => {
+    const bestDistance = Math.abs(THINKING_EFFORT_ORDER.indexOf(best) - effortIndex);
+    const candidateDistance = Math.abs(
+      THINKING_EFFORT_ORDER.indexOf(candidate) - effortIndex,
+    );
+    return candidateDistance < bestDistance ? candidate : best;
+  }, candidates[0]);
+}
+
 export function StartSettingsSkeleton() {
   return (
     <div className="grid gap-3 rounded-[6px] border bg-card p-3">
@@ -364,32 +409,41 @@ export function StartSettingsPanel({
     () => models.find((model) => model.id === modelId) ?? null,
     [modelId, models],
   );
-  const reasoningAvailable = Boolean(selectedModel?.capabilityReasoning);
+  const supportedThinkingEfforts = useMemo(
+    () => supportedThinkingEffortsForModel(selectedModel),
+    [selectedModel],
+  );
+  const thinkingEffortOptions = useMemo(
+    () =>
+      THINKING_EFFORT_OPTIONS.filter((option) =>
+        supportedThinkingEfforts.includes(option.value)
+      ),
+    [supportedThinkingEfforts],
+  );
+  const selectedThinkingEffort = normalizeThinkingEffort(
+    config.thinkingEffort,
+    supportedThinkingEfforts,
+  );
+  const reasoningAvailable = supportedThinkingEfforts.some((value) => value !== "none");
   const webSearchAvailable = Boolean(selectedModel?.capabilityWeb);
-  const toolsAvailable = Boolean(selectedModel?.capabilityTools);
 
   useEffect(() => {
-    if (!reasoningAvailable && config.thinkingEffort !== "none") {
-      onConfigChange((current) => ({ ...current, thinkingEffort: "none" }));
+    const normalized = normalizeThinkingEffort(config.thinkingEffort, supportedThinkingEfforts);
+    if (normalized !== config.thinkingEffort) {
+      onConfigChange((current) => ({ ...current, thinkingEffort: normalized }));
     }
-  }, [config.thinkingEffort, onConfigChange, reasoningAvailable]);
+  }, [config.thinkingEffort, onConfigChange, supportedThinkingEfforts]);
 
   useEffect(() => {
-    if (
-      (!webSearchAvailable && config.useWebSearch)
-      || (!toolsAvailable && config.useTools)
-    ) {
+    if (!webSearchAvailable && config.useWebSearch) {
       onConfigChange((current) => ({
         ...current,
         useWebSearch: webSearchAvailable ? current.useWebSearch : false,
-        useTools: toolsAvailable ? current.useTools : false,
       }));
     }
   }, [
-    config.useTools,
     config.useWebSearch,
     onConfigChange,
-    toolsAvailable,
     webSearchAvailable,
   ]);
 
@@ -552,7 +606,7 @@ export function StartSettingsPanel({
 
               <FieldBlock label="思考强度">
                 <Select
-                  value={reasoningAvailable ? config.thinkingEffort : "none"}
+                  value={selectedThinkingEffort}
                   onValueChange={(value) =>
                     onConfigChange((current) => ({
                       ...current,
@@ -565,10 +619,7 @@ export function StartSettingsPanel({
                     <SelectValue placeholder="选择思考强度" />
                   </SelectTrigger>
                   <SelectContent>
-                    {(reasoningAvailable
-                      ? THINKING_EFFORT_OPTIONS
-                      : THINKING_EFFORT_OPTIONS.slice(0, 1)
-                    ).map((option) => (
+                    {thinkingEffortOptions.map((option) => (
                       <SelectItem key={option.value} value={option.value}>
                         {option.label}
                       </SelectItem>
@@ -593,16 +644,16 @@ export function StartSettingsPanel({
                 </div>
               </FieldBlock>
 
-              <FieldBlock label="工具调用">
+              <FieldBlock label="自定义参数">
                 <div className="flex h-8 items-center">
                   <Switch
                     size="sm"
-                    checked={toolsAvailable ? config.useTools : false}
-                    disabled={loading || !toolsAvailable}
+                    checked={config.useCustomParameters}
+                    disabled={loading}
                     onCheckedChange={(checked) =>
                       onConfigChange((current) => ({
                         ...current,
-                        useTools: checked,
+                        useCustomParameters: checked,
                       }))
                     }
                   />

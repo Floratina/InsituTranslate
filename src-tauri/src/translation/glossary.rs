@@ -6,13 +6,13 @@ use std::time::Duration;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
 
 use crate::adapters::RuntimeAdapter;
 use crate::db as app_db;
-use crate::domain::{ProviderPurpose, UnifiedChatRequest, UnifiedToolChoice};
+use crate::domain::{ProviderPurpose, UnifiedChatRequest};
 use crate::glossaries::{self, CreateAutoGlossaryInput, GlossaryView, PrepareAutoGlossaryInput};
 use crate::glossary_prompt::{
     build_glossary_prompt, sanitize_and_flatten_glossary, GlossaryEntry, GlossaryPromptBuildResult,
@@ -25,7 +25,7 @@ use super::db::{
     connect_inp, content_format_from_source_path, document_format_from_source_path, finalize_task,
     get_task_from_index, get_translation_config, glossary_source_chunks, metadata_task,
     progress_detail_for_config, refresh_task_stats, set_progress_detail_and_emit,
-    set_task_glossary_id, task_glossary_config,
+    set_task_glossary_id, task_glossary_config, task_use_custom_parameters,
 };
 use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter};
 use super::types::ChunkRecord;
@@ -222,6 +222,7 @@ pub async fn prepare_auto_glossary_for_task(
     let chunks = glossary_source_chunks(&inp_pool).await?;
     let config = get_translation_config(config_pool).await?;
     let interrupt = TranslationInterrupt::new();
+    let use_custom_parameters = task_use_custom_parameters(&inp_pool).await?;
     let result = generate_auto_glossary(
         app,
         provider_pool,
@@ -234,6 +235,7 @@ pub async fn prepare_auto_glossary_for_task(
         &task,
         &chunks,
         &config,
+        use_custom_parameters,
         &interrupt,
     )
     .await?;
@@ -303,6 +305,7 @@ pub(super) async fn prepare_task_glossary(
                     task,
                     pending_chunks,
                     config,
+                    task_use_custom_parameters(inp_pool).await?,
                     interrupt,
                 )
                 .await?
@@ -351,9 +354,11 @@ async fn generate_auto_glossary(
     task: &TranslationTaskView,
     pending_chunks: &[ChunkRecord],
     config: &TranslationConfigView,
+    use_custom_parameters: bool,
     interrupt: &TranslationInterrupt,
 ) -> Result<AutoGlossaryGeneration, String> {
-    let glossary_runtime = select_glossary_runtime(provider_pool, client).await?;
+    let glossary_runtime =
+        select_glossary_runtime(provider_pool, client, use_custom_parameters).await?;
     let chunks = pending_chunks
         .iter()
         .filter(|chunk| !chunk.source_text.trim().is_empty())
@@ -522,6 +527,7 @@ async fn generate_auto_glossary(
 async fn select_glossary_runtime(
     provider_pool: &SqlitePool,
     client: &Client,
+    use_custom_parameters: bool,
 ) -> Result<GlossaryRuntime, String> {
     let provider = app_db::list_providers(provider_pool, Some(ProviderPurpose::Glossary))
         .await?
@@ -542,7 +548,11 @@ async fn select_glossary_runtime(
         adapter: Arc::new(RuntimeAdapter::new(client.clone(), config)),
         model_request_name: model.request_name.clone(),
         assistant_prompt: Some(assistant.system_prompt),
-        assistant_custom_parameters: assistant.custom_parameters,
+        assistant_custom_parameters: if use_custom_parameters {
+            assistant.custom_parameters
+        } else {
+            json!({})
+        },
     })
 }
 
@@ -601,8 +611,6 @@ async fn generate_glossary_for_chunk(
         let request = UnifiedChatRequest {
             model: runtime.model_request_name.clone(),
             messages,
-            tools: Vec::new(),
-            tool_choice: UnifiedToolChoice::None,
             web_search: false,
             thinking: None,
             max_output_tokens: None,

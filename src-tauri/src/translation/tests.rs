@@ -2,6 +2,7 @@ use crate::adapters::{ProviderChatError, RateLimitTelemetry};
 use crate::db as app_db;
 use crate::domain::{
     AddModelInput, CreateProviderInput, ProviderProtocol, ProviderPurpose, ThinkingEffort,
+    UpdateAssistantCustomParametersInput,
 };
 use crate::glossary_prompt::GlossaryEntry;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
@@ -403,7 +404,7 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
             glossary_id: Some("glossary-freeze-id".into()),
             thinking_effort: ThinkingEffort::None,
             use_web_search: false,
-            use_tools: false,
+            use_custom_parameters: false,
             confidence_mode: ConfidenceMode::Off,
             pdf_parsing_mode: PdfParsingMode::LocalFirst,
         },
@@ -456,6 +457,119 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
     assert_eq!(snapshot["glossaryId"], "glossary-freeze-id");
 
     inp_pool.close().await;
+    provider_pool.close().await;
+    config_pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn create_task_injects_custom_parameters_only_when_enabled() {
+    let root = temp_root("custom-parameters-switch");
+    tokio::fs::create_dir_all(&root).await.expect("create root");
+    let provider_db = root.join("providers.sqlite");
+    let provider_pool = app_db::connect(&provider_db).await.expect("provider db");
+    let config_pool = connect_config_db(&root).await.expect("config db");
+    let provider = app_db::create_provider(
+        &provider_pool,
+        CreateProviderInput {
+            name: "Custom Parameter Provider".into(),
+            protocol: ProviderProtocol::OpenaiChat,
+            purpose: ProviderPurpose::Translation,
+            avatar: None,
+        },
+    )
+    .await
+    .expect("provider");
+    let model = app_db::add_model(
+        &provider_pool,
+        AddModelInput {
+            provider_id: provider.id.clone(),
+            request_name: "custom-parameter-model".into(),
+            alias: "Custom Parameter Model".into(),
+            source: "manual".into(),
+        },
+    )
+    .await
+    .expect("model");
+    let assistant = app_db::list_assistants(&provider_pool, ProviderPurpose::Translation)
+        .await
+        .expect("assistants")
+        .into_iter()
+        .next()
+        .expect("default assistant");
+    let assistant = app_db::update_assistant_custom_parameters(
+        &provider_pool,
+        UpdateAssistantCustomParametersInput {
+            id: assistant.id,
+            custom_parameters: json!({"service_tier": "flex"}),
+        },
+    )
+    .await
+    .expect("custom parameters");
+    let source_path = root.join("custom-parameters.txt");
+    tokio::fs::write(&source_path, "Apple animation.")
+        .await
+        .expect("write source");
+
+    for (enabled, expected) in [(false, json!({})), (true, json!({"service_tier": "flex"}))] {
+        update_translation_config(
+            &config_pool,
+            UpdateTranslationConfigInput {
+                source_language: "English".into(),
+                custom_source_language: String::new(),
+                target_language: "Simplified Chinese".into(),
+                custom_target_language: String::new(),
+                provider_id: provider.id.clone(),
+                model_id: model.id.clone(),
+                assistant_id: assistant.id.clone(),
+                chunk_token_limit: 800,
+                max_concurrency: 3,
+                max_retries: 2,
+                rate_limit_strategy: RateLimitStrategy::Dynamic,
+                max_requests_per_minute: 120,
+                max_tokens_per_minute: 60_000,
+                context_handling_mode: ContextHandlingMode::Off,
+                use_global_background: false,
+                use_glossary: false,
+                glossary_mode: GlossaryMode::Auto,
+                glossary_id: None,
+                thinking_effort: ThinkingEffort::None,
+                use_web_search: false,
+                use_custom_parameters: enabled,
+                confidence_mode: ConfidenceMode::Off,
+                pdf_parsing_mode: PdfParsingMode::LocalFirst,
+            },
+        )
+        .await
+        .expect("update config");
+        let task = create_translation_task(
+            &provider_pool,
+            &Client::new(),
+            &config_pool,
+            &root,
+            CreateTranslationTaskInput {
+                file_path: source_path.to_string_lossy().to_string(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                tags: Vec::new(),
+                provider_id: provider.id.clone(),
+                model_id: model.id.clone(),
+                assistant_id: Some(assistant.id.clone()),
+            },
+        )
+        .await
+        .expect("create task");
+        let inp_pool = connect_inp(Path::new(&task.inp_path)).await.expect("inp");
+        let stored_json: String =
+            sqlx::query_scalar("SELECT assistant_custom_parameters_json FROM metadata LIMIT 1")
+                .fetch_one(&inp_pool)
+                .await
+                .expect("stored custom parameters");
+        inp_pool.close().await;
+        let stored: Value = serde_json::from_str(&stored_json).expect("stored json");
+        assert_eq!(stored, expected);
+    }
+
     provider_pool.close().await;
     config_pool.close().await;
     let _ = std::fs::remove_dir_all(root);
@@ -1341,7 +1455,7 @@ async fn migrates_legacy_defaults_only_once() {
             glossary_id: None,
             thinking_effort: ThinkingEffort::None,
             use_web_search: false,
-            use_tools: false,
+            use_custom_parameters: false,
             confidence_mode: ConfidenceMode::ConfidenceIndex,
             pdf_parsing_mode: PdfParsingMode::MineruFirst,
         },

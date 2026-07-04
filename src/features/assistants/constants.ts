@@ -105,12 +105,6 @@ export const CUSTOM_PARAMETER_PRESETS: CustomParameterPreset[] = [
   },
   {
     group: "OpenAI Chat",
-    label: "并行工具调用",
-    description: "允许模型在一次响应中调用多个工具",
-    value: { parallel_tool_calls: true },
-  },
-  {
-    group: "OpenAI Chat",
     label: "JSON 模式",
     description: JSON_MODE_DESCRIPTION,
     value: { response_format: { type: "json_object" } },
@@ -142,12 +136,6 @@ export const CUSTOM_PARAMETER_PRESETS: CustomParameterPreset[] = [
     label: "存储响应",
     description: "控制是否存储模型响应，预设为关闭",
     value: { store: false },
-  },
-  {
-    group: "OpenAI Responses",
-    label: "并行工具调用",
-    description: "允许模型在一次响应中调用多个工具",
-    value: { parallel_tool_calls: true },
   },
   {
     group: "OpenAI Responses",

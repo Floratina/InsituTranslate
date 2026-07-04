@@ -6,15 +6,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::domain::{
-    AddModelInput, AssistantIconKind, AssistantToolMode, AssistantView, CopyAssistantInput,
-    CopyProviderInput, CreateAssistantInput, CreateProviderInput,
-    ImportVertexAiServiceAccountInput, ModelView, ProviderProtocol, ProviderPurpose,
-    ProviderRuntimeConfig, ProviderView, ReorderAssistantsInput, ReorderProvidersInput,
-    SetProviderEnabledInput, UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput,
-    UpdateAssistantSettingsInput, UpdateModelInput, UpdateProviderConfigInput,
-    UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
+    AddModelInput, AssistantIconKind, AssistantView, CopyAssistantInput, CopyProviderInput,
+    CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput, ModelView,
+    ProviderProtocol, ProviderPurpose, ProviderRuntimeConfig, ProviderView, ReorderAssistantsInput,
+    ReorderProvidersInput, SetProviderEnabledInput, UpdateAssistantCustomParametersInput,
+    UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
+    UpdateProviderConfigInput, UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
 };
-use crate::features::infer_model_capabilities;
+use crate::features::{infer_model_capabilities, supported_thinking_efforts};
 use crate::secrets;
 use crate::vertex_ai;
 
@@ -778,7 +777,7 @@ async fn backfill_model_capabilities(pool: &SqlitePool) -> Result<(), String> {
 
     let rows = sqlx::query(
         "SELECT m.id, m.request_name, m.capability_reasoning, m.capability_web,
-                m.capability_tools, p.protocol, p.base_url
+                p.protocol, p.base_url
          FROM models m
          JOIN providers p ON p.id = m.provider_id",
     )
@@ -797,16 +796,14 @@ async fn backfill_model_capabilities(pool: &SqlitePool) -> Result<(), String> {
         let capability_reasoning =
             row.get::<i64, _>("capability_reasoning") != 0 || inferred.reasoning;
         let capability_web = row.get::<i64, _>("capability_web") != 0 || inferred.web;
-        let capability_tools = row.get::<i64, _>("capability_tools") != 0 || inferred.tools;
         sqlx::query(
             "UPDATE models
-             SET capability_reasoning = ?, capability_web = ?, capability_tools = ?,
+             SET capability_reasoning = ?, capability_web = ?,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?",
         )
         .bind(capability_reasoning)
         .bind(capability_web)
-        .bind(capability_tools)
         .bind(row.get::<String, _>("id"))
         .execute(&mut *transaction)
         .await
@@ -887,8 +884,6 @@ fn assistant_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AssistantView, St
         temperature: row.get("temperature"),
         top_p_enabled: row.get::<i64, _>("top_p_enabled") != 0,
         top_p: row.get("top_p"),
-        tool_mode: AssistantToolMode::parse(row.get::<String, _>("tool_mode").as_str())?,
-        max_tool_calls: row.get("max_tool_calls"),
         custom_parameters: serde_json::from_str(&custom_parameters_json)
             .unwrap_or_else(|_| json!({})),
     })
@@ -933,9 +928,6 @@ fn validate_assistant_settings(input: &UpdateAssistantSettingsInput) -> Result<(
     if !input.top_p.is_finite() || !(0.0..=1.0).contains(&input.top_p) {
         return Err("Assistant Top-P must be between 0 and 1".into());
     }
-    if input.max_tool_calls < 0 {
-        return Err("Assistant maximum tool calls must be non-negative".into());
-    }
     Ok(())
 }
 
@@ -945,7 +937,7 @@ pub async fn update_assistant_settings(
 ) -> Result<AssistantView, String> {
     validate_assistant_settings(&input)?;
     sqlx::query(
-        "UPDATE assistants SET name = ?, icon_kind = ?, icon_value = ?, temperature_enabled = ?, temperature = ?, top_p_enabled = ?, top_p = ?, tool_mode = ?, max_tool_calls = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE assistants SET name = ?, icon_kind = ?, icon_value = ?, temperature_enabled = ?, temperature = ?, top_p_enabled = ?, top_p = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
     .bind(input.name.trim())
     .bind(input.icon_kind.as_str())
@@ -954,8 +946,6 @@ pub async fn update_assistant_settings(
     .bind(input.temperature)
     .bind(input.top_p_enabled)
     .bind(input.top_p)
-    .bind(input.tool_mode.as_str())
-    .bind(input.max_tool_calls)
     .bind(&input.id)
     .execute(pool)
     .await
@@ -1054,7 +1044,7 @@ pub async fn copy_assistant(
         .await
         .map_err(|error| error.to_string())?;
     sqlx::query(
-        "INSERT INTO assistants (id, name, icon_kind, icon_value, purpose, system_prompt, temperature_enabled, temperature, top_p_enabled, top_p, tool_mode, max_tool_calls, custom_parameters_json, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        "INSERT INTO assistants (id, name, icon_kind, icon_value, purpose, system_prompt, temperature_enabled, temperature, top_p_enabled, top_p, custom_parameters_json, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
     )
     .bind(&id)
     .bind(name)
@@ -1066,8 +1056,6 @@ pub async fn copy_assistant(
     .bind(source.get::<f64, _>("temperature"))
     .bind(source.get::<i64, _>("top_p_enabled"))
     .bind(source.get::<f64, _>("top_p"))
-    .bind(source.get::<String, _>("tool_mode"))
-    .bind(source.get::<i64, _>("max_tool_calls"))
     .bind(source.get::<String, _>("custom_parameters_json"))
     .execute(&mut *transaction)
     .await
@@ -1155,20 +1143,25 @@ async fn provider_from_row(
             .fetch_one(pool)
             .await
             .map_err(|error| error.to_string())?;
+    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
+    let base_url: String = row.get("base_url");
     let model_rows =
         sqlx::query("SELECT * FROM models WHERE provider_id = ? ORDER BY sort_order, created_at")
             .bind(&id)
             .fetch_all(pool)
             .await
             .map_err(|error| error.to_string())?;
-    let models = model_rows.iter().map(model_from_row).collect();
+    let models = model_rows
+        .iter()
+        .map(|row| model_from_row(row, protocol, &base_url))
+        .collect();
     let header_keys_json: String = row.get("header_keys_json");
     let config_json: String = row.get("config_json");
     Ok(ProviderView {
         id,
         name: row.get("name"),
-        protocol: ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?,
-        base_url: row.get("base_url"),
+        protocol,
+        base_url,
         use_raw_base_url: row.get::<i64, _>("use_raw_base_url") != 0,
         config: serde_json::from_str(&config_json).unwrap_or_else(|_| json!({})),
         avatar: row.get("avatar"),
@@ -1181,16 +1174,24 @@ async fn provider_from_row(
     })
 }
 
-fn model_from_row(row: &sqlx::sqlite::SqliteRow) -> ModelView {
+fn model_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    protocol: ProviderProtocol,
+    base_url: &str,
+) -> ModelView {
+    let request_name: String = row.get("request_name");
+    let capability_reasoning = row.get::<i64, _>("capability_reasoning") != 0;
+    let supported_thinking_efforts =
+        supported_thinking_efforts(protocol, base_url, &request_name, capability_reasoning);
     ModelView {
         id: row.get("id"),
         provider_id: row.get("provider_id"),
-        request_name: row.get("request_name"),
+        request_name,
         alias: row.get("alias"),
         source: row.get("source"),
-        capability_reasoning: row.get::<i64, _>("capability_reasoning") != 0,
+        capability_reasoning,
+        supported_thinking_efforts,
         capability_web: row.get::<i64, _>("capability_web") != 0,
-        capability_tools: row.get::<i64, _>("capability_tools") != 0,
         test_status: row.get("test_status"),
         latency_ms: row.get("latency_ms"),
         tested_at: row.get("tested_at"),
@@ -1811,18 +1812,15 @@ pub async fn add_model(pool: &SqlitePool, input: AddModelInput) -> Result<ModelV
         .await
         .map_err(|error| error.to_string())?;
     let protocol = ProviderProtocol::parse(provider.get::<String, _>("protocol").as_str())?;
+    let base_url: String = provider.get("base_url");
     let request_name = input.request_name.trim();
     let alias = if input.alias.trim().is_empty() {
         request_name
     } else {
         input.alias.trim()
     };
-    let inferred = infer_model_capabilities(
-        protocol,
-        provider.get::<String, _>("base_url").as_str(),
-        request_name,
-    );
-    sqlx::query("INSERT INTO models (id, provider_id, request_name, alias, source, capability_reasoning, capability_web, capability_tools, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM models WHERE provider_id = ?), 0)) ON CONFLICT(provider_id, request_name) DO UPDATE SET alias = excluded.alias")
+    let inferred = infer_model_capabilities(protocol, base_url.as_str(), request_name);
+    sqlx::query("INSERT INTO models (id, provider_id, request_name, alias, source, capability_reasoning, capability_web, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM models WHERE provider_id = ?), 0)) ON CONFLICT(provider_id, request_name) DO UPDATE SET alias = excluded.alias")
         .bind(&id)
         .bind(&input.provider_id)
         .bind(request_name)
@@ -1830,7 +1828,6 @@ pub async fn add_model(pool: &SqlitePool, input: AddModelInput) -> Result<ModelV
         .bind(input.source)
         .bind(inferred.reasoning)
         .bind(inferred.web)
-        .bind(inferred.tools)
         .bind(&input.provider_id)
         .execute(pool)
         .await
@@ -1841,15 +1838,14 @@ pub async fn add_model(pool: &SqlitePool, input: AddModelInput) -> Result<ModelV
         .fetch_one(pool)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(model_from_row(&row))
+    Ok(model_from_row(&row, protocol, &base_url))
 }
 
 pub async fn update_model(pool: &SqlitePool, input: UpdateModelInput) -> Result<ModelView, String> {
-    sqlx::query("UPDATE models SET alias = ?, capability_reasoning = ?, capability_web = ?, capability_tools = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query("UPDATE models SET alias = ?, capability_reasoning = ?, capability_web = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(input.alias.trim())
         .bind(input.capability_reasoning)
         .bind(input.capability_web)
-        .bind(input.capability_tools)
         .bind(&input.id)
         .execute(pool)
         .await
@@ -1858,13 +1854,20 @@ pub async fn update_model(pool: &SqlitePool, input: UpdateModelInput) -> Result<
 }
 
 pub async fn get_model(pool: &SqlitePool, id: &str) -> Result<ModelView, String> {
-    let row = sqlx::query("SELECT * FROM models WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Model not found".to_string())?;
-    Ok(model_from_row(&row))
+    let row = sqlx::query(
+        "SELECT m.*, p.protocol, p.base_url
+         FROM models m
+         JOIN providers p ON p.id = m.provider_id
+         WHERE m.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "Model not found".to_string())?;
+    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
+    let base_url: String = row.get("base_url");
+    Ok(model_from_row(&row, protocol, &base_url))
 }
 
 pub async fn delete_model(pool: &SqlitePool, id: &str) -> Result<(), String> {
@@ -1940,7 +1943,7 @@ pub async fn update_test_result(
 mod tests {
     use super::*;
     use crate::domain::{
-        AddModelInput, AssistantIconKind, AssistantToolMode, CopyAssistantInput, CopyProviderInput,
+        AddModelInput, AssistantIconKind, CopyAssistantInput, CopyProviderInput,
         CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput,
         ProviderProtocol, ProviderPurpose, ReorderAssistantsInput, ReorderProvidersInput,
         UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput,
@@ -1982,7 +1985,6 @@ mod tests {
                 alias: "Renamed".into(),
                 capability_reasoning: true,
                 capability_web: false,
-                capability_tools: true,
             },
         )
         .await
@@ -2032,7 +2034,6 @@ mod tests {
 
         assert!(model.capability_reasoning);
         assert!(model.capability_web);
-        assert!(model.capability_tools);
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
@@ -2074,7 +2075,6 @@ mod tests {
         let backfilled = get_model(&pool, &model_id).await.expect("backfilled model");
         assert!(backfilled.capability_reasoning);
         assert!(backfilled.capability_web);
-        assert!(backfilled.capability_tools);
 
         update_model(
             &pool,
@@ -2083,7 +2083,6 @@ mod tests {
                 alias: "GPT-5".into(),
                 capability_reasoning: true,
                 capability_web: false,
-                capability_tools: true,
             },
         )
         .await
@@ -2666,8 +2665,6 @@ mod tests {
             assert_eq!(assistants[0].temperature, 1.0);
             assert!(!assistants[0].top_p_enabled);
             assert_eq!(assistants[0].top_p, 1.0);
-            assert_eq!(assistants[0].tool_mode, AssistantToolMode::Function);
-            assert_eq!(assistants[0].max_tool_calls, 5);
             assert_eq!(assistants[0].custom_parameters, json!({}));
         }
         let translation = list_assistants(&pool, ProviderPurpose::Translation)
@@ -2711,13 +2708,11 @@ mod tests {
                 temperature: 0.7,
                 top_p_enabled: true,
                 top_p: 0.9,
-                tool_mode: AssistantToolMode::Prompt,
-                max_tool_calls: 0,
             },
         )
         .await
         .expect("update settings");
-        assert_eq!(updated.max_tool_calls, 0);
+        assert_eq!(updated.name, "Translator");
         update_assistant_prompt(
             &pool,
             UpdateAssistantPromptInput {
@@ -2756,7 +2751,6 @@ mod tests {
         assert_eq!(copied.name, "Translator-01");
         assert_eq!(copied.purpose, ProviderPurpose::Glossary);
         assert_eq!(copied.system_prompt, "Translate precisely.");
-        assert_eq!(copied.tool_mode, AssistantToolMode::Prompt);
         assert_eq!(copied.custom_parameters, json!({"service_tier": "flex"}));
 
         let translation = list_assistants(&pool, ProviderPurpose::Translation)
@@ -2795,25 +2789,6 @@ mod tests {
                 temperature: 2.1,
                 top_p_enabled: true,
                 top_p: 1.1,
-                tool_mode: AssistantToolMode::Function,
-                max_tool_calls: 5,
-            },
-        )
-        .await
-        .is_err());
-        assert!(update_assistant_settings(
-            &pool,
-            UpdateAssistantSettingsInput {
-                id: created.id.clone(),
-                name: "Valid".into(),
-                icon_kind: AssistantIconKind::Emoji,
-                icon_value: "🤖".into(),
-                temperature_enabled: false,
-                temperature: 1.0,
-                top_p_enabled: false,
-                top_p: 1.0,
-                tool_mode: AssistantToolMode::Function,
-                max_tool_calls: -1,
             },
         )
         .await

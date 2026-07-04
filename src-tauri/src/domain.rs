@@ -91,30 +91,6 @@ impl AssistantIconKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum AssistantToolMode {
-    Function,
-    Prompt,
-}
-
-impl AssistantToolMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Function => "function",
-            Self::Prompt => "prompt",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "function" => Ok(Self::Function),
-            "prompt" => Ok(Self::Prompt),
-            _ => Err(format!("Unsupported assistant tool mode: {value}")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantView {
@@ -128,8 +104,6 @@ pub struct AssistantView {
     pub temperature: f64,
     pub top_p_enabled: bool,
     pub top_p: f64,
-    pub tool_mode: AssistantToolMode,
-    pub max_tool_calls: i64,
     pub custom_parameters: Value,
 }
 
@@ -150,8 +124,6 @@ pub struct UpdateAssistantSettingsInput {
     pub temperature: f64,
     pub top_p_enabled: bool,
     pub top_p: f64,
-    pub tool_mode: AssistantToolMode,
-    pub max_tool_calls: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,8 +181,8 @@ pub struct ModelView {
     pub alias: String,
     pub source: String,
     pub capability_reasoning: bool,
+    pub supported_thinking_efforts: Vec<ThinkingEffort>,
     pub capability_web: bool,
-    pub capability_tools: bool,
     pub test_status: String,
     pub latency_ms: Option<i64>,
     pub tested_at: Option<String>,
@@ -302,7 +274,6 @@ pub struct UpdateModelInput {
     pub alias: String,
     pub capability_reasoning: bool,
     pub capability_web: bool,
-    pub capability_tools: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,16 +355,6 @@ pub enum UnifiedContent {
         signature: Option<String>,
         encrypted_data: Option<String>,
     },
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: Value,
-    },
-    ToolResult {
-        call_id: String,
-        content: String,
-        is_error: bool,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,27 +366,9 @@ pub struct UnifiedMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UnifiedTool {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum UnifiedToolChoice {
-    Auto,
-    Required,
-    None,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UnifiedChatRequest {
     pub model: String,
     pub messages: Vec<UnifiedMessage>,
-    pub tools: Vec<UnifiedTool>,
-    pub tool_choice: UnifiedToolChoice,
     #[serde(default)]
     pub web_search: bool,
     pub thinking: Option<ThinkingConfig>,
@@ -465,7 +408,6 @@ pub struct UnifiedChatResponse {
     pub text: String,
     pub reasoning: String,
     pub thinking: Vec<UnifiedContent>,
-    pub tool_calls: Vec<UnifiedContent>,
     pub usage: Option<UnifiedUsage>,
     pub logprob_stats: Option<LogprobStats>,
     pub raw: Value,

@@ -6,7 +6,6 @@ import {
   LoaderCircle,
   Plus,
   Settings,
-  Wrench,
   type LucideIcon,
 } from "lucide-react";
 
@@ -128,7 +127,6 @@ export function ProviderModelList({
                     <div className="flex flex-wrap gap-1">
                       <CapabilityPill icon={Brain} label="推理" active={model.capabilityReasoning} />
                       <CapabilityPill icon={Globe2} label="联网" active={model.capabilityWeb} />
-                      <CapabilityPill icon={Wrench} label="工具调用" active={model.capabilityTools} />
                     </div>
                   )}
                 </TableCell>

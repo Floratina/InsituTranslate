@@ -64,11 +64,27 @@ pub struct ProviderChatError {
     pub status: Option<u16>,
     pub message: String,
     pub rate_limits: RateLimitTelemetry,
+    pub kind: ProviderChatErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderChatErrorKind {
+    HttpStatus,
+    Transport,
+    LocalRequest,
+    InvalidResponse,
 }
 
 impl ProviderChatError {
     pub fn is_rate_limited(&self) -> bool {
         self.status == Some(429)
+    }
+
+    pub fn is_transient(&self) -> bool {
+        if let Some(status) = self.status {
+            return matches!(status, 408 | 429 | 499) || status >= 500;
+        }
+        matches!(self.kind, ProviderChatErrorKind::Transport)
     }
 }
 
@@ -187,6 +203,7 @@ impl RuntimeAdapter {
                 status: None,
                 message: error,
                 rate_limits: RateLimitTelemetry::default(),
+                kind: ProviderChatErrorKind::LocalRequest,
             })?);
         if let Some(value) = body {
             request = request.json(&value);
@@ -195,26 +212,31 @@ impl RuntimeAdapter {
             status: None,
             message: error.to_string(),
             rate_limits: RateLimitTelemetry::default(),
+            kind: ProviderChatErrorKind::Transport,
         })?;
         let status = response.status();
         let headers = response.headers().clone();
-        let rate_limits = rate_limits_from_headers(&headers);
+        let mut rate_limits = rate_limits_from_headers(&headers);
         let text = response.text().await.map_err(|error| ProviderChatError {
             status: Some(status.as_u16()),
             message: error.to_string(),
             rate_limits: rate_limits.clone(),
+            kind: ProviderChatErrorKind::Transport,
         })?;
         if !status.is_success() {
+            merge_retry_after_from_error_body(&mut rate_limits, &text);
             return Err(ProviderChatError {
                 status: Some(status.as_u16()),
                 message: format!("HTTP {}: {}", status.as_u16(), truncate(&text, 500)),
                 rate_limits,
+                kind: ProviderChatErrorKind::HttpStatus,
             });
         }
         let raw = serde_json::from_str(&text).map_err(|error| ProviderChatError {
             status: Some(status.as_u16()),
             message: format!("Invalid JSON response: {error}"),
             rate_limits: rate_limits.clone(),
+            kind: ProviderChatErrorKind::InvalidResponse,
         })?;
         Ok(JsonResponseMeta {
             raw,
@@ -473,6 +495,7 @@ impl RuntimeAdapter {
                 status: None,
                 message: error,
                 rate_limits: RateLimitTelemetry::default(),
+                kind: ProviderChatErrorKind::LocalRequest,
             })?;
         let meta = self
             .request_json_with_meta(Method::POST, url, Some(body))
@@ -483,6 +506,7 @@ impl RuntimeAdapter {
                 status: Some(meta.status),
                 message: error,
                 rate_limits: meta.rate_limits.clone(),
+                kind: ProviderChatErrorKind::InvalidResponse,
             }
         })?;
         Ok(ProviderChatMeta {
@@ -559,6 +583,54 @@ fn rate_limits_from_headers(headers: &HeaderMap) -> RateLimitTelemetry {
         token_reset_ms,
         retry_after_ms,
         source,
+    }
+}
+
+fn merge_retry_after_from_error_body(rate_limits: &mut RateLimitTelemetry, text: &str) {
+    if let Some(delay) = retry_after_ms_from_error_body(text) {
+        rate_limits.retry_after_ms = Some(
+            rate_limits
+                .retry_after_ms
+                .map_or(delay, |value| value.max(delay)),
+        );
+        if rate_limits.source.is_none() {
+            rate_limits.source = Some("google-rpc".to_string());
+        }
+    }
+}
+
+fn retry_after_ms_from_error_body(text: &str) -> Option<u64> {
+    let raw = serde_json::from_str::<Value>(text).ok()?;
+    let details = raw
+        .pointer("/error/details")
+        .and_then(Value::as_array)
+        .or_else(|| raw.pointer("/details").and_then(Value::as_array))?;
+    details.iter().find_map(|detail| {
+        let type_name = detail
+            .get("@type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !type_name.ends_with("google.rpc.RetryInfo") {
+            return None;
+        }
+        detail.get("retryDelay").and_then(parse_retry_delay_ms)
+    })
+}
+
+fn parse_retry_delay_ms(value: &Value) -> Option<u64> {
+    if let Some(text) = value.as_str() {
+        return parse_duration_ms(text);
+    }
+    let seconds = value.get("seconds").and_then(Value::as_u64).unwrap_or(0);
+    let nanos = value.get("nanos").and_then(Value::as_u64).unwrap_or(0);
+    if seconds == 0 && nanos == 0 {
+        None
+    } else {
+        Some(
+            seconds
+                .saturating_mul(1000)
+                .saturating_add(nanos / 1_000_000),
+        )
     }
 }
 
@@ -2080,6 +2152,15 @@ mod tests {
     const SYSTEM_TEXT: &str = "Always translate formally.";
     const USER_TEXT: &str = "Hello.";
 
+    fn chat_error(status: Option<u16>, kind: ProviderChatErrorKind) -> ProviderChatError {
+        ProviderChatError {
+            status,
+            message: "test error".into(),
+            rate_limits: RateLimitTelemetry::default(),
+            kind,
+        }
+    }
+
     fn request() -> UnifiedChatRequest {
         UnifiedChatRequest {
             model: "deepseek-v4".into(),
@@ -2928,6 +3009,54 @@ mod tests {
         assert_eq!(telemetry.token_limit, Some(9000));
         assert_eq!(telemetry.token_remaining, Some(800));
         assert_eq!(telemetry.source.as_deref(), Some("openai-compatible"));
+    }
+
+    #[test]
+    fn classifies_transient_provider_chat_errors() {
+        for status in [408, 429, 499, 500, 502, 503, 504] {
+            assert!(
+                chat_error(Some(status), ProviderChatErrorKind::HttpStatus).is_transient(),
+                "HTTP {status} should be transient"
+            );
+        }
+        for status in [400, 401, 403, 404, 422] {
+            assert!(
+                !chat_error(Some(status), ProviderChatErrorKind::HttpStatus).is_transient(),
+                "HTTP {status} should be permanent"
+            );
+        }
+        assert!(chat_error(None, ProviderChatErrorKind::Transport).is_transient());
+        assert!(chat_error(Some(503), ProviderChatErrorKind::Transport).is_transient());
+        assert!(!chat_error(Some(401), ProviderChatErrorKind::Transport).is_transient());
+        assert!(!chat_error(None, ProviderChatErrorKind::LocalRequest).is_transient());
+        assert!(!chat_error(Some(200), ProviderChatErrorKind::InvalidResponse).is_transient());
+    }
+
+    #[test]
+    fn parses_google_rpc_retry_delay_from_error_body() {
+        let body = json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "2.25s"
+                }]
+            }
+        })
+        .to_string();
+        assert_eq!(retry_after_ms_from_error_body(&body), Some(2250));
+
+        let object_body = json!({
+            "error": {
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": {"seconds": 1, "nanos": 500000000}
+                }]
+            }
+        })
+        .to_string();
+        assert_eq!(retry_after_ms_from_error_body(&object_body), Some(1500));
     }
 
     #[test]

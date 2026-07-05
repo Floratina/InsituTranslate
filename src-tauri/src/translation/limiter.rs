@@ -222,13 +222,13 @@ impl AdaptiveLimiter {
             return;
         }
         let mut state = self.state.lock().await;
-        if has_headers {
-            state.header_mode = true;
-            state.window = self.max;
-            state.success_streak = 0;
-        } else if rate_limited {
+        if rate_limited {
             state.header_mode = false;
             state.window = (state.window / 2).max(1);
+            state.success_streak = 0;
+        } else if has_headers {
+            state.header_mode = true;
+            state.window = self.max;
             state.success_streak = 0;
         } else if success && !state.header_mode {
             state.success_streak += 1;

@@ -2640,6 +2640,7 @@ dependencies = [
  "calamine",
  "comrak",
  "docx-rs",
+ "fastrand",
  "fontdb",
  "futures-util",
  "jsonwebtoken",

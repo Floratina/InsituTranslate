@@ -18,6 +18,7 @@ calamine = "0.35.0"
 comrak = { version = "0.28", default-features = false }
 docx-rs = { version = "0.4.20", default-features = false }
 futures-util = "0.3"
+fastrand = "2.4.1"
 fontdb = "0.23"
 jsonwebtoken = "9"
 lib-epub = { version = "0.3.1", features = ["builder", "content-builder"] }

@@ -28,6 +28,9 @@ use super::db::{
     set_task_glossary_id, task_glossary_config, task_use_custom_parameters,
 };
 use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter};
+use super::scheduler::{
+    retry_base_delay_ms, retry_delay_with_jitter_ms, transient_retry_base_delay_ms,
+};
 use super::types::ChunkRecord;
 use super::{
     GlossaryMode, ProgressStep, RateLimitStrategy, TranslationConfigView, TranslationInterrupt,
@@ -649,16 +652,25 @@ async fn generate_glossary_for_chunk(
                         error.is_rate_limited(),
                     )
                     .await;
-                if error.is_rate_limited() {
+                let is_transient = error.is_transient();
+                if !is_transient {
                     return AutoGlossaryChunkOutcome::Interrupted {
                         error: error.to_string(),
                     };
                 }
                 last_error = Some(error.to_string());
+                if attempt < max_retries {
+                    let base_delay = transient_retry_base_delay_ms(&error, attempt);
+                    let sleep_ms = retry_delay_with_jitter_ms(base_delay);
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    continue;
+                }
             }
         }
         if attempt < max_retries {
-            tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
+            let base_delay = retry_base_delay_ms(attempt);
+            let sleep_ms = retry_delay_with_jitter_ms(base_delay);
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
     AutoGlossaryChunkOutcome::Failed {

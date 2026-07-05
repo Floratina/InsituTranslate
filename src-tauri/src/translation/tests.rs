@@ -1,8 +1,10 @@
-use crate::adapters::{ProviderChatError, RateLimitTelemetry};
+use crate::adapters::{
+    ProviderChatError, ProviderChatErrorKind, RateLimitTelemetry, RuntimeAdapter,
+};
 use crate::db as app_db;
 use crate::domain::{
-    AddModelInput, CreateProviderInput, ProviderProtocol, ProviderPurpose, ThinkingEffort,
-    UpdateAssistantCustomParametersInput,
+    AddModelInput, CreateProviderInput, ProviderProtocol, ProviderPurpose, ProviderRuntimeConfig,
+    ThinkingEffort, UpdateAssistantCustomParametersInput,
 };
 use crate::glossary_prompt::GlossaryEntry;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
@@ -23,8 +25,13 @@ use super::db::{
     task_glossary_config, translated_source_text, validate_inp_file,
 };
 use super::glossary::TaskGlossaryMatcher;
-use super::scheduler::logprobs_parameter_rejected;
-use super::types::ChunkOutcome;
+use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy};
+use super::request_options::TranslationRequestOptions;
+use super::scheduler::{
+    logprobs_parameter_rejected, retry_base_delay_ms, retry_delay_with_jitter_ms,
+    transient_retry_base_delay_ms, translate_chunk,
+};
+use super::types::{ChunkOutcome, ChunkRecord};
 
 #[derive(Debug, Clone)]
 #[cfg(test)]
@@ -98,7 +105,9 @@ fn push_raw_chunk(task_id: &str, chunks: &mut Vec<RawChunk>, source_text: String
 use super::*;
 use crate::document_parsing::types::{BlockRef, PlaceholderMap};
 use std::io::{Cursor, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 fn temp_root(label: &str) -> PathBuf {
@@ -945,8 +954,257 @@ fn detects_logprobs_parameter_rejection() {
         status: Some(400),
         message: "Unrecognized request argument supplied: logprobs".into(),
         rate_limits: RateLimitTelemetry::default(),
+        kind: ProviderChatErrorKind::HttpStatus,
     };
     assert!(logprobs_parameter_rejected(&error));
+}
+
+#[test]
+fn retry_backoff_uses_compound_growth_cap_and_jitter() {
+    assert_eq!(retry_base_delay_ms(0), 1500);
+    assert_eq!(retry_base_delay_ms(1), 2250);
+    assert_eq!(retry_base_delay_ms(2), 3375);
+
+    let error = ProviderChatError {
+        status: Some(503),
+        message: "HTTP 503: overloaded".into(),
+        rate_limits: RateLimitTelemetry::default(),
+        kind: ProviderChatErrorKind::HttpStatus,
+    };
+    assert_eq!(transient_retry_base_delay_ms(&error, 8), 12_000);
+
+    let retry_after = ProviderChatError {
+        status: Some(429),
+        message: "HTTP 429: rate limit".into(),
+        rate_limits: RateLimitTelemetry {
+            retry_after_ms: Some(2_250),
+            ..RateLimitTelemetry::default()
+        },
+        kind: ProviderChatErrorKind::HttpStatus,
+    };
+    assert_eq!(transient_retry_base_delay_ms(&retry_after, 0), 2_250);
+
+    for _ in 0..128 {
+        let jittered = retry_delay_with_jitter_ms(2_250);
+        assert!((1_750..=2_750).contains(&jittered));
+        assert!(retry_delay_with_jitter_ms(12_000) <= 12_000);
+    }
+}
+
+#[tokio::test]
+async fn translate_chunk_retries_transient_429_without_interrupting_task() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let address = listener.local_addr().expect("mock address");
+    let server = std::thread::spawn(move || {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = if index == 0 {
+                r#"{"error":{"message":"rate limited","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1ms"}]}}"#.to_string()
+            } else {
+                r#"{"choices":[{"message":{"content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#.to_string()
+            };
+            let status = if index == 0 {
+                "HTTP/1.1 429 Too Many Requests"
+            } else {
+                "HTTP/1.1 200 OK"
+            };
+            write!(
+                stream,
+                "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write mock response");
+        }
+    });
+    let adapter = Arc::new(RuntimeAdapter::new(
+        Client::new(),
+        ProviderRuntimeConfig {
+            protocol: ProviderProtocol::OpenaiChat,
+            base_url: format!("http://{address}/v1"),
+            use_raw_base_url: true,
+            config: json!({}),
+            auth_type: "bearer".into(),
+            auth_header: "Authorization".into(),
+            credential: None,
+            custom_headers: Vec::new(),
+        },
+    ));
+    let outcome = translate_chunk(
+        adapter,
+        "test-model".into(),
+        "zh-CN".into(),
+        None,
+        TranslationRequestOptions {
+            custom_parameters: json!({}),
+            web_search: false,
+            thinking: None,
+        },
+        None,
+        None,
+        Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
+        DocumentFormat::Txt,
+        ContentFormat::PlainText,
+        ChunkRecord {
+            id: "chunk-429".into(),
+            sequence: 0,
+            source_text: "Hello".into(),
+            map_json: "{}".into(),
+        },
+        2,
+        ConfidenceMode::Off,
+        Arc::new(HeaderQuotaPolicy::new(true)),
+        Arc::new(AdaptiveLimiter::new(2, true)),
+        None,
+        None,
+    )
+    .await;
+    server.join().expect("mock server joins");
+
+    assert_eq!(outcome.status, TranslationChunkStatus::Success);
+    assert!(!outcome.interrupt_task);
+    assert_eq!(outcome.retry_count, 1);
+    assert_eq!(outcome.translated_text, "你好");
+}
+
+#[tokio::test]
+async fn translate_chunk_interrupts_immediately_on_permanent_provider_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let address = listener.local_addr().expect("mock address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept mock request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let body = r#"{"error":{"message":"invalid api key"}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write mock response");
+    });
+    let adapter = Arc::new(RuntimeAdapter::new(
+        Client::new(),
+        ProviderRuntimeConfig {
+            protocol: ProviderProtocol::OpenaiChat,
+            base_url: format!("http://{address}/v1"),
+            use_raw_base_url: true,
+            config: json!({}),
+            auth_type: "bearer".into(),
+            auth_header: "Authorization".into(),
+            credential: None,
+            custom_headers: Vec::new(),
+        },
+    ));
+    let outcome = translate_chunk(
+        adapter,
+        "test-model".into(),
+        "zh-CN".into(),
+        None,
+        TranslationRequestOptions {
+            custom_parameters: json!({}),
+            web_search: false,
+            thinking: None,
+        },
+        None,
+        None,
+        Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
+        DocumentFormat::Txt,
+        ContentFormat::PlainText,
+        ChunkRecord {
+            id: "chunk-401".into(),
+            sequence: 0,
+            source_text: "Hello".into(),
+            map_json: "{}".into(),
+        },
+        5,
+        ConfidenceMode::Off,
+        Arc::new(HeaderQuotaPolicy::new(true)),
+        Arc::new(AdaptiveLimiter::new(2, true)),
+        None,
+        None,
+    )
+    .await;
+    server.join().expect("mock server joins");
+
+    assert_eq!(outcome.status, TranslationChunkStatus::Failed);
+    assert!(outcome.interrupt_task);
+    assert_eq!(outcome.retry_count, 0);
+    assert!(outcome
+        .error_message
+        .as_deref()
+        .is_some_and(|message| message.contains("HTTP 401")));
+}
+
+#[tokio::test]
+async fn translate_chunk_marks_transient_exhaustion_failed_without_interrupt() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let address = listener.local_addr().expect("mock address");
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = r#"{"error":{"message":"overloaded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1ms"}]}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write mock response");
+        }
+    });
+    let adapter = Arc::new(RuntimeAdapter::new(
+        Client::new(),
+        ProviderRuntimeConfig {
+            protocol: ProviderProtocol::OpenaiChat,
+            base_url: format!("http://{address}/v1"),
+            use_raw_base_url: true,
+            config: json!({}),
+            auth_type: "bearer".into(),
+            auth_header: "Authorization".into(),
+            credential: None,
+            custom_headers: Vec::new(),
+        },
+    ));
+    let outcome = translate_chunk(
+        adapter,
+        "test-model".into(),
+        "zh-CN".into(),
+        None,
+        TranslationRequestOptions {
+            custom_parameters: json!({}),
+            web_search: false,
+            thinking: None,
+        },
+        None,
+        None,
+        Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
+        DocumentFormat::Txt,
+        ContentFormat::PlainText,
+        ChunkRecord {
+            id: "chunk-503".into(),
+            sequence: 0,
+            source_text: "Hello".into(),
+            map_json: "{}".into(),
+        },
+        2,
+        ConfidenceMode::Off,
+        Arc::new(HeaderQuotaPolicy::new(true)),
+        Arc::new(AdaptiveLimiter::new(2, true)),
+        None,
+        None,
+    )
+    .await;
+    server.join().expect("mock server joins");
+
+    assert_eq!(outcome.status, TranslationChunkStatus::Failed);
+    assert!(!outcome.interrupt_task);
+    assert_eq!(outcome.retry_count, 2);
 }
 
 #[test]

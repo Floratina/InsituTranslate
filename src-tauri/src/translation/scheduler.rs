@@ -121,6 +121,29 @@ fn retry_action(attempt: u32, max_retries: u32) -> &'static str {
     }
 }
 
+const RETRY_BACKOFF_BASE_MS: u64 = 1_500;
+const RETRY_BACKOFF_CAP_MS: u64 = 12_000;
+const RETRY_JITTER_MS: i64 = 500;
+const RETRY_MIN_SLEEP_MS: u64 = 250;
+
+pub(super) fn transient_retry_base_delay_ms(error: &ProviderChatError, attempt: u32) -> u64 {
+    error
+        .rate_limits
+        .retry_after_ms
+        .unwrap_or_else(|| retry_base_delay_ms(attempt))
+        .min(RETRY_BACKOFF_CAP_MS)
+}
+
+pub(super) fn retry_base_delay_ms(attempt: u32) -> u64 {
+    let multiplier = 1.5_f64.powi(attempt.min(32) as i32);
+    ((RETRY_BACKOFF_BASE_MS as f64) * multiplier).ceil() as u64
+}
+
+pub(super) fn retry_delay_with_jitter_ms(base_ms: u64) -> u64 {
+    let jitter = fastrand::i64(-RETRY_JITTER_MS..=RETRY_JITTER_MS);
+    (base_ms as i64 + jitter).clamp(RETRY_MIN_SLEEP_MS as i64, RETRY_BACKOFF_CAP_MS as i64) as u64
+}
+
 pub async fn prepare_translation_run(
     app: &AppHandle,
     provider_pool: &SqlitePool,
@@ -600,7 +623,12 @@ pub async fn run_translation_task(
                 )
                 .await;
                 if outcome.interrupt_task {
-                    interrupted.interrupt("Rate limit reached; task interrupted");
+                    interrupted.interrupt(
+                        outcome
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "Task interrupted".to_string()),
+                    );
                     limiter.notify_waiters();
                 }
                 let _ = tx.send(outcome).await;
@@ -681,9 +709,10 @@ async fn run_sliding_window_translation(
         )
         .await;
         let interrupt_task = outcome.interrupt_task;
+        let interrupt_reason = outcome.error_message.clone();
         apply_and_emit_chunk_outcome(app, inp_pool, config_pool, inp_path, outcome).await?;
         if interrupt_task {
-            interrupt.interrupt("Rate limit reached; task interrupted");
+            interrupt.interrupt(interrupt_reason.unwrap_or_else(|| "Task interrupted".to_string()));
             limiter.notify_waiters();
         }
     }
@@ -821,7 +850,7 @@ async fn finalize_translation_run(
     .await
 }
 
-async fn translate_chunk(
+pub(super) async fn translate_chunk(
     adapter: Arc<RuntimeAdapter>,
     model_request_name: String,
     target_language: String,
@@ -985,9 +1014,8 @@ async fn translate_chunk(
                 } else {
                     text.clone()
                 });
-                if meta.status == 429 || finish_reason_is_truncation(meta.finish_reason.as_deref())
-                {
-                    let finish_reason = meta.finish_reason.as_deref().unwrap_or("rate-limit");
+                if finish_reason_is_truncation(meta.finish_reason.as_deref()) {
+                    let finish_reason = meta.finish_reason.as_deref().unwrap_or("truncation");
                     last_error = Some(format!("Interrupted by finish reason: {finish_reason}"));
                     log_chunk_issue(
                         &backend_log,
@@ -1158,7 +1186,7 @@ async fn translate_chunk(
                 last_error = Some(error.to_string());
                 log_chunk_issue(
                     &backend_log,
-                    if error.is_rate_limited() || attempt == max_retries {
+                    if !error.is_transient() || attempt == max_retries {
                         "ERROR"
                     } else {
                         "WARN"
@@ -1178,10 +1206,10 @@ async fn translate_chunk(
                         error
                     ),
                 );
-                if error.is_rate_limited() {
+                if !error.is_transient() {
                     return failed_outcome(
                         chunk,
-                        TranslationChunkStatus::Interrupted,
+                        TranslationChunkStatus::Failed,
                         retry_count,
                         last_error,
                         last_text,
@@ -1202,7 +1230,19 @@ async fn translate_chunk(
                         false,
                     );
                 }
-                tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
+                let base_delay = transient_retry_base_delay_ms(&error, attempt);
+                let sleep_ms = retry_delay_with_jitter_ms(base_delay);
+                log_chunk_issue(
+                    &backend_log,
+                    "WARN",
+                    &chunk,
+                    attempt,
+                    max_retries,
+                    format!(
+                        "transient provider error backoff_ms={sleep_ms} base_backoff_ms={base_delay}"
+                    ),
+                );
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
             }
         }
     }

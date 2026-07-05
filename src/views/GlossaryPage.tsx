@@ -286,12 +286,24 @@ function startResize(
   setWidths: (next: number[]) => void,
 ): void {
   event.preventDefault();
+  const partnerIndex = columnIndex + 1;
+  if (partnerIndex >= widths.length) return;
   const startX = event.clientX;
   const startWidth = widths[columnIndex];
+  const partnerStartWidth = widths[partnerIndex];
   const onPointerMove = (moveEvent: PointerEvent): void => {
     const minWidth = minWidths[columnIndex] ?? 88;
-    const nextWidth = Math.max(minWidth, Math.min(760, startWidth + moveEvent.clientX - startX));
-    setWidths(widths.map((width, index) => (index === columnIndex ? nextWidth : width)));
+    const partnerMinWidth = minWidths[partnerIndex] ?? 88;
+    const rawDelta = moveEvent.clientX - startX;
+    const delta = Math.max(
+      minWidth - startWidth,
+      Math.min(rawDelta, partnerStartWidth - partnerMinWidth),
+    );
+    setWidths(widths.map((width, index) => {
+      if (index === columnIndex) return Math.round(startWidth + delta);
+      if (index === partnerIndex) return Math.round(partnerStartWidth - delta);
+      return width;
+    }));
   };
   const onPointerUp = (): void => {
     window.removeEventListener("pointermove", onPointerMove);
@@ -822,7 +834,7 @@ export default function GlossaryPage() {
             onSort={updateListSort}
             onPageChange={setListPage}
             onPageSizeChange={setListPageSize}
-            onResize={(event, index) => startResize(event, index, listWidths, LIST_MIN_WIDTHS, setListWidths)}
+            onResize={(event, index, renderedWidths) => startResize(event, index, renderedWidths, LIST_MIN_WIDTHS, setListWidths)}
             onAutoFit={autoFitListColumn}
           />
         ) : (
@@ -845,7 +857,7 @@ export default function GlossaryPage() {
             onSort={updateEntrySort}
             onPageChange={(page) => setEntryPage((current) => ({ ...current, page }))}
             onPageSizeChange={setEntryPageSize}
-            onResize={(event, index) => startResize(event, index, detailWidths, DETAIL_MIN_WIDTHS, setDetailWidths)}
+            onResize={(event, index, renderedWidths) => startResize(event, index, renderedWidths, DETAIL_MIN_WIDTHS, setDetailWidths)}
             onAutoFit={autoFitDetailColumn}
           />
         )}
@@ -953,7 +965,11 @@ interface GlossaryListViewProps {
   onSort: (field: GlossarySortField) => void;
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
-  onResize: (event: ReactPointerEvent<HTMLButtonElement>, index: number) => void;
+  onResize: (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    index: number,
+    widths: number[],
+  ) => void;
   onAutoFit: (index: number) => void;
 }
 
@@ -1121,7 +1137,11 @@ interface GlossaryListTableProps {
   onSort: (field: GlossarySortField) => void;
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
-  onResize: (event: ReactPointerEvent<HTMLButtonElement>, index: number) => void;
+  onResize: (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    index: number,
+    widths: number[],
+  ) => void;
   onAutoFit: (index: number) => void;
 }
 
@@ -1191,6 +1211,7 @@ function GlossaryListTable({
                   loadingField={listSortLoading}
                   columnIndex={0}
                   canResize
+                  widths={adaptiveWidths}
                   onSort={onSort}
                   onResize={onResize}
                   onAutoFit={onAutoFit}
@@ -1199,6 +1220,7 @@ function GlossaryListTable({
                   title="数量"
                   columnIndex={1}
                   canResize
+                  widths={adaptiveWidths}
                   onResize={onResize}
                   onAutoFit={onAutoFit}
                 />
@@ -1209,6 +1231,7 @@ function GlossaryListTable({
                   loadingField={listSortLoading}
                   columnIndex={2}
                   canResize
+                  widths={adaptiveWidths}
                   onSort={onSort}
                   onResize={onResize}
                   onAutoFit={onAutoFit}
@@ -1219,7 +1242,8 @@ function GlossaryListTable({
                   sort={listSort}
                   loadingField={listSortLoading}
                   columnIndex={3}
-                  canResize
+                  canResize={false}
+                  widths={adaptiveWidths}
                   onSort={onSort}
                   onResize={onResize}
                   onAutoFit={onAutoFit}
@@ -1446,7 +1470,11 @@ interface GlossaryDetailViewProps {
   onSort: (field: GlossaryEntrySortField) => void;
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
-  onResize: (event: ReactPointerEvent<HTMLButtonElement>, index: number) => void;
+  onResize: (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    index: number,
+    widths: number[],
+  ) => void;
   onAutoFit: (index: number) => void;
 }
 
@@ -1547,6 +1575,7 @@ function GlossaryDetailView({
                   loadingField={entrySortLoading}
                   columnIndex={0}
                   canResize
+                  widths={adaptiveWidths}
                   onSort={onSort}
                   onResize={onResize}
                   onAutoFit={onAutoFit}
@@ -1557,7 +1586,8 @@ function GlossaryDetailView({
                   sort={entrySort}
                   loadingField={entrySortLoading}
                   columnIndex={1}
-                  canResize
+                  canResize={false}
+                  widths={adaptiveWidths}
                   onSort={onSort}
                   onResize={onResize}
                   onAutoFit={onAutoFit}
@@ -1703,8 +1733,13 @@ interface ResizableHeaderProps<Field extends string> {
   canResize: boolean;
   isLastColumn?: boolean;
   onSort?: (field: Field) => void;
-  onResize: (event: ReactPointerEvent<HTMLButtonElement>, index: number) => void;
+  onResize: (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    index: number,
+    widths: number[],
+  ) => void;
   onAutoFit: (index: number) => void;
+  widths: number[];
 }
 
 function ResizableHeader<Field extends string>({
@@ -1718,6 +1753,7 @@ function ResizableHeader<Field extends string>({
   onSort,
   onResize,
   onAutoFit,
+  widths,
 }: ResizableHeaderProps<Field>) {
   const active = Boolean(field && sort?.field === field);
   const label = active ? SORT_LABELS[sort?.mode ?? "created-desc"] : SORT_LABELS["created-desc"];
@@ -1761,7 +1797,7 @@ function ResizableHeader<Field extends string>({
             "absolute top-0 right-0 h-full w-2 cursor-col-resize touch-none transition-colors",
             !isLastColumn && "border-r border-transparent hover:border-primary/70",
           )}
-          onPointerDown={(event) => onResize(event, columnIndex)}
+          onPointerDown={(event) => onResize(event, columnIndex, widths)}
           onDoubleClick={() => onAutoFit(columnIndex)}
         />
       )}

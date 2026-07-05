@@ -158,7 +158,7 @@ const ALL_FILTER_VALUE = "__all__";
 const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
 const ACTION_COLUMN_WIDTH = 64;
-const TASK_MIN_WIDTHS = [156, 196, 128, 156];
+const TASK_MIN_WIDTHS = [144, 176, 104, 128];
 const TASK_INITIAL_WIDTHS = [340, 260, 220, 260];
 const TASK_MAX_WIDTHS = [720, 520, 480, 460];
 const TASK_FLEX_COLUMNS = [0, 1, 2, 3];
@@ -357,12 +357,24 @@ function startResize(
   setWidths: (next: number[]) => void,
 ): void {
   event.preventDefault();
+  const partnerIndex = columnIndex + 1;
+  if (partnerIndex >= widths.length) return;
   const startX = event.clientX;
   const startWidth = widths[columnIndex];
+  const partnerStartWidth = widths[partnerIndex];
   const onPointerMove = (moveEvent: PointerEvent): void => {
     const minWidth = minWidths[columnIndex] ?? 88;
-    const nextWidth = Math.max(minWidth, Math.min(760, startWidth + moveEvent.clientX - startX));
-    setWidths(widths.map((width, index) => (index === columnIndex ? nextWidth : width)));
+    const partnerMinWidth = minWidths[partnerIndex] ?? 88;
+    const rawDelta = moveEvent.clientX - startX;
+    const delta = Math.max(
+      minWidth - startWidth,
+      Math.min(rawDelta, partnerStartWidth - partnerMinWidth),
+    );
+    setWidths(widths.map((width, index) => {
+      if (index === columnIndex) return Math.round(startWidth + delta);
+      if (index === partnerIndex) return Math.round(partnerStartWidth - delta);
+      return width;
+    }));
   };
   const onPointerUp = (): void => {
     window.removeEventListener("pointermove", onPointerMove);
@@ -928,7 +940,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         onSort={updateSort}
         onPageChange={setPage}
         onPageSizeChange={setPageSize}
-        onResize={(event, index) => startResize(event, index, widths, TASK_MIN_WIDTHS, setWidths)}
+        onResize={(event, index, renderedWidths) => startResize(event, index, renderedWidths, TASK_MIN_WIDTHS, setWidths)}
         onAutoFit={autoFitColumn}
         onStart={(task) => void runTaskAction(task, startTranslationTask, "running")}
         onResume={(task) => void runTaskAction(task, resumeTranslationTask, "running")}
@@ -1002,7 +1014,11 @@ interface TasksTableProps {
   onSort: (field: TaskSortField) => void;
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
-  onResize: (event: ReactPointerEvent<HTMLButtonElement>, index: number) => void;
+  onResize: (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    index: number,
+    widths: number[],
+  ) => void;
   onAutoFit: (index: number) => void;
   onStart: (task: TranslationTaskView) => void;
   onResume: (task: TranslationTaskView) => void;
@@ -1080,6 +1096,7 @@ function TasksTable({
                 sort={sort}
                 loadingField={sortLoading}
                 columnIndex={0}
+                widths={adaptiveWidths}
                 onSort={onSort}
                 onResize={onResize}
                 onAutoFit={onAutoFit}
@@ -1090,6 +1107,7 @@ function TasksTable({
                 sort={sort}
                 loadingField={sortLoading}
                 columnIndex={1}
+                widths={adaptiveWidths}
                 onSort={onSort}
                 onResize={onResize}
                 onAutoFit={onAutoFit}
@@ -1100,6 +1118,7 @@ function TasksTable({
                 sort={sort}
                 loadingField={sortLoading}
                 columnIndex={2}
+                widths={adaptiveWidths}
                 onSort={onSort}
                 onResize={onResize}
                 onAutoFit={onAutoFit}
@@ -1110,6 +1129,8 @@ function TasksTable({
                 sort={sort}
                 loadingField={sortLoading}
                 columnIndex={3}
+                canResize={false}
+                widths={adaptiveWidths}
                 onSort={onSort}
                 onResize={onResize}
                 onAutoFit={onAutoFit}
@@ -1374,9 +1395,15 @@ interface ResizableHeaderProps {
   sort: TaskSortState;
   loadingField: TaskSortField | null;
   columnIndex: number;
+  canResize?: boolean;
   onSort: (field: TaskSortField) => void;
-  onResize: (event: ReactPointerEvent<HTMLButtonElement>, index: number) => void;
+  onResize: (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    index: number,
+    widths: number[],
+  ) => void;
   onAutoFit: (index: number) => void;
+  widths: number[];
 }
 
 function ResizableHeader({
@@ -1385,9 +1412,11 @@ function ResizableHeader({
   sort,
   loadingField,
   columnIndex,
+  canResize = true,
   onSort,
   onResize,
   onAutoFit,
+  widths,
 }: ResizableHeaderProps) {
   const active = sort.field === field;
   const label = active ? sortLabels[sort.mode] : sortLabels["created-desc"];
@@ -1419,13 +1448,15 @@ function ResizableHeader({
           )}
         </span>
       </button>
-      <button
-        type="button"
-        aria-label="调整列宽"
-        className="absolute top-0 right-0 h-full w-2 cursor-col-resize touch-none border-r border-transparent transition-colors hover:border-primary/70"
-        onPointerDown={(event) => onResize(event, columnIndex)}
-        onDoubleClick={() => onAutoFit(columnIndex)}
-      />
+      {canResize && (
+        <button
+          type="button"
+          aria-label="调整列宽"
+          className="absolute top-0 right-0 h-full w-2 cursor-col-resize touch-none border-r border-transparent transition-colors hover:border-primary/70"
+          onPointerDown={(event) => onResize(event, columnIndex, widths)}
+          onDoubleClick={() => onAutoFit(columnIndex)}
+        />
+      )}
     </th>
   );
 }

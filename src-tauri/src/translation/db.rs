@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, SqlitePool};
@@ -32,13 +33,14 @@ use super::types::{
 use super::{
     ContextHandlingMode, CreateTranslationTaskInput, ExportTranslationTaskInput, GlossaryMode,
     ImportTranslationTaskInput, RateLimitStrategy, TokenStats, TranslationChunkStatus,
-    TranslationChunkView, TranslationConfigView, TranslationProgressPayload, TranslationTaskDetail,
-    TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskStatus,
-    TranslationTaskView, UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput,
-    UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput, CONFIG_DB_FILE,
-    DEFAULT_CHUNK_TOKEN_LIMIT, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE,
-    DEFAULT_MAX_RETRIES, DEFAULT_MAX_TOKENS_PER_MINUTE, INP_FILE_DAMAGED, INP_SCHEMA_VERSION,
-    MAX_TASK_NAME_LENGTH, MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH, SOURCE_FILE_UNAVAILABLE, TASKS_DIR,
+    TranslationChunkView, TranslationConfigView, TranslationProgressPayload,
+    TranslationTaskActiveRetry, TranslationTaskDetail, TranslationTaskExportFormat,
+    TranslationTaskFilters, TranslationTaskStatus, TranslationTaskView,
+    UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput,
+    UpdateTranslationTaskTagsInput, CONFIG_DB_FILE, DEFAULT_CHUNK_TOKEN_LIMIT,
+    DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_TOKENS_PER_MINUTE, INP_FILE_DAMAGED, INP_SCHEMA_VERSION, MAX_TASK_NAME_LENGTH,
+    MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH, SOURCE_FILE_UNAVAILABLE, TASKS_DIR,
     TRANSLATION_PROGRESS_EVENT, TRANSLATION_TASK_CREATION_PROGRESS_EVENT,
 };
 
@@ -46,6 +48,15 @@ use super::{
 pub(super) struct ParsedTaskSource {
     pub(super) chunks: Vec<document_parsing::types::ParsedChunk>,
     pub(super) assets: Vec<PdfAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DbActiveRetry {
+    chunk_id: String,
+    current: u32,
+    max: u32,
+    message: String,
 }
 
 pub fn default_workspace_root() -> PathBuf {
@@ -161,6 +172,7 @@ async fn migrate_config_db(pool: &SqlitePool) -> Result<(), String> {
             error_rate REAL NOT NULL DEFAULT 0,
             last_error TEXT,
             rate_limit_status TEXT,
+            active_retry_json TEXT,
             progress_detail_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -221,6 +233,7 @@ async fn migrate_config_db(pool: &SqlitePool) -> Result<(), String> {
         "INTEGER NOT NULL DEFAULT 60000",
     )
     .await?;
+    add_column_if_missing(pool, "task_index", "active_retry_json", "TEXT").await?;
     add_column_if_missing(pool, "task_index", "progress_detail_json", "TEXT").await?;
     sqlx::query(
         "INSERT INTO translation_config (
@@ -505,6 +518,13 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
         parse_progress_detail_json(progress_detail_json)
             .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     }
+    if schema_version >= 9 {
+        require_columns(pool, "metadata", &["active_retry_json"]).await?;
+        let active_retry_json = row
+            .try_get::<Option<String>, _>("active_retry_json")
+            .unwrap_or(None);
+        parse_active_retry_json(active_retry_json).map_err(|_| INP_FILE_DAMAGED.to_string())?;
+    }
     TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     parse_tags_json(row.get("tags_json")).map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -625,6 +645,7 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             error_rate REAL NOT NULL DEFAULT 0,
             last_error TEXT,
             rate_limit_status TEXT,
+            active_retry_json TEXT,
             progress_detail_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -694,6 +715,7 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
     .await?;
     add_column_if_missing(pool, "metadata", "glossary_id", "TEXT").await?;
     add_column_if_missing(pool, "metadata", "global_background", "TEXT").await?;
+    add_column_if_missing(pool, "metadata", "active_retry_json", "TEXT").await?;
     add_column_if_missing(pool, "metadata", "progress_detail_json", "TEXT").await?;
     add_column_if_missing(pool, "chunks", "map_json", "TEXT NOT NULL DEFAULT '{}'").await?;
     add_column_if_missing(
@@ -2177,6 +2199,70 @@ pub(super) async fn apply_chunk_outcome(
     Ok(())
 }
 
+pub(super) async fn set_active_retry_and_emit(
+    app: &AppHandle,
+    inp_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    inp_path: &Path,
+    chunk_id: &str,
+    current: u32,
+    max: u32,
+    message: String,
+) -> Result<(), String> {
+    let retry = DbActiveRetry {
+        chunk_id: chunk_id.to_string(),
+        current,
+        max,
+        message,
+    };
+    let active_retry_json = serialize_active_retry(Some(&retry))?;
+    sqlx::query(
+        "UPDATE metadata
+         SET active_retry_json = ?, updated_at = ?
+         WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
+    )
+    .bind(active_retry_json)
+    .bind(unix_timestamp())
+    .execute(inp_pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let task = refresh_task_stats(inp_pool, config_pool, inp_path, None).await?;
+    let _ = app.emit(
+        TRANSLATION_PROGRESS_EVENT,
+        TranslationProgressPayload { task },
+    );
+    Ok(())
+}
+
+pub(super) async fn clear_active_retry_for_chunk(
+    inp_pool: &SqlitePool,
+    chunk_id: &str,
+) -> Result<(), String> {
+    let row = sqlx::query("SELECT active_retry_json FROM metadata LIMIT 1")
+        .fetch_one(inp_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let retry = parse_db_active_retry_json(
+        row.try_get::<Option<String>, _>("active_retry_json")
+            .unwrap_or(None),
+    )?;
+    if retry
+        .as_ref()
+        .is_some_and(|value| value.chunk_id == chunk_id)
+    {
+        sqlx::query(
+            "UPDATE metadata
+             SET active_retry_json = NULL, updated_at = ?
+             WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
+        )
+        .bind(unix_timestamp())
+        .execute(inp_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 pub(super) async fn finalize_task(
     app: &AppHandle,
     inp_pool: &SqlitePool,
@@ -2189,7 +2275,8 @@ pub(super) async fn finalize_task(
     sqlx::query(
         "UPDATE metadata
          SET status = ?, last_error = COALESCE(?, last_error),
-             rate_limit_status = COALESCE(?, rate_limit_status), updated_at = ?
+             rate_limit_status = COALESCE(?, rate_limit_status), active_retry_json = NULL,
+             updated_at = ?
          WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
     )
     .bind(status.as_str())
@@ -2340,15 +2427,16 @@ pub(super) async fn upsert_task_index(
     task: &TranslationTaskView,
 ) -> Result<(), String> {
     let tags_json = serialize_tags(&task.tags)?;
+    let active_retry_json = serialize_task_active_retry(task.active_retry.as_ref())?;
     let progress_detail_json = serialize_progress_detail(task.progress_detail.as_ref())?;
     sqlx::query(
         "INSERT INTO task_index (
             id, name, inp_path, source_path, source_language, target_language, status, progress,
             provider_id, model_id, model_request_name, assistant_id, tags_json, total_chunks, completed_chunks,
             failed_chunks, interrupted_chunks, input_tokens, output_tokens, cached_tokens,
-            thinking_tokens, total_tokens, error_rate, last_error, rate_limit_status, progress_detail_json,
-            created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            thinking_tokens, total_tokens, error_rate, last_error, rate_limit_status, active_retry_json,
+            progress_detail_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             inp_path = excluded.inp_path,
@@ -2374,6 +2462,7 @@ pub(super) async fn upsert_task_index(
             error_rate = excluded.error_rate,
             last_error = excluded.last_error,
             rate_limit_status = excluded.rate_limit_status,
+            active_retry_json = excluded.active_retry_json,
             progress_detail_json = excluded.progress_detail_json,
             updated_at = excluded.updated_at",
     )
@@ -2402,6 +2491,7 @@ pub(super) async fn upsert_task_index(
     .bind(task.error_rate)
     .bind(task.last_error.as_deref())
     .bind(task.rate_limit_status.as_deref())
+    .bind(active_retry_json)
     .bind(progress_detail_json)
     .bind(&task.created_at)
     .bind(&task.updated_at)
@@ -2453,6 +2543,7 @@ fn task_from_index_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranslationTaskV
         error_rate: row.get("error_rate"),
         last_error: row.get("last_error"),
         rate_limit_status: row.get("rate_limit_status"),
+        active_retry: row_active_retry(row)?,
         progress_detail: row_progress_detail(row)?,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -2495,6 +2586,7 @@ pub(super) async fn metadata_task(
         error_rate: row.get("error_rate"),
         last_error: row.get("last_error"),
         rate_limit_status: row.get("rate_limit_status"),
+        active_retry: row_active_retry(&row)?,
         progress_detail: row_progress_detail(&row)?,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -2755,9 +2847,63 @@ fn parse_progress_detail_json(
         .transpose()
 }
 
+fn serialize_active_retry(retry: Option<&DbActiveRetry>) -> Result<Option<String>, String> {
+    retry
+        .map(|value| serde_json::to_string(value).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn serialize_task_active_retry(
+    retry: Option<&TranslationTaskActiveRetry>,
+) -> Result<Option<String>, String> {
+    retry
+        .map(|value| serde_json::to_string(value).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn parse_db_active_retry_json(
+    active_retry_json: Option<String>,
+) -> Result<Option<DbActiveRetry>, String> {
+    active_retry_json
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            serde_json::from_str::<DbActiveRetry>(&value)
+                .map_err(|error| format!("Stored task active retry is invalid: {error}"))
+        })
+        .transpose()
+}
+
+fn parse_active_retry_json(
+    active_retry_json: Option<String>,
+) -> Result<Option<TranslationTaskActiveRetry>, String> {
+    active_retry_json
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            if let Ok(retry) = serde_json::from_str::<DbActiveRetry>(&value) {
+                return Ok(TranslationTaskActiveRetry {
+                    current: retry.current,
+                    max: retry.max,
+                    message: retry.message,
+                });
+            }
+            serde_json::from_str::<TranslationTaskActiveRetry>(&value)
+                .map_err(|error| format!("Stored task active retry is invalid: {error}"))
+        })
+        .transpose()
+}
+
 fn row_progress_detail(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ProgressDetail>, String> {
     parse_progress_detail_json(
         row.try_get::<Option<String>, _>("progress_detail_json")
+            .unwrap_or(None),
+    )
+}
+
+fn row_active_retry(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<Option<TranslationTaskActiveRetry>, String> {
+    parse_active_retry_json(
+        row.try_get::<Option<String>, _>("active_retry_json")
             .unwrap_or(None),
     )
 }

@@ -55,7 +55,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -86,9 +85,9 @@ import {
   formatPercent,
   formatTokenK,
   statusLabel,
-  taskStatusMessage,
   unixTimeLabel,
 } from "@/features/translation/format";
+import { TaskStatsCell } from "@/features/translation/TaskStatsCell";
 import type {
   ExportTranslationTaskInput,
   ProgressStep,
@@ -244,6 +243,7 @@ function optimisticTaskStatus(
     completedChunks: resetProgress ? 0 : task.completedChunks,
     failedChunks: resetProgress ? 0 : task.failedChunks,
     interruptedChunks: resetProgress ? 0 : task.interruptedChunks,
+    activeRetry: null,
     progressDetail,
     updatedAt: optimisticTimestamp(),
   };
@@ -1157,7 +1157,7 @@ function TasksTable({
                         </div>
                       </td>
                       <td className="h-11 min-w-0 px-3 py-2">
-                        <TaskStats task={task} />
+                        <TaskStatsCell task={task} />
                       </td>
                       <td className="h-11 min-w-0 px-3 py-2">
                         <TaskTags tags={task.tags} />
@@ -1211,34 +1211,6 @@ function TasksTable({
       />
     </section>
   );
-}
-
-function TaskStats({ task }: { task: TranslationTaskView }) {
-  const status = taskStatusMessage(task);
-  return (
-    <div className="grid min-w-0 gap-1.5">
-      <div className="flex min-w-0 items-center gap-1.5">
-        {liveTaskStatus(task.status) && (
-          <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />
-        )}
-        <span className={cn("truncate text-2xs", taskStatusTextClass(status.severity))}>
-          {status.text}
-        </span>
-      </div>
-      <div className="flex min-w-0 items-center gap-2">
-        <Progress value={Math.round(Math.max(0, Math.min(1, task.progress)) * 100)} className="h-1.5 min-w-16 flex-1" />
-        <span className="shrink-0 text-2xs text-muted-foreground">
-          {formatTokenK(task.tokenStats.totalTokens)} · {formatPercent(task.progress)}
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function taskStatusTextClass(severity: ReturnType<typeof taskStatusMessage>["severity"]): string {
-  if (severity === "danger") return "text-[var(--task-status-danger)]";
-  if (severity === "warning") return "text-[var(--task-status-warning)]";
-  return "text-muted-foreground";
 }
 
 function ProgressStepPill({ step }: { step: ProgressStep }) {

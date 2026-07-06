@@ -700,8 +700,47 @@ async fn inp_migration_adds_progress_detail_column_as_null() {
 }
 
 #[tokio::test]
-async fn config_migration_adds_task_index_progress_detail_column() {
-    let root = temp_root("task-index-progress-detail");
+async fn inp_migration_adds_active_retry_column_as_null() {
+    let root = temp_root("active-retry-migration");
+    let inp_path = root.join("legacy-v8.inp");
+    write_test_inp(&inp_path, "task-active-retry-v8", "Active Retry")
+        .await
+        .expect("write inp");
+    let pool = connect_inp(&inp_path).await.expect("open inp");
+    sqlx::query("ALTER TABLE metadata DROP COLUMN active_retry_json")
+        .execute(&pool)
+        .await
+        .expect("drop active retry");
+    sqlx::query("UPDATE metadata SET schema_version = 8")
+        .execute(&pool)
+        .await
+        .expect("mark v8");
+    pool.close().await;
+
+    let migrated = connect_inp(&inp_path).await.expect("migrate");
+    let schema_version: i64 = sqlx::query_scalar("SELECT schema_version FROM metadata LIMIT 1")
+        .fetch_one(&migrated)
+        .await
+        .expect("schema version");
+    let active_retry: Option<String> =
+        sqlx::query_scalar("SELECT active_retry_json FROM metadata LIMIT 1")
+            .fetch_one(&migrated)
+            .await
+            .expect("active retry");
+    assert_eq!(schema_version, INP_SCHEMA_VERSION);
+    assert_eq!(active_retry, None);
+    migrated.close().await;
+
+    let task = validate_inp_file(&inp_path)
+        .await
+        .expect("validate migrated");
+    assert!(task.active_retry.is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn config_migration_adds_task_index_progress_columns() {
+    let root = temp_root("task-index-progress-columns");
     let pool = connect_config_db(&root).await.expect("connect config");
     let columns = sqlx::query("PRAGMA table_info(task_index)")
         .fetch_all(&pool)
@@ -710,6 +749,9 @@ async fn config_migration_adds_task_index_progress_detail_column() {
     assert!(columns
         .iter()
         .any(|row| row.get::<String, _>("name") == "progress_detail_json"));
+    assert!(columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "active_retry_json"));
     pool.close().await;
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1059,6 +1101,8 @@ async fn translate_chunk_retries_transient_429_without_interrupting_task() {
         Arc::new(AdaptiveLimiter::new(2, true)),
         None,
         None,
+        TranslationInterrupt::new(),
+        None,
     )
     .await;
     server.join().expect("mock server joins");
@@ -1067,6 +1111,62 @@ async fn translate_chunk_retries_transient_429_without_interrupting_task() {
     assert!(!outcome.interrupt_task);
     assert_eq!(outcome.retry_count, 1);
     assert_eq!(outcome.translated_text, "你好");
+}
+
+#[tokio::test]
+async fn translate_chunk_interruption_returns_empty_interrupted_outcome() {
+    let adapter = Arc::new(RuntimeAdapter::new(
+        Client::new(),
+        ProviderRuntimeConfig {
+            protocol: ProviderProtocol::OpenaiChat,
+            base_url: "http://127.0.0.1:9/v1".into(),
+            use_raw_base_url: true,
+            config: json!({}),
+            auth_type: "bearer".into(),
+            auth_header: "Authorization".into(),
+            credential: None,
+            custom_headers: Vec::new(),
+        },
+    ));
+    let interrupt = TranslationInterrupt::new();
+    interrupt.interrupt("Task paused");
+
+    let outcome = translate_chunk(
+        adapter,
+        "test-model".into(),
+        "zh-CN".into(),
+        None,
+        TranslationRequestOptions {
+            custom_parameters: json!({}),
+            web_search: false,
+            thinking: None,
+        },
+        None,
+        None,
+        Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
+        DocumentFormat::Txt,
+        ContentFormat::PlainText,
+        ChunkRecord {
+            id: "chunk-paused".into(),
+            sequence: 0,
+            source_text: "Hello".into(),
+            map_json: "{}".into(),
+        },
+        2,
+        ConfidenceMode::Off,
+        Arc::new(HeaderQuotaPolicy::new(true)),
+        Arc::new(AdaptiveLimiter::new(2, true)),
+        None,
+        None,
+        interrupt,
+        None,
+    )
+    .await;
+
+    assert_eq!(outcome.status, TranslationChunkStatus::Interrupted);
+    assert_eq!(outcome.after_translate_text, "");
+    assert_eq!(outcome.translated_text, "");
+    assert_eq!(outcome.error_message.as_deref(), Some("Task paused"));
 }
 
 #[tokio::test]
@@ -1125,6 +1225,8 @@ async fn translate_chunk_interrupts_immediately_on_permanent_provider_error() {
         Arc::new(HeaderQuotaPolicy::new(true)),
         Arc::new(AdaptiveLimiter::new(2, true)),
         None,
+        None,
+        TranslationInterrupt::new(),
         None,
     )
     .await;
@@ -1197,6 +1299,8 @@ async fn translate_chunk_marks_transient_exhaustion_failed_without_interrupt() {
         Arc::new(HeaderQuotaPolicy::new(true)),
         Arc::new(AdaptiveLimiter::new(2, true)),
         None,
+        None,
+        TranslationInterrupt::new(),
         None,
     )
     .await;

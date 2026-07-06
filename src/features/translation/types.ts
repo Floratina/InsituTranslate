@@ -183,9 +183,16 @@ export interface TranslationTaskView {
   errorRate: number;
   lastError: string | null;
   rateLimitStatus: string | null;
+  activeRetry: TranslationTaskActiveRetry | null;
   progressDetail: ProgressDetail | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface TranslationTaskActiveRetry {
+  current: number;
+  max: number;
+  message: string;
 }
 
 export interface TranslationChunkView {

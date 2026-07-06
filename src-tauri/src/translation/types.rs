@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::domain::ThinkingEffort;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
@@ -467,6 +468,14 @@ pub struct TranslationTaskPdfOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TranslationTaskActiveRetry {
+    pub current: u32,
+    pub max: u32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TranslationTaskView {
     pub id: String,
     pub name: String,
@@ -489,6 +498,7 @@ pub struct TranslationTaskView {
     pub error_rate: f64,
     pub last_error: Option<String>,
     pub rate_limit_status: Option<String>,
+    pub active_retry: Option<TranslationTaskActiveRetry>,
     pub progress_detail: Option<ProgressDetail>,
     pub created_at: String,
     pub updated_at: String,
@@ -535,6 +545,7 @@ pub enum RunMode {
 #[derive(Debug, Clone)]
 pub struct TranslationInterrupt {
     pub(super) flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
     reason: Arc<StdMutex<Option<String>>>,
 }
 
@@ -542,6 +553,7 @@ impl TranslationInterrupt {
     pub fn new() -> Self {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
             reason: Arc::new(StdMutex::new(None)),
         }
     }
@@ -551,6 +563,7 @@ impl TranslationInterrupt {
             *current = Some(reason.into());
         }
         self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     pub(super) fn is_interrupted(&self) -> bool {
@@ -559,6 +572,13 @@ impl TranslationInterrupt {
 
     pub(super) fn reason(&self) -> Option<String> {
         self.reason.lock().ok().and_then(|current| current.clone())
+    }
+
+    pub(super) async fn cancelled(&self) {
+        if self.is_interrupted() {
+            return;
+        }
+        self.notify.notified().await;
     }
 }
 

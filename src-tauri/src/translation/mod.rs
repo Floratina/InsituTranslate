@@ -5,7 +5,7 @@ const DEFAULT_MAX_CONCURRENCY: i64 = 5;
 const DEFAULT_MAX_RETRIES: i64 = 5;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: i64 = 60;
 const DEFAULT_MAX_TOKENS_PER_MINUTE: i64 = 60_000;
-const INP_SCHEMA_VERSION: i64 = 8;
+const INP_SCHEMA_VERSION: i64 = 9;
 const GLOBAL_BACKGROUND_TARGET_TOKENS: u64 = 1000;
 const GLOBAL_BACKGROUND_BATCH_CHUNKS: i64 = 20;
 const MAX_TASK_TAGS: usize = 12;
@@ -47,7 +47,7 @@ pub use self::types::{
     GlossaryMode, ImportTranslationTaskInput, PreparedRun, ProgressDetail, ProgressStep,
     RateLimitStrategy, RunMode, StartTranslationTaskCreationResult, TokenStats,
     TranslationChunkStatus, TranslationChunkView, TranslationConfigView, TranslationInterrupt,
-    TranslationProgressPayload, TranslationTaskCreationProgressPayload,
+    TranslationProgressPayload, TranslationTaskActiveRetry, TranslationTaskCreationProgressPayload,
     TranslationTaskCreationStage, TranslationTaskCreationStatus, TranslationTaskDetail,
     TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskIdsInput,
     TranslationTaskPdfOptions, TranslationTaskStatus, TranslationTaskView,

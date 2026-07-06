@@ -27,13 +27,14 @@ use super::context::{
     previous_translation_context, unix_timestamp,
 };
 use super::db::{
-    aggregate_chunk_stats, apply_chunk_outcome, config_snapshot_json, connect_inp,
-    content_format_from_source_path, document_format_from_source_path,
+    aggregate_chunk_stats, apply_chunk_outcome, clear_active_retry_for_chunk, config_snapshot_json,
+    connect_inp, content_format_from_source_path, document_format_from_source_path,
     effective_translation_concurrency, finalize_task, get_task_from_index, get_translation_config,
     glossary_source_chunks, insert_assets, metadata_task, parse_source_file_for_task,
     pending_chunks, progress_detail_for_config, progress_detail_for_translation_stats,
-    refresh_task_stats, resolve_source_file, set_progress_detail, set_progress_detail_and_emit,
-    task_assistant_custom_parameters, task_assistant_prompt, task_glossary_config,
+    refresh_task_stats, resolve_source_file, set_active_retry_and_emit, set_progress_detail,
+    set_progress_detail_and_emit, task_assistant_custom_parameters, task_assistant_prompt,
+    task_glossary_config,
 };
 use super::glossary::{prepare_task_glossary, TaskGlossaryMatcher, TaskGlossaryPreparation};
 use super::limiter::{
@@ -55,6 +56,36 @@ fn count_label(name: &str, current: u64, total: u64) -> String {
 fn write_translation_log(log: &Option<BackendLog>, level: &str, message: impl AsRef<str>) {
     if let Some(log) = log {
         log.write(level, "translation", message);
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ActiveRetryReporter {
+    app: AppHandle,
+    inp_pool: SqlitePool,
+    config_pool: SqlitePool,
+    inp_path: PathBuf,
+}
+
+impl ActiveRetryReporter {
+    async fn report(
+        &self,
+        chunk_id: &str,
+        current: u32,
+        max: u32,
+        message: String,
+    ) -> Result<(), String> {
+        set_active_retry_and_emit(
+            &self.app,
+            &self.inp_pool,
+            &self.config_pool,
+            &self.inp_path,
+            chunk_id,
+            current,
+            max,
+            message,
+        )
+        .await
     }
 }
 
@@ -121,6 +152,28 @@ fn retry_action(attempt: u32, max_retries: u32) -> &'static str {
     }
 }
 
+async fn report_active_retry(
+    reporter: Option<&ActiveRetryReporter>,
+    chunk: &ChunkRecord,
+    attempt: u32,
+    max_retries: u32,
+    message: &str,
+) {
+    if attempt >= max_retries {
+        return;
+    }
+    if let Some(reporter) = reporter {
+        let _ = reporter
+            .report(
+                &chunk.id,
+                attempt + 1,
+                max_retries,
+                message.trim().to_string(),
+            )
+            .await;
+    }
+}
+
 const RETRY_BACKOFF_BASE_MS: u64 = 1_500;
 const RETRY_BACKOFF_CAP_MS: u64 = 12_000;
 const RETRY_JITTER_MS: i64 = 500;
@@ -171,6 +224,11 @@ pub async fn prepare_translation_run(
     let config = get_translation_config(config_pool).await?;
     let glossary_config = task_glossary_config(&inp_pool).await?;
     let now = unix_timestamp();
+    sqlx::query("UPDATE metadata SET active_retry_json = NULL WHERE task_id = ?")
+        .bind(&indexed.id)
+        .execute(&inp_pool)
+        .await
+        .map_err(|error| error.to_string())?;
     match mode {
         RunMode::Start => {
             if indexed.status == TranslationTaskStatus::Success {
@@ -181,7 +239,10 @@ pub async fn prepare_translation_run(
         RunMode::Resume => {
             sqlx::query(
                 "UPDATE chunks
-                 SET status = ?, error_message = NULL, confidence = NULL, updated_at = ?
+                 SET status = ?, after_translate_text = '', translated_text = '',
+                     retry_count = 0, error_message = NULL, confidence = NULL,
+                     input_tokens = 0, output_tokens = 0, cached_tokens = 0,
+                     thinking_tokens = 0, total_tokens = 0, updated_at = ?
                  WHERE status IN (?, ?)",
             )
             .bind(TranslationChunkStatus::Pending.as_str())
@@ -254,7 +315,8 @@ pub async fn prepare_translation_run(
     sqlx::query(
         "UPDATE metadata
          SET status = ?, token_limit = ?, max_concurrency = ?, max_retries = ?,
-             config_snapshot_json = ?, last_error = NULL, rate_limit_status = NULL, updated_at = ?
+             config_snapshot_json = ?, last_error = NULL, rate_limit_status = NULL,
+             active_retry_json = NULL, updated_at = ?
          WHERE task_id = ?",
     )
     .bind(TranslationTaskStatus::Running.as_str())
@@ -555,6 +617,12 @@ pub async fn run_translation_task(
             let quota = quota.clone();
             let manual_limiter = manual_limiter.clone();
             let backend_log = backend_log.clone();
+            let retry_reporter = ActiveRetryReporter {
+                app: app.clone(),
+                inp_pool: inp_pool.clone(),
+                config_pool: config_pool.clone(),
+                inp_path: prepared.inp_path.clone(),
+            };
             let model_request_name = model.request_name.clone();
             let target_language = target_language.clone();
             let assistant_prompt = assistant_prompt.clone();
@@ -620,6 +688,8 @@ pub async fn run_translation_task(
                     limiter.clone(),
                     manual_limiter,
                     backend_log,
+                    interrupted.clone(),
+                    Some(retry_reporter),
                 )
                 .await;
                 if outcome.interrupt_task {
@@ -706,6 +776,13 @@ async fn run_sliding_window_translation(
             limiter.clone(),
             manual_limiter.clone(),
             backend_log.clone(),
+            interrupt.clone(),
+            Some(ActiveRetryReporter {
+                app: app.clone(),
+                inp_pool: inp_pool.clone(),
+                config_pool: config_pool.clone(),
+                inp_path: inp_path.to_path_buf(),
+            }),
         )
         .await;
         let interrupt_task = outcome.interrupt_task;
@@ -757,7 +834,9 @@ async fn apply_and_emit_chunk_outcome(
     inp_path: &Path,
     outcome: ChunkOutcome,
 ) -> Result<(), String> {
+    let chunk_id = outcome.chunk_id.clone();
     apply_chunk_outcome(inp_pool, outcome).await?;
+    clear_active_retry_for_chunk(inp_pool, &chunk_id).await?;
     let stats = aggregate_chunk_stats(inp_pool).await?;
     let metadata = metadata_task(inp_pool, inp_path).await?;
     let glossary_config = task_glossary_config(inp_pool).await?;
@@ -868,12 +947,17 @@ pub(super) async fn translate_chunk(
     limiter: Arc<AdaptiveLimiter>,
     manual_limiter: Option<Arc<ManualRateLimiter>>,
     backend_log: Option<BackendLog>,
+    interrupt: TranslationInterrupt,
+    retry_reporter: Option<ActiveRetryReporter>,
 ) -> ChunkOutcome {
     let mut retry_count = 0_i64;
     let mut last_error = None;
     let mut last_text = None;
     let mut last_stats = TokenStats::default();
     for attempt in 0..=max_retries {
+        if interrupt.is_interrupted() {
+            return interrupted_outcome(chunk, retry_count, interrupt.reason());
+        }
         retry_count = attempt as i64;
         let prompt = build_translation_prompt(TranslationPromptInput {
             target_language: target_language.clone(),
@@ -969,19 +1053,36 @@ pub(super) async fn translate_chunk(
                 .unwrap_or(0)
             + 256;
         if let Some(manual_limiter) = manual_limiter.as_ref() {
-            manual_limiter.before_request(estimated_tokens).await;
+            tokio::select! {
+                _ = manual_limiter.before_request(estimated_tokens) => {}
+                _ = interrupt.cancelled() => {
+                    return interrupted_outcome(chunk, retry_count, interrupt.reason());
+                }
+            }
         }
-        quota.before_request(estimated_tokens).await;
-        match send_chat_with_logprobs_fallback(
-            &adapter,
-            &request,
-            estimated_tokens,
-            &quota,
-            &limiter,
-            manual_limiter.as_ref(),
-        )
-        .await
-        {
+        tokio::select! {
+            _ = quota.before_request(estimated_tokens) => {}
+            _ = interrupt.cancelled() => {
+                return interrupted_outcome(chunk, retry_count, interrupt.reason());
+            }
+        }
+        let request_result = tokio::select! {
+            result = send_chat_with_logprobs_fallback(
+                &adapter,
+                &request,
+                estimated_tokens,
+                &quota,
+                &limiter,
+                manual_limiter.as_ref(),
+            ) => result,
+            _ = interrupt.cancelled() => {
+                return interrupted_outcome(chunk, retry_count, interrupt.reason());
+            }
+        };
+        if interrupt.is_interrupted() {
+            return interrupted_outcome(chunk, retry_count, interrupt.reason());
+        }
+        match request_result {
             Ok(meta) => {
                 quota.update(&meta.rate_limits).await;
                 limiter
@@ -1047,6 +1148,16 @@ pub(super) async fn translate_chunk(
                             false,
                         );
                     }
+                    report_active_retry(
+                        retry_reporter.as_ref(),
+                        &chunk,
+                        attempt,
+                        max_retries,
+                        last_error
+                            .as_deref()
+                            .unwrap_or("Interrupted by finish reason"),
+                    )
+                    .await;
                     continue;
                 }
                 if text.trim().is_empty() {
@@ -1079,6 +1190,16 @@ pub(super) async fn translate_chunk(
                             false,
                         );
                     }
+                    report_active_retry(
+                        retry_reporter.as_ref(),
+                        &chunk,
+                        attempt,
+                        max_retries,
+                        last_error
+                            .as_deref()
+                            .unwrap_or("Model returned empty content"),
+                    )
+                    .await;
                     continue;
                 }
                 if text.trim() == chunk.source_text.trim() && !chunk.source_text.trim().is_empty() {
@@ -1111,6 +1232,16 @@ pub(super) async fn translate_chunk(
                             false,
                         );
                     }
+                    report_active_retry(
+                        retry_reporter.as_ref(),
+                        &chunk,
+                        attempt,
+                        max_retries,
+                        last_error
+                            .as_deref()
+                            .unwrap_or("Model returned unchanged source text"),
+                    )
+                    .await;
                     continue;
                 }
                 let translated_text = match restore_chunk_for_map(&chunk.map_json, &text) {
@@ -1146,6 +1277,16 @@ pub(super) async fn translate_chunk(
                                 false,
                             );
                         }
+                        report_active_retry(
+                            retry_reporter.as_ref(),
+                            &chunk,
+                            attempt,
+                            max_retries,
+                            last_error
+                                .as_deref()
+                                .unwrap_or("Placeholder restore failed"),
+                        )
+                        .await;
                         continue;
                     }
                 };
@@ -1230,6 +1371,14 @@ pub(super) async fn translate_chunk(
                         false,
                     );
                 }
+                report_active_retry(
+                    retry_reporter.as_ref(),
+                    &chunk,
+                    attempt,
+                    max_retries,
+                    last_error.as_deref().unwrap_or("Provider request failed"),
+                )
+                .await;
                 let base_delay = transient_retry_base_delay_ms(&error, attempt);
                 let sleep_ms = retry_delay_with_jitter_ms(base_delay);
                 log_chunk_issue(
@@ -1242,7 +1391,12 @@ pub(super) async fn translate_chunk(
                         "transient provider error backoff_ms={sleep_ms} base_backoff_ms={base_delay}"
                     ),
                 );
-                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+                    _ = interrupt.cancelled() => {
+                        return interrupted_outcome(chunk, retry_count, interrupt.reason());
+                    }
+                }
             }
         }
     }
@@ -1326,6 +1480,25 @@ fn failed_outcome(
     }
 }
 
+fn interrupted_outcome(
+    chunk: ChunkRecord,
+    retry_count: i64,
+    reason: Option<String>,
+) -> ChunkOutcome {
+    ChunkOutcome {
+        chunk_id: chunk.id,
+        status: TranslationChunkStatus::Interrupted,
+        interrupt_task: false,
+        after_translate_text: String::new(),
+        translated_text: String::new(),
+        retry_count,
+        error_message: reason.or_else(|| Some("Task paused".to_string())),
+        token_stats: TokenStats::default(),
+        rate_limit_status: None,
+        confidence: None,
+    }
+}
+
 fn token_stats_from_response(
     response: &crate::domain::UnifiedChatResponse,
     source_text: &str,
@@ -1358,13 +1531,16 @@ pub async fn mark_task_failed_after_runtime_error(
     error: String,
 ) -> Result<TranslationTaskView, String> {
     let inp_pool = connect_inp(inp_path).await?;
-    sqlx::query("UPDATE metadata SET status = ?, last_error = ?, updated_at = ?")
-        .bind(TranslationTaskStatus::Failed.as_str())
-        .bind(error)
-        .bind(unix_timestamp())
-        .execute(&inp_pool)
-        .await
-        .map_err(|error| error.to_string())?;
+    sqlx::query(
+        "UPDATE metadata
+         SET status = ?, last_error = ?, active_retry_json = NULL, updated_at = ?",
+    )
+    .bind(TranslationTaskStatus::Failed.as_str())
+    .bind(error)
+    .bind(unix_timestamp())
+    .execute(&inp_pool)
+    .await
+    .map_err(|error| error.to_string())?;
     let stats = aggregate_chunk_stats(&inp_pool).await?;
     let metadata = metadata_task(&inp_pool, inp_path).await?;
     let glossary_config = task_glossary_config(&inp_pool).await?;

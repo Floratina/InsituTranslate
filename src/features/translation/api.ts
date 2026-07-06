@@ -126,6 +126,10 @@ export function getTranslationTaskDetail(
   return invoke<TranslationTaskDetail>("get_translation_task_detail", { id });
 }
 
+export function getTranslationTaskSummary(id: string): Promise<TranslationTaskView> {
+  return invoke<TranslationTaskView>("get_translation_task_summary", { id });
+}
+
 export function getTranslationConfig(): Promise<TranslationConfigView> {
   return invoke<TranslationConfigView>("get_translation_config");
 }

@@ -22,6 +22,7 @@ export function formatErrorRate(value: number): string {
 export function statusLabel(status: TranslationTaskStatus): string {
   const labels: Record<TranslationTaskStatus, string> = {
     pending: "待开始",
+    queued: "排队中",
     running: "进行中",
     "interrupted-pending": "正在中断",
     interrupted: "中断",
@@ -166,6 +167,12 @@ export function taskStatusMessage(task: TranslationTaskView): TaskStatusMessage 
   if (task.status === "running" && task.progressDetail?.translating) {
     return {
       text: task.progressDetail.translating.label,
+      severity: "muted",
+    };
+  }
+  if (task.status === "queued") {
+    return {
+      text: "排队中，等待当前任务完成",
       severity: "muted",
     };
   }

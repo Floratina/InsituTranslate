@@ -18,6 +18,7 @@ use super::{
 #[serde(rename_all = "kebab-case")]
 pub enum TranslationTaskStatus {
     Pending,
+    Queued,
     Running,
     InterruptedPending,
     Interrupted,
@@ -29,6 +30,7 @@ impl TranslationTaskStatus {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Queued => "queued",
             Self::Running => "running",
             Self::InterruptedPending => "interrupted-pending",
             Self::Interrupted => "interrupted",
@@ -40,6 +42,7 @@ impl TranslationTaskStatus {
     pub(super) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "pending" => Ok(Self::Pending),
+            "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
             "interrupted-pending" => Ok(Self::InterruptedPending),
             "interrupted" => Ok(Self::Interrupted),
@@ -279,14 +282,12 @@ pub struct TokenStats {
     pub total_tokens: u64,
 }
 
-impl TokenStats {
-    pub(super) fn add(&mut self, other: &TokenStats) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cached_tokens += other.cached_tokens;
-        self.thinking_tokens += other.thinking_tokens;
-        self.total_tokens += other.total_tokens;
-    }
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextTokenStats {
+    pub source_tokens: u64,
+    pub target_tokens: u64,
+    pub total_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +496,7 @@ pub struct TranslationTaskView {
     pub failed_chunks: i64,
     pub interrupted_chunks: i64,
     pub token_stats: TokenStats,
+    pub text_token_stats: TextTokenStats,
     pub error_rate: f64,
     pub last_error: Option<String>,
     pub rate_limit_status: Option<String>,
@@ -519,6 +521,7 @@ pub struct TranslationChunkView {
     pub retry_count: i64,
     pub error_message: Option<String>,
     pub token_stats: TokenStats,
+    pub text_token_stats: TextTokenStats,
     pub updated_at: String,
 }
 

@@ -1,8 +1,6 @@
 import { Loader2 } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
 
 import { Progress } from "@/components/ui/progress";
-import { APP_MOTION_EASE } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 
 import {
@@ -15,7 +13,7 @@ import type {
   TranslationTaskView,
 } from "./types";
 
-type TaskStatsLineMode = "normal" | "retry" | "failed" | "interrupted";
+type TaskStatsLineMode = "normal" | "retry" | "failed" | "interrupted" | "queued";
 type TaskStatsLineSeverity = "muted" | "warning" | "danger";
 
 interface TaskStatsLine {
@@ -27,11 +25,6 @@ interface TaskStatsLine {
 interface TaskStatsCellProps {
   task: TranslationTaskView;
 }
-
-const lineTransition = {
-  duration: 0.15,
-  ease: APP_MOTION_EASE,
-} as const;
 
 function liveTaskStatus(status: TranslationTaskStatus): boolean {
   return status === "running" || status === "interrupted-pending";
@@ -62,6 +55,14 @@ function taskStatsLine(task: TranslationTaskView): TaskStatsLine {
     };
   }
 
+  if (task.status === "queued") {
+    return {
+      mode: "queued",
+      text: status.text || "排队中，等待当前任务完成",
+      severity: "muted",
+    };
+  }
+
   if (task.activeRetry) {
     return {
       mode: "retry",
@@ -87,22 +88,16 @@ export function TaskStatsCell({ task }: TaskStatsCellProps) {
           <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />
         )}
         <div className="relative h-4 min-w-0 flex-1 overflow-hidden">
-          <AnimatePresence initial={false} mode="wait">
-            <motion.div
-              key={line.mode}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={lineTransition}
-              className={cn(
-                "absolute inset-x-0 top-0 truncate text-2xs leading-4",
-                taskStatsLineClass(line.severity),
-              )}
-              title={line.text}
-            >
-              {line.text}
-            </motion.div>
-          </AnimatePresence>
+          <div
+            key={line.mode}
+            className={cn(
+              "absolute inset-x-0 top-0 truncate text-2xs leading-4 transition-colors duration-150",
+              taskStatsLineClass(line.severity),
+            )}
+            title={line.text}
+          >
+            {line.text}
+          </div>
         </div>
       </div>
       <div className="flex min-w-0 items-center gap-2">

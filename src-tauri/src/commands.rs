@@ -35,8 +35,9 @@ use crate::translation_tasks::{
     ProgressStep, RunMode, StartTranslationTaskCreationResult, TranslationConfigView,
     TranslationInterrupt, TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
     TranslationTaskCreationStatus, TranslationTaskDetail, TranslationTaskFilters,
-    TranslationTaskIdsInput, TranslationTaskView, UpdateTranslationConfigInput,
-    UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
+    TranslationTaskIdsInput, TranslationTaskStatus, TranslationTaskView,
+    UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput,
+    UpdateTranslationTaskTagsInput,
 };
 
 #[derive(Debug, Clone)]
@@ -663,6 +664,14 @@ pub async fn get_translation_task_detail(
 }
 
 #[tauri::command]
+pub async fn get_translation_task_summary(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TranslationTaskView, String> {
+    translation_tasks::get_translation_task_summary(&state.translation_config_pool, &id).await
+}
+
+#[tauri::command]
 pub async fn delete_translation_task(state: State<'_, AppState>, id: String) -> Result<(), String> {
     if state
         .running_translation_task
@@ -785,12 +794,56 @@ pub async fn start_translation_tasks_batch(
     state
         .translation_batch_cancel
         .store(false, Ordering::SeqCst);
-    let tasks = translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
-        .await?
-        .into_iter()
-        .filter(|task| input.ids.iter().any(|id| id == &task.id))
-        .collect::<Vec<_>>();
-    let ids = input.ids;
+    let requested_ids = input.ids;
+    let task_by_id =
+        translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
+            .await?
+            .into_iter()
+            .filter(|task| {
+                matches!(
+                    task.status,
+                    TranslationTaskStatus::Pending | TranslationTaskStatus::Interrupted
+                )
+            })
+            .map(|task| (task.id.clone(), task))
+            .collect::<HashMap<_, _>>();
+    let mut queue = Vec::new();
+    let mut queued_tasks = Vec::new();
+    for id in requested_ids {
+        let Some(task) = task_by_id.get(&id).cloned() else {
+            continue;
+        };
+        let mode = match task.status {
+            TranslationTaskStatus::Pending => RunMode::Start,
+            TranslationTaskStatus::Interrupted => RunMode::Resume,
+            _ => continue,
+        };
+        match translation_tasks::mark_task_queued(
+            &app,
+            &state.translation_config_pool,
+            &state.translation_workspace_root,
+            &task.id,
+            task.status,
+        )
+        .await
+        {
+            Ok(queued) => queued_tasks.push(queued),
+            Err(error) => {
+                let queued_ids = queued_tasks
+                    .iter()
+                    .map(|task| task.id.clone())
+                    .collect::<Vec<_>>();
+                let _ = translation_tasks::restore_queued_tasks(
+                    &app,
+                    &state.translation_config_pool,
+                    &queued_ids,
+                )
+                .await;
+                return Err(error);
+            }
+        }
+        queue.push((task.id, mode));
+    }
     let provider_pool = state.pool.clone();
     let config_pool = state.translation_config_pool.clone();
     let glossary_config_pool = state.glossary_config_pool.clone();
@@ -801,42 +854,37 @@ pub async fn start_translation_tasks_batch(
     let cancel = state.translation_batch_cancel.clone();
     tauri::async_runtime::spawn(async move {
         let backend_log = crate::diagnostics::BackendLog::from_app(&app).ok();
-        for id in ids {
+        for (index, (id, mode)) in queue.iter().cloned().enumerate() {
             if cancel.load(Ordering::SeqCst) {
+                let remaining = queue[index..]
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                let _ =
+                    translation_tasks::restore_queued_tasks(&app, &config_pool, &remaining).await;
                 break;
             }
-            let indexed = match translation_tasks::list_translation_tasks(&config_pool, None).await
-            {
-                Ok(tasks) => tasks.into_iter().find(|task| task.id == id),
-                Err(error) => {
-                    if let Some(log) = &backend_log {
-                        log.write(
-                            "ERROR",
-                            "translation",
-                            format!("Batch task id={id} list lookup failed: {error}"),
-                        );
-                    }
-                    continue;
-                }
-            };
-            let Some(indexed) = indexed else {
-                continue;
-            };
-            let mode = match indexed.status {
-                translation_tasks::TranslationTaskStatus::Pending => RunMode::Start,
-                translation_tasks::TranslationTaskStatus::Interrupted => RunMode::Resume,
-                _ => continue,
-            };
             let interrupt = TranslationInterrupt::new();
-            {
+            let blocked_by_running = {
                 let mut guard = running.lock().await;
                 if guard.is_some() {
-                    break;
+                    true
+                } else {
+                    *guard = Some(RunningTranslationTask {
+                        id: id.clone(),
+                        interrupt: interrupt.clone(),
+                    });
+                    false
                 }
-                *guard = Some(RunningTranslationTask {
-                    id: id.clone(),
-                    interrupt: interrupt.clone(),
-                });
+            };
+            if blocked_by_running {
+                let remaining = queue[index..]
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                let _ =
+                    translation_tasks::restore_queued_tasks(&app, &config_pool, &remaining).await;
+                break;
             }
             let prepared = match translation_tasks::prepare_translation_run(
                 &app,
@@ -862,6 +910,10 @@ pub async fn start_translation_tasks_batch(
                     if guard.as_ref().is_some_and(|current| current.id == id) {
                         *guard = None;
                     }
+                    drop(guard);
+                    let _ =
+                        translation_tasks::restore_queued_tasks(&app, &config_pool, &[id.clone()])
+                            .await;
                     continue;
                 }
             };
@@ -898,7 +950,7 @@ pub async fn start_translation_tasks_batch(
             }
         }
     });
-    Ok(tasks)
+    Ok(queued_tasks)
 }
 
 #[tauri::command]
@@ -919,15 +971,46 @@ pub async fn retranslate_translation_tasks_batch(
     state
         .translation_batch_cancel
         .store(false, Ordering::SeqCst);
-    let tasks = translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
-        .await?
-        .into_iter()
-        .filter(|task| {
-            task.status == translation_tasks::TranslationTaskStatus::Success
-                && input.ids.iter().any(|id| id == &task.id)
-        })
-        .collect::<Vec<_>>();
-    let ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
+    let requested_ids = input.ids;
+    let task_by_id =
+        translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
+            .await?
+            .into_iter()
+            .filter(|task| task.status == TranslationTaskStatus::Success)
+            .map(|task| (task.id.clone(), task))
+            .collect::<HashMap<_, _>>();
+    let mut queue = Vec::new();
+    let mut queued_tasks = Vec::new();
+    for id in requested_ids {
+        let Some(task) = task_by_id.get(&id).cloned() else {
+            continue;
+        };
+        match translation_tasks::mark_task_queued(
+            &app,
+            &state.translation_config_pool,
+            &state.translation_workspace_root,
+            &task.id,
+            task.status,
+        )
+        .await
+        {
+            Ok(queued) => queued_tasks.push(queued),
+            Err(error) => {
+                let queued_ids = queued_tasks
+                    .iter()
+                    .map(|task| task.id.clone())
+                    .collect::<Vec<_>>();
+                let _ = translation_tasks::restore_queued_tasks(
+                    &app,
+                    &state.translation_config_pool,
+                    &queued_ids,
+                )
+                .await;
+                return Err(error);
+            }
+        }
+        queue.push((task.id, RunMode::Retranslate));
+    }
     let provider_pool = state.pool.clone();
     let config_pool = state.translation_config_pool.clone();
     let glossary_config_pool = state.glossary_config_pool.clone();
@@ -938,20 +1021,37 @@ pub async fn retranslate_translation_tasks_batch(
     let cancel = state.translation_batch_cancel.clone();
     tauri::async_runtime::spawn(async move {
         let backend_log = crate::diagnostics::BackendLog::from_app(&app).ok();
-        for id in ids {
+        for (index, (id, mode)) in queue.iter().cloned().enumerate() {
             if cancel.load(Ordering::SeqCst) {
+                let remaining = queue[index..]
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                let _ =
+                    translation_tasks::restore_queued_tasks(&app, &config_pool, &remaining).await;
                 break;
             }
             let interrupt = TranslationInterrupt::new();
-            {
+            let blocked_by_running = {
                 let mut guard = running.lock().await;
                 if guard.is_some() {
-                    break;
+                    true
+                } else {
+                    *guard = Some(RunningTranslationTask {
+                        id: id.clone(),
+                        interrupt: interrupt.clone(),
+                    });
+                    false
                 }
-                *guard = Some(RunningTranslationTask {
-                    id: id.clone(),
-                    interrupt: interrupt.clone(),
-                });
+            };
+            if blocked_by_running {
+                let remaining = queue[index..]
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                let _ =
+                    translation_tasks::restore_queued_tasks(&app, &config_pool, &remaining).await;
+                break;
             }
             let prepared = match translation_tasks::prepare_translation_run(
                 &app,
@@ -960,7 +1060,7 @@ pub async fn retranslate_translation_tasks_batch(
                 &config_pool,
                 &workspace_root,
                 &id,
-                RunMode::Retranslate,
+                mode,
             )
             .await
             {
@@ -977,6 +1077,10 @@ pub async fn retranslate_translation_tasks_batch(
                     if guard.as_ref().is_some_and(|current| current.id == id) {
                         *guard = None;
                     }
+                    drop(guard);
+                    let _ =
+                        translation_tasks::restore_queued_tasks(&app, &config_pool, &[id.clone()])
+                            .await;
                     continue;
                 }
             };
@@ -1013,7 +1117,7 @@ pub async fn retranslate_translation_tasks_batch(
             }
         }
     });
-    Ok(tasks)
+    Ok(queued_tasks)
 }
 
 #[tauri::command]
@@ -1038,6 +1142,15 @@ pub async fn pause_translation_tasks_batch(
         .await?;
         interrupt.interrupt("Task paused");
     }
+    let queued_ids =
+        translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
+            .await?
+            .into_iter()
+            .filter(|task| task.status == TranslationTaskStatus::Queued)
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+    translation_tasks::restore_queued_tasks(&app, &state.translation_config_pool, &queued_ids)
+        .await?;
     Ok(())
 }
 

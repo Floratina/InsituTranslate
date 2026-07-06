@@ -242,7 +242,7 @@ pub async fn prepare_translation_run(
                  SET status = ?, after_translate_text = '', translated_text = '',
                      retry_count = 0, error_message = NULL, confidence = NULL,
                      input_tokens = 0, output_tokens = 0, cached_tokens = 0,
-                     thinking_tokens = 0, total_tokens = 0, updated_at = ?
+                     thinking_tokens = 0, total_tokens = 0, target_tokens = 0, updated_at = ?
                  WHERE status IN (?, ?)",
             )
             .bind(TranslationChunkStatus::Pending.as_str())
@@ -316,7 +316,7 @@ pub async fn prepare_translation_run(
         "UPDATE metadata
          SET status = ?, token_limit = ?, max_concurrency = ?, max_retries = ?,
              config_snapshot_json = ?, last_error = NULL, rate_limit_status = NULL,
-             active_retry_json = NULL, updated_at = ?
+             active_retry_json = NULL, queued_from_status = NULL, updated_at = ?
          WHERE task_id = ?",
     )
     .bind(TranslationTaskStatus::Running.as_str())
@@ -403,12 +403,14 @@ async fn rebuild_chunks_for_retranslate(
     insert_assets(&mut transaction, &parsed_source.assets, now).await?;
     let total_chunks = parsed_source.chunks.len() as u64;
     for chunk in parsed_source.chunks {
+        let source_tokens = estimate_tokens(&chunk.source_text) as i64;
         sqlx::query(
             "INSERT INTO chunks (
                 id, sequence, map_json, preprocessed_text, source_text,
                 after_translate_text, translated_text, status, retry_count,
-                input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens, updated_at
-             ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?)",
+                input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens,
+                source_tokens, target_tokens, updated_at
+             ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?, 0, ?)",
         )
         .bind(format!("{}_chunk_{:06}", indexed.id, chunk.sequence))
         .bind(chunk.sequence)
@@ -416,6 +418,7 @@ async fn rebuild_chunks_for_retranslate(
         .bind(chunk.preprocessed_text)
         .bind(chunk.source_text)
         .bind(TranslationChunkStatus::Pending.as_str())
+        .bind(source_tokens)
         .bind(now)
         .execute(&mut *transaction)
         .await
@@ -901,7 +904,9 @@ async fn finalize_translation_run(
         TranslationTaskStatus::Success => "INFO",
         TranslationTaskStatus::Interrupted | TranslationTaskStatus::InterruptedPending => "WARN",
         TranslationTaskStatus::Failed => "ERROR",
-        TranslationTaskStatus::Pending | TranslationTaskStatus::Running => "INFO",
+        TranslationTaskStatus::Pending
+        | TranslationTaskStatus::Queued
+        | TranslationTaskStatus::Running => "INFO",
     };
     write_translation_log(
         backend_log,
@@ -1533,7 +1538,7 @@ pub async fn mark_task_failed_after_runtime_error(
     let inp_pool = connect_inp(inp_path).await?;
     sqlx::query(
         "UPDATE metadata
-         SET status = ?, last_error = ?, active_retry_json = NULL, updated_at = ?",
+         SET status = ?, last_error = ?, active_retry_json = NULL, queued_from_status = NULL, updated_at = ?",
     )
     .bind(TranslationTaskStatus::Failed.as_str())
     .bind(error)

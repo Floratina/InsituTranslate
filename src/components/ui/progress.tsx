@@ -1,8 +1,6 @@
 import * as React from "react"
 import { Progress as ProgressPrimitive } from "radix-ui"
-import { motion } from "motion/react"
 
-import { CONTROLLED_STATE_MOTION_PROPS } from "@/lib/motion"
 import { cn } from "@/lib/utils"
 
 function Progress({
@@ -23,10 +21,9 @@ function Progress({
         data-slot="progress-indicator"
         asChild
       >
-        <motion.div
-          {...CONTROLLED_STATE_MOTION_PROPS}
-          className="size-full flex-1 origin-left bg-primary"
-          animate={{ scaleX: Math.max(0, Math.min(100, value ?? 0)) / 100 }}
+        <div
+          className="size-full flex-1 origin-left bg-primary transition-transform duration-200 ease-out will-change-transform"
+          style={{ transform: `scaleX(${Math.max(0, Math.min(100, value ?? 0)) / 100})` }}
         />
       </ProgressPrimitive.Indicator>
     </ProgressPrimitive.Root>

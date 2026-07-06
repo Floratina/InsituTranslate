@@ -22,8 +22,8 @@ use crate::pdf_parsing::{self, PdfAsset, PdfParsingMode};
 use crate::task_prompt::{ContentFormat, DocumentFormat};
 
 use super::context::{
-    display_name_from_path, global_background_from_texts, next_inp_path, sanitize_file_stem,
-    unix_timestamp,
+    display_name_from_path, estimate_tokens, global_background_from_texts, next_inp_path,
+    sanitize_file_stem, unix_timestamp,
 };
 use super::types::{
     ChunkOutcome, ChunkRecord, ProgressDetail, ProgressStep, TaskGlossaryConfig,
@@ -32,15 +32,15 @@ use super::types::{
 };
 use super::{
     ContextHandlingMode, CreateTranslationTaskInput, ExportTranslationTaskInput, GlossaryMode,
-    ImportTranslationTaskInput, RateLimitStrategy, TokenStats, TranslationChunkStatus,
-    TranslationChunkView, TranslationConfigView, TranslationProgressPayload,
-    TranslationTaskActiveRetry, TranslationTaskDetail, TranslationTaskExportFormat,
-    TranslationTaskFilters, TranslationTaskStatus, TranslationTaskView,
-    UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput,
-    UpdateTranslationTaskTagsInput, CONFIG_DB_FILE, DEFAULT_CHUNK_TOKEN_LIMIT,
-    DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_MAX_RETRIES,
-    DEFAULT_MAX_TOKENS_PER_MINUTE, INP_FILE_DAMAGED, INP_SCHEMA_VERSION, MAX_TASK_NAME_LENGTH,
-    MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH, SOURCE_FILE_UNAVAILABLE, TASKS_DIR,
+    ImportTranslationTaskInput, RateLimitStrategy, TextTokenStats, TokenStats,
+    TranslationChunkStatus, TranslationChunkView, TranslationConfigView,
+    TranslationProgressPayload, TranslationTaskActiveRetry, TranslationTaskDetail,
+    TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskStatus,
+    TranslationTaskView, UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput,
+    UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput, CONFIG_DB_FILE,
+    DEFAULT_CHUNK_TOKEN_LIMIT, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE,
+    DEFAULT_MAX_RETRIES, DEFAULT_MAX_TOKENS_PER_MINUTE, INP_FILE_DAMAGED, INP_SCHEMA_VERSION,
+    MAX_TASK_NAME_LENGTH, MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH, SOURCE_FILE_UNAVAILABLE, TASKS_DIR,
     TRANSLATION_PROGRESS_EVENT, TRANSLATION_TASK_CREATION_PROGRESS_EVENT,
 };
 
@@ -169,11 +169,15 @@ async fn migrate_config_db(pool: &SqlitePool) -> Result<(), String> {
             cached_tokens INTEGER NOT NULL DEFAULT 0,
             thinking_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            source_text_tokens INTEGER NOT NULL DEFAULT 0,
+            target_text_tokens INTEGER NOT NULL DEFAULT 0,
+            total_text_tokens INTEGER NOT NULL DEFAULT 0,
             error_rate REAL NOT NULL DEFAULT 0,
             last_error TEXT,
             rate_limit_status TEXT,
             active_retry_json TEXT,
             progress_detail_json TEXT,
+            queued_from_status TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )"#,
@@ -235,6 +239,28 @@ async fn migrate_config_db(pool: &SqlitePool) -> Result<(), String> {
     .await?;
     add_column_if_missing(pool, "task_index", "active_retry_json", "TEXT").await?;
     add_column_if_missing(pool, "task_index", "progress_detail_json", "TEXT").await?;
+    add_column_if_missing(
+        pool,
+        "task_index",
+        "source_text_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "task_index",
+        "target_text_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "task_index",
+        "total_text_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(pool, "task_index", "queued_from_status", "TEXT").await?;
     sqlx::query(
         "INSERT INTO translation_config (
             id, chunk_token_limit, max_concurrency, max_retries, rate_limit_strategy,
@@ -525,6 +551,20 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
             .unwrap_or(None);
         parse_active_retry_json(active_retry_json).map_err(|_| INP_FILE_DAMAGED.to_string())?;
     }
+    if schema_version >= 10 {
+        require_columns(
+            pool,
+            "metadata",
+            &[
+                "source_text_tokens",
+                "target_text_tokens",
+                "total_text_tokens",
+                "queued_from_status",
+            ],
+        )
+        .await?;
+        require_columns(pool, "chunks", &["source_tokens", "target_tokens"]).await?;
+    }
     TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     parse_tags_json(row.get("tags_json")).map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -571,21 +611,40 @@ async fn require_columns(
 }
 
 async fn recover_running_tasks(config_pool: &SqlitePool) -> Result<(), String> {
-    let rows = sqlx::query("SELECT id, inp_path FROM task_index WHERE status IN (?, ?)")
-        .bind(TranslationTaskStatus::Running.as_str())
-        .bind(TranslationTaskStatus::InterruptedPending.as_str())
-        .fetch_all(config_pool)
-        .await
-        .map_err(|error| error.to_string())?;
+    let rows = sqlx::query(
+        "SELECT id, inp_path, status, queued_from_status FROM task_index WHERE status IN (?, ?, ?)",
+    )
+    .bind(TranslationTaskStatus::Running.as_str())
+    .bind(TranslationTaskStatus::InterruptedPending.as_str())
+    .bind(TranslationTaskStatus::Queued.as_str())
+    .fetch_all(config_pool)
+    .await
+    .map_err(|error| error.to_string())?;
     let now = unix_timestamp();
     for row in rows {
         let id: String = row.get("id");
         let inp_path: String = row.get("inp_path");
+        let status = TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())?;
+        let queued_from_status = row
+            .try_get::<Option<String>, _>("queued_from_status")
+            .unwrap_or(None)
+            .and_then(|value| TranslationTaskStatus::parse(&value).ok());
+        let (next_status, message) = if status == TranslationTaskStatus::Queued {
+            (
+                queued_from_status.unwrap_or(TranslationTaskStatus::Pending),
+                "Application closed while the task was queued",
+            )
+        } else {
+            (
+                TranslationTaskStatus::Interrupted,
+                "Application closed while the task was running",
+            )
+        };
         sqlx::query(
-            "UPDATE task_index SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
+            "UPDATE task_index SET status = ?, queued_from_status = NULL, last_error = ?, updated_at = ? WHERE id = ?",
         )
-        .bind(TranslationTaskStatus::Interrupted.as_str())
-        .bind("Application closed while the task was running")
+        .bind(next_status.as_str())
+        .bind(message)
         .bind(&now)
         .bind(&id)
         .execute(config_pool)
@@ -593,10 +652,10 @@ async fn recover_running_tasks(config_pool: &SqlitePool) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
         if let Ok(inp_pool) = connect_inp(Path::new(&inp_path)).await {
             let _ = sqlx::query(
-                "UPDATE metadata SET status = ?, last_error = ?, updated_at = ? WHERE task_id = ?",
+                "UPDATE metadata SET status = ?, queued_from_status = NULL, last_error = ?, updated_at = ? WHERE task_id = ?",
             )
-            .bind(TranslationTaskStatus::Interrupted.as_str())
-            .bind("Application closed while the task was running")
+            .bind(next_status.as_str())
+            .bind(message)
             .bind(&now)
             .bind(&id)
             .execute(&inp_pool)
@@ -642,11 +701,15 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             cached_tokens INTEGER NOT NULL DEFAULT 0,
             thinking_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            source_text_tokens INTEGER NOT NULL DEFAULT 0,
+            target_text_tokens INTEGER NOT NULL DEFAULT 0,
+            total_text_tokens INTEGER NOT NULL DEFAULT 0,
             error_rate REAL NOT NULL DEFAULT 0,
             last_error TEXT,
             rate_limit_status TEXT,
             active_retry_json TEXT,
             progress_detail_json TEXT,
+            queued_from_status TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )"#,
@@ -667,6 +730,8 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             cached_tokens INTEGER NOT NULL DEFAULT 0,
             thinking_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            source_tokens INTEGER NOT NULL DEFAULT 0,
+            target_tokens INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         )"#,
         r#"CREATE TABLE IF NOT EXISTS assets (
@@ -717,6 +782,28 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
     add_column_if_missing(pool, "metadata", "global_background", "TEXT").await?;
     add_column_if_missing(pool, "metadata", "active_retry_json", "TEXT").await?;
     add_column_if_missing(pool, "metadata", "progress_detail_json", "TEXT").await?;
+    add_column_if_missing(
+        pool,
+        "metadata",
+        "source_text_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "metadata",
+        "target_text_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "metadata",
+        "total_text_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(pool, "metadata", "queued_from_status", "TEXT").await?;
     add_column_if_missing(pool, "chunks", "map_json", "TEXT NOT NULL DEFAULT '{}'").await?;
     add_column_if_missing(
         pool,
@@ -733,12 +820,65 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
     )
     .await?;
     add_column_if_missing(pool, "chunks", "confidence", "REAL DEFAULT NULL").await?;
+    add_column_if_missing(
+        pool,
+        "chunks",
+        "source_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "chunks",
+        "target_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    backfill_chunk_text_tokens(pool).await?;
     sqlx::query("UPDATE metadata SET schema_version = ? WHERE schema_version < ?")
         .bind(INP_SCHEMA_VERSION)
         .bind(INP_SCHEMA_VERSION)
         .execute(pool)
         .await
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn backfill_chunk_text_tokens(pool: &SqlitePool) -> Result<(), String> {
+    let rows = sqlx::query(
+        "SELECT id, status, source_text, translated_text, source_tokens, target_tokens FROM chunks
+         WHERE source_tokens = 0 OR (status = ? AND target_tokens = 0)",
+    )
+    .bind(TranslationChunkStatus::Success.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    for row in rows {
+        let id: String = row.get("id");
+        let status = TranslationChunkStatus::parse(row.get::<String, _>("status").as_str())?;
+        let source_tokens = if row.get::<i64, _>("source_tokens") > 0 {
+            row.get::<i64, _>("source_tokens")
+        } else {
+            estimate_tokens(row.get::<String, _>("source_text").as_str()) as i64
+        };
+        let target_tokens = if status == TranslationChunkStatus::Success {
+            let stored = row.get::<i64, _>("target_tokens");
+            if stored > 0 {
+                stored
+            } else {
+                estimate_tokens(row.get::<String, _>("translated_text").as_str()) as i64
+            }
+        } else {
+            0
+        };
+        sqlx::query("UPDATE chunks SET source_tokens = ?, target_tokens = ? WHERE id = ?")
+            .bind(source_tokens)
+            .bind(target_tokens)
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -1301,12 +1441,14 @@ pub async fn create_translation_task(
     insert_assets(&mut transaction, &parsed_source.assets, &created_at).await?;
 
     for chunk in parsed_source.chunks {
+        let source_tokens = estimate_tokens(&chunk.source_text) as i64;
         sqlx::query(
             "INSERT INTO chunks (
                 id, sequence, map_json, preprocessed_text, source_text,
                 after_translate_text, translated_text, status, retry_count,
-                input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens, updated_at
-             ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?)",
+                input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens,
+                source_tokens, target_tokens, updated_at
+             ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?, 0, ?)",
         )
         .bind(format!("{task_id}_chunk_{:06}", chunk.sequence))
         .bind(chunk.sequence)
@@ -1314,6 +1456,7 @@ pub async fn create_translation_task(
         .bind(chunk.preprocessed_text)
         .bind(chunk.source_text)
         .bind(TranslationChunkStatus::Pending.as_str())
+        .bind(source_tokens)
         .bind(&created_at)
         .execute(&mut *transaction)
         .await
@@ -1666,25 +1809,26 @@ pub async fn create_translation_task_with_progress(
     try_creation!(insert_assets(&mut transaction, &parsed_source.assets, &created_at).await);
 
     for chunk in parsed_source.chunks {
-        try_creation!(
-            sqlx::query(
-                "INSERT INTO chunks (
+        let source_tokens = estimate_tokens(&chunk.source_text) as i64;
+        try_creation!(sqlx::query(
+            "INSERT INTO chunks (
                     id, sequence, map_json, preprocessed_text, source_text,
                     after_translate_text, translated_text, status, retry_count,
-                    input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens, updated_at
-                 ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?)",
-            )
-            .bind(format!("{task_id}_chunk_{:06}", chunk.sequence))
-            .bind(chunk.sequence)
-            .bind(chunk.map_json)
-            .bind(chunk.preprocessed_text)
-            .bind(chunk.source_text)
-            .bind(TranslationChunkStatus::Pending.as_str())
-            .bind(&created_at)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| error.to_string())
-        );
+                    input_tokens, output_tokens, cached_tokens, thinking_tokens, total_tokens,
+                    source_tokens, target_tokens, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, '', '', ?, 0, 0, 0, 0, 0, 0, ?, 0, ?)",
+        )
+        .bind(format!("{task_id}_chunk_{:06}", chunk.sequence))
+        .bind(chunk.sequence)
+        .bind(chunk.map_json)
+        .bind(chunk.preprocessed_text)
+        .bind(chunk.source_text)
+        .bind(TranslationChunkStatus::Pending.as_str())
+        .bind(source_tokens)
+        .bind(&created_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string()));
     }
     try_creation!(transaction
         .commit()
@@ -2064,6 +2208,119 @@ pub async fn get_translation_task_detail(
     Ok(TranslationTaskDetail { task, chunks })
 }
 
+pub async fn get_translation_task_summary(
+    config_pool: &SqlitePool,
+    id: &str,
+) -> Result<TranslationTaskView, String> {
+    get_task_from_index(config_pool, id).await
+}
+
+pub async fn mark_task_queued(
+    app: &AppHandle,
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    id: &str,
+    from_status: TranslationTaskStatus,
+) -> Result<TranslationTaskView, String> {
+    let task = get_task_from_index(config_pool, id).await?;
+    let inp_path = PathBuf::from(&task.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
+    let now = unix_timestamp();
+    sqlx::query(
+        "UPDATE task_index
+         SET status = ?, queued_from_status = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(TranslationTaskStatus::Queued.as_str())
+    .bind(from_status.as_str())
+    .bind(&now)
+    .bind(id)
+    .execute(config_pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let inp_pool = connect_inp(&inp_path).await?;
+    sqlx::query(
+        "UPDATE metadata
+         SET status = ?, queued_from_status = ?, updated_at = ?
+         WHERE task_id = ?",
+    )
+    .bind(TranslationTaskStatus::Queued.as_str())
+    .bind(from_status.as_str())
+    .bind(&now)
+    .bind(id)
+    .execute(&inp_pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    inp_pool.close().await;
+    let queued = get_task_from_index(config_pool, id).await?;
+    let _ = app.emit(
+        TRANSLATION_PROGRESS_EVENT,
+        TranslationProgressPayload {
+            task: queued.clone(),
+        },
+    );
+    Ok(queued)
+}
+
+pub async fn restore_queued_tasks(
+    app: &AppHandle,
+    config_pool: &SqlitePool,
+    ids: &[String],
+) -> Result<Vec<TranslationTaskView>, String> {
+    let mut restored = Vec::new();
+    for id in ids {
+        let task = match get_task_from_index(config_pool, id).await {
+            Ok(task) if task.status == TranslationTaskStatus::Queued => task,
+            Ok(_) => continue,
+            Err(error) => return Err(error),
+        };
+        let row = sqlx::query("SELECT queued_from_status FROM task_index WHERE id = ?")
+            .bind(id)
+            .fetch_one(config_pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let next_status = row
+            .try_get::<Option<String>, _>("queued_from_status")
+            .unwrap_or(None)
+            .and_then(|value| TranslationTaskStatus::parse(&value).ok())
+            .unwrap_or(TranslationTaskStatus::Pending);
+        let now = unix_timestamp();
+        sqlx::query(
+            "UPDATE task_index
+             SET status = ?, queued_from_status = NULL, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(next_status.as_str())
+        .bind(&now)
+        .bind(id)
+        .execute(config_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Ok(inp_pool) = connect_inp(Path::new(&task.inp_path)).await {
+            let _ = sqlx::query(
+                "UPDATE metadata
+                 SET status = ?, queued_from_status = NULL, updated_at = ?
+                 WHERE task_id = ?",
+            )
+            .bind(next_status.as_str())
+            .bind(&now)
+            .bind(id)
+            .execute(&inp_pool)
+            .await;
+            inp_pool.close().await;
+        }
+        let task = get_task_from_index(config_pool, id).await?;
+        let _ = app.emit(
+            TRANSLATION_PROGRESS_EVENT,
+            TranslationProgressPayload { task: task.clone() },
+        );
+        restored.push(task);
+    }
+    Ok(restored)
+}
+
 pub async fn mark_task_interrupted_pending(
     app: &AppHandle,
     config_pool: &SqlitePool,
@@ -2122,7 +2379,9 @@ pub async fn delete_translation_task(
     let inp_path = PathBuf::from(&task.inp_path);
     if matches!(
         task.status,
-        TranslationTaskStatus::Running | TranslationTaskStatus::InterruptedPending
+        TranslationTaskStatus::Queued
+            | TranslationTaskStatus::Running
+            | TranslationTaskStatus::InterruptedPending
     ) {
         return Err("Pause the running task before deleting it".into());
     }
@@ -2150,7 +2409,9 @@ pub async fn delete_translation_tasks(
         let task = get_task_from_index(config_pool, id).await?;
         if matches!(
             task.status,
-            TranslationTaskStatus::Running | TranslationTaskStatus::InterruptedPending
+            TranslationTaskStatus::Queued
+                | TranslationTaskStatus::Running
+                | TranslationTaskStatus::InterruptedPending
         ) {
             return Err("请先暂停正在运行的任务".into());
         }
@@ -2165,12 +2426,17 @@ pub(super) async fn apply_chunk_outcome(
     pool: &SqlitePool,
     outcome: ChunkOutcome,
 ) -> Result<(), String> {
+    let target_tokens = if outcome.status == TranslationChunkStatus::Success {
+        estimate_tokens(&outcome.translated_text) as i64
+    } else {
+        0
+    };
     sqlx::query(
         "UPDATE chunks
          SET after_translate_text = ?, translated_text = ?, status = ?, retry_count = ?, error_message = ?,
-             input_tokens = ?, output_tokens = ?, cached_tokens = ?, thinking_tokens = ?,
-             total_tokens = ?, confidence = ?, updated_at = ?
-         WHERE id = ?",
+              input_tokens = ?, output_tokens = ?, cached_tokens = ?, thinking_tokens = ?,
+              total_tokens = ?, target_tokens = ?, confidence = ?, updated_at = ?
+          WHERE id = ?",
     )
     .bind(outcome.after_translate_text)
     .bind(outcome.translated_text)
@@ -2182,6 +2448,7 @@ pub(super) async fn apply_chunk_outcome(
     .bind(outcome.token_stats.cached_tokens as i64)
     .bind(outcome.token_stats.thinking_tokens as i64)
     .bind(outcome.token_stats.total_tokens as i64)
+    .bind(target_tokens)
     .bind(outcome.confidence)
     .bind(unix_timestamp())
     .bind(outcome.chunk_id)
@@ -2275,8 +2542,8 @@ pub(super) async fn finalize_task(
     sqlx::query(
         "UPDATE metadata
          SET status = ?, last_error = COALESCE(?, last_error),
-             rate_limit_status = COALESCE(?, rate_limit_status), active_retry_json = NULL,
-             updated_at = ?
+              rate_limit_status = COALESCE(?, rate_limit_status), active_retry_json = NULL,
+              queued_from_status = NULL, updated_at = ?
          WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
     )
     .bind(status.as_str())
@@ -2308,9 +2575,10 @@ async fn refresh_task_stats_internal(
     sqlx::query(
         "UPDATE metadata
          SET status = ?, progress = ?, total_chunks = ?, completed_chunks = ?,
-             failed_chunks = ?, interrupted_chunks = ?, input_tokens = ?, output_tokens = ?,
-             cached_tokens = ?, thinking_tokens = ?, total_tokens = ?, error_rate = ?, updated_at = ?
-         WHERE task_id = ?",
+              failed_chunks = ?, interrupted_chunks = ?, input_tokens = ?, output_tokens = ?,
+              cached_tokens = ?, thinking_tokens = ?, total_tokens = ?, source_text_tokens = ?,
+              target_text_tokens = ?, total_text_tokens = ?, error_rate = ?, updated_at = ?
+          WHERE task_id = ?",
     )
     .bind(status.as_str())
     .bind(stats.progress)
@@ -2323,6 +2591,9 @@ async fn refresh_task_stats_internal(
     .bind(stats.token_stats.cached_tokens as i64)
     .bind(stats.token_stats.thinking_tokens as i64)
     .bind(stats.token_stats.total_tokens as i64)
+    .bind(stats.text_token_stats.source_tokens as i64)
+    .bind(stats.text_token_stats.target_tokens as i64)
+    .bind(stats.text_token_stats.total_tokens as i64)
     .bind(stats.error_rate)
     .bind(&now)
     .bind(&metadata.id)
@@ -2363,44 +2634,42 @@ pub(super) struct AggregateStats {
     pub(super) progress: f64,
     pub(super) error_rate: f64,
     pub(super) token_stats: TokenStats,
+    pub(super) text_token_stats: TextTokenStats,
 }
 
 pub(super) async fn aggregate_chunk_stats(pool: &SqlitePool) -> Result<AggregateStats, String> {
-    let rows = sqlx::query("SELECT * FROM chunks")
-        .fetch_all(pool)
-        .await
-        .map_err(|error| error.to_string())?;
-    let total_chunks = rows.len() as i64;
-    let mut completed_chunks = 0_i64;
-    let mut failed_chunks = 0_i64;
-    let mut interrupted_chunks = 0_i64;
-    let mut terminal_chunks = 0_i64;
-    let mut token_stats = TokenStats::default();
-    for row in rows {
-        let status = TranslationChunkStatus::parse(row.get::<String, _>("status").as_str())?;
-        match status {
-            TranslationChunkStatus::Success => {
-                completed_chunks += 1;
-                terminal_chunks += 1;
-            }
-            TranslationChunkStatus::Failed => {
-                failed_chunks += 1;
-                terminal_chunks += 1;
-            }
-            TranslationChunkStatus::Interrupted => {
-                interrupted_chunks += 1;
-                terminal_chunks += 1;
-            }
-            TranslationChunkStatus::Pending => {}
-        }
-        token_stats.add(&TokenStats {
-            input_tokens: row.get::<i64, _>("input_tokens").max(0) as u64,
-            output_tokens: row.get::<i64, _>("output_tokens").max(0) as u64,
-            cached_tokens: row.get::<i64, _>("cached_tokens").max(0) as u64,
-            thinking_tokens: row.get::<i64, _>("thinking_tokens").max(0) as u64,
-            total_tokens: row.get::<i64, _>("total_tokens").max(0) as u64,
-        });
-    }
+    let row = sqlx::query(
+        "SELECT
+            COUNT(*) AS total_chunks,
+            COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS completed_chunks,
+            COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS failed_chunks,
+            COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS interrupted_chunks,
+            COALESCE(SUM(CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END), 0) AS terminal_chunks,
+            COALESCE(SUM(input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+            COALESCE(SUM(thinking_tokens), 0) AS thinking_tokens,
+            COALESCE(SUM(total_tokens), 0) AS total_tokens,
+            COALESCE(SUM(source_tokens), 0) AS source_tokens,
+            COALESCE(SUM(target_tokens), 0) AS target_tokens
+         FROM chunks",
+    )
+    .bind(TranslationChunkStatus::Success.as_str())
+    .bind(TranslationChunkStatus::Failed.as_str())
+    .bind(TranslationChunkStatus::Interrupted.as_str())
+    .bind(TranslationChunkStatus::Success.as_str())
+    .bind(TranslationChunkStatus::Failed.as_str())
+    .bind(TranslationChunkStatus::Interrupted.as_str())
+    .fetch_one(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let total_chunks: i64 = row.get("total_chunks");
+    let completed_chunks: i64 = row.get("completed_chunks");
+    let failed_chunks: i64 = row.get("failed_chunks");
+    let interrupted_chunks: i64 = row.get("interrupted_chunks");
+    let terminal_chunks: i64 = row.get("terminal_chunks");
+    let source_tokens = row.get::<i64, _>("source_tokens").max(0) as u64;
+    let target_tokens = row.get::<i64, _>("target_tokens").max(0) as u64;
     let progress = if total_chunks == 0 {
         1.0
     } else {
@@ -2418,7 +2687,18 @@ pub(super) async fn aggregate_chunk_stats(pool: &SqlitePool) -> Result<Aggregate
         interrupted_chunks,
         progress,
         error_rate,
-        token_stats,
+        token_stats: TokenStats {
+            input_tokens: row.get::<i64, _>("input_tokens").max(0) as u64,
+            output_tokens: row.get::<i64, _>("output_tokens").max(0) as u64,
+            cached_tokens: row.get::<i64, _>("cached_tokens").max(0) as u64,
+            thinking_tokens: row.get::<i64, _>("thinking_tokens").max(0) as u64,
+            total_tokens: row.get::<i64, _>("total_tokens").max(0) as u64,
+        },
+        text_token_stats: TextTokenStats {
+            source_tokens,
+            target_tokens,
+            total_tokens: source_tokens + target_tokens,
+        },
     })
 }
 
@@ -2434,9 +2714,10 @@ pub(super) async fn upsert_task_index(
             id, name, inp_path, source_path, source_language, target_language, status, progress,
             provider_id, model_id, model_request_name, assistant_id, tags_json, total_chunks, completed_chunks,
             failed_chunks, interrupted_chunks, input_tokens, output_tokens, cached_tokens,
-            thinking_tokens, total_tokens, error_rate, last_error, rate_limit_status, active_retry_json,
-            progress_detail_json, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            thinking_tokens, total_tokens, source_text_tokens, target_text_tokens, total_text_tokens,
+            error_rate, last_error, rate_limit_status, active_retry_json, progress_detail_json,
+            queued_from_status, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             inp_path = excluded.inp_path,
@@ -2459,11 +2740,15 @@ pub(super) async fn upsert_task_index(
             cached_tokens = excluded.cached_tokens,
             thinking_tokens = excluded.thinking_tokens,
             total_tokens = excluded.total_tokens,
+            source_text_tokens = excluded.source_text_tokens,
+            target_text_tokens = excluded.target_text_tokens,
+            total_text_tokens = excluded.total_text_tokens,
             error_rate = excluded.error_rate,
             last_error = excluded.last_error,
             rate_limit_status = excluded.rate_limit_status,
             active_retry_json = excluded.active_retry_json,
             progress_detail_json = excluded.progress_detail_json,
+            queued_from_status = excluded.queued_from_status,
             updated_at = excluded.updated_at",
     )
     .bind(&task.id)
@@ -2488,11 +2773,15 @@ pub(super) async fn upsert_task_index(
     .bind(task.token_stats.cached_tokens as i64)
     .bind(task.token_stats.thinking_tokens as i64)
     .bind(task.token_stats.total_tokens as i64)
+    .bind(task.text_token_stats.source_tokens as i64)
+    .bind(task.text_token_stats.target_tokens as i64)
+    .bind(task.text_token_stats.total_tokens as i64)
     .bind(task.error_rate)
     .bind(task.last_error.as_deref())
     .bind(task.rate_limit_status.as_deref())
     .bind(active_retry_json)
     .bind(progress_detail_json)
+    .bind(None::<String>)
     .bind(&task.created_at)
     .bind(&task.updated_at)
     .execute(pool)
@@ -2540,6 +2829,20 @@ fn task_from_index_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranslationTaskV
             thinking_tokens: row.get::<i64, _>("thinking_tokens").max(0) as u64,
             total_tokens: row.get::<i64, _>("total_tokens").max(0) as u64,
         },
+        text_token_stats: TextTokenStats {
+            source_tokens: row
+                .try_get::<i64, _>("source_text_tokens")
+                .unwrap_or(0)
+                .max(0) as u64,
+            target_tokens: row
+                .try_get::<i64, _>("target_text_tokens")
+                .unwrap_or(0)
+                .max(0) as u64,
+            total_tokens: row
+                .try_get::<i64, _>("total_text_tokens")
+                .unwrap_or(0)
+                .max(0) as u64,
+        },
         error_rate: row.get("error_rate"),
         last_error: row.get("last_error"),
         rate_limit_status: row.get("rate_limit_status"),
@@ -2583,6 +2886,20 @@ pub(super) async fn metadata_task(
             thinking_tokens: row.get::<i64, _>("thinking_tokens").max(0) as u64,
             total_tokens: row.get::<i64, _>("total_tokens").max(0) as u64,
         },
+        text_token_stats: TextTokenStats {
+            source_tokens: row
+                .try_get::<i64, _>("source_text_tokens")
+                .unwrap_or(0)
+                .max(0) as u64,
+            target_tokens: row
+                .try_get::<i64, _>("target_text_tokens")
+                .unwrap_or(0)
+                .max(0) as u64,
+            total_tokens: row
+                .try_get::<i64, _>("total_text_tokens")
+                .unwrap_or(0)
+                .max(0) as u64,
+        },
         error_rate: row.get("error_rate"),
         last_error: row.get("last_error"),
         rate_limit_status: row.get("rate_limit_status"),
@@ -2612,6 +2929,12 @@ fn chunk_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranslationChunkView,
             cached_tokens: row.get::<i64, _>("cached_tokens").max(0) as u64,
             thinking_tokens: row.get::<i64, _>("thinking_tokens").max(0) as u64,
             total_tokens: row.get::<i64, _>("total_tokens").max(0) as u64,
+        },
+        text_token_stats: TextTokenStats {
+            source_tokens: row.get::<i64, _>("source_tokens").max(0) as u64,
+            target_tokens: row.get::<i64, _>("target_tokens").max(0) as u64,
+            total_tokens: (row.get::<i64, _>("source_tokens").max(0)
+                + row.get::<i64, _>("target_tokens").max(0)) as u64,
         },
         updated_at: row.get("updated_at"),
     })
@@ -2974,7 +3297,7 @@ pub(super) fn progress_detail_for_translation_stats(
         TranslationTaskStatus::Failed | TranslationTaskStatus::Interrupted => "failed",
         TranslationTaskStatus::Success if completed_chunks >= total_chunks => "success",
         TranslationTaskStatus::Success => "failed",
-        TranslationTaskStatus::Pending => "pending",
+        TranslationTaskStatus::Pending | TranslationTaskStatus::Queued => "pending",
         TranslationTaskStatus::Running | TranslationTaskStatus::InterruptedPending => "running",
     };
     detail.translating = ProgressStep::new(

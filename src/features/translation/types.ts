@@ -1,5 +1,6 @@
 export type TranslationTaskStatus =
   | "pending"
+  | "queued"
   | "running"
   | "interrupted-pending"
   | "interrupted"
@@ -17,6 +18,12 @@ export interface TokenStats {
   outputTokens: number;
   cachedTokens: number;
   thinkingTokens: number;
+  totalTokens: number;
+}
+
+export interface TextTokenStats {
+  sourceTokens: number;
+  targetTokens: number;
   totalTokens: number;
 }
 
@@ -180,6 +187,7 @@ export interface TranslationTaskView {
   failedChunks: number;
   interruptedChunks: number;
   tokenStats: TokenStats;
+  textTokenStats: TextTokenStats;
   errorRate: number;
   lastError: string | null;
   rateLimitStatus: string | null;
@@ -208,6 +216,7 @@ export interface TranslationChunkView {
   retryCount: number;
   errorMessage: string | null;
   tokenStats: TokenStats;
+  textTokenStats: TextTokenStats;
   updatedAt: string;
 }
 

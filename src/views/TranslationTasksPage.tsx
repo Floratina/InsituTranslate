@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  memo,
   useMemo,
   useRef,
   useState,
@@ -69,7 +70,6 @@ import {
   deleteTranslationTask,
   deleteTranslationTasks,
   exportTranslationTask,
-  getTranslationTaskDetail,
   listTranslationTasks,
   openTranslationTaskFolder,
   pauseTranslationTask,
@@ -193,16 +193,71 @@ function taskTab(status: TranslationTaskStatus): TaskTab {
   return "running";
 }
 
-function liveTaskStatus(status: TranslationTaskStatus): boolean {
-  return status === "running" || status === "interrupted-pending";
-}
-
 function startableTaskStatus(status: TranslationTaskStatus): boolean {
   return status === "pending" || status === "interrupted";
 }
 
 function optimisticTimestamp(): string {
   return Math.floor(Date.now() / 1000).toString();
+}
+
+function sameTaskSignature(left: TranslationTaskView, right: TranslationTaskView): boolean {
+  return left.id === right.id
+    && left.name === right.name
+    && left.status === right.status
+    && left.progress === right.progress
+    && left.completedChunks === right.completedChunks
+    && left.failedChunks === right.failedChunks
+    && left.interruptedChunks === right.interruptedChunks
+    && left.totalChunks === right.totalChunks
+    && left.updatedAt === right.updatedAt
+    && left.tokenStats.totalTokens === right.tokenStats.totalTokens
+    && left.textTokenStats.totalTokens === right.textTokenStats.totalTokens
+    && left.lastError === right.lastError
+    && left.rateLimitStatus === right.rateLimitStatus
+    && left.activeRetry?.current === right.activeRetry?.current
+    && left.activeRetry?.message === right.activeRetry?.message
+    && left.tags.join("\u0000") === right.tags.join("\u0000");
+}
+
+function mergeTaskList(
+  current: TranslationTaskView[],
+  updates: Iterable<TranslationTaskView>,
+): TranslationTaskView[] {
+  let changed = false;
+  const byId = new Map(current.map((task) => [task.id, task]));
+  for (const incoming of updates) {
+    const previous = byId.get(incoming.id);
+    if (!previous) {
+      byId.set(incoming.id, incoming);
+      changed = true;
+    } else if (!sameTaskSignature(previous, incoming)) {
+      byId.set(incoming.id, incoming);
+      changed = true;
+    }
+  }
+  if (!changed) return current;
+  const merged = current.map((task) => byId.get(task.id) ?? task);
+  const known = new Set(current.map((task) => task.id));
+  for (const incoming of byId.values()) {
+    if (!known.has(incoming.id)) merged.unshift(incoming);
+  }
+  return merged;
+}
+
+function reconcileTaskList(
+  current: TranslationTaskView[],
+  refreshed: TranslationTaskView[],
+): TranslationTaskView[] {
+  let changed = current.length !== refreshed.length;
+  const currentById = new Map(current.map((task) => [task.id, task]));
+  const next = refreshed.map((task) => {
+    const previous = currentById.get(task.id);
+    if (previous && sameTaskSignature(previous, task)) return previous;
+    changed = true;
+    return task;
+  });
+  return changed ? next : current;
 }
 
 function resetProgressStep(label: string, total: number): ProgressStep {
@@ -525,10 +580,6 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     () => sortedTasks.filter((task) => task.status === "success"),
     [sortedTasks],
   );
-  const pollingTaskIds = useMemo(
-    () => tasks.filter((task) => liveTaskStatus(task.status)).map((task) => task.id),
-    [tasks],
-  );
   const pagedTasks = useMemo(() => {
     const start = page * pageSize;
     return sortedTasks.slice(start, start + pageSize);
@@ -552,7 +603,8 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
       return;
     }
     try {
-      setTasks(await listTranslationTasks());
+      const refreshed = await listTranslationTasks();
+      setTasks((current) => reconcileTaskList(current, refreshed));
     } catch (error) {
       pushToast(getErrorMessage(error), "error");
     } finally {
@@ -568,44 +620,40 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   useEffect(() => {
     if (!isTauriRuntime()) return undefined;
     let dispose: (() => void) | undefined;
+    const pending = new Map<string, TranslationTaskView>();
+    let flushTimer: number | null = null;
+    const flush = (): void => {
+      flushTimer = null;
+      const updates = Array.from(pending.values());
+      pending.clear();
+      setTasks((current) => mergeTaskList(current, updates));
+    };
     void listen<TranslationProgressPayload>("translation-progress", (event) => {
-      setTasks((current) => {
-        const incoming = event.payload.task;
-        const exists = current.some((task) => task.id === incoming.id);
-        if (!exists) return [incoming, ...current];
-        return current.map((task) => (task.id === incoming.id ? incoming : task));
-      });
+      pending.set(event.payload.task.id, event.payload.task);
+      if (flushTimer === null) {
+        flushTimer = window.setTimeout(flush, 250);
+      }
     }).then((unlisten) => {
       dispose = unlisten;
     });
-    return () => dispose?.();
+    return () => {
+      dispose?.();
+      if (flushTimer !== null) window.clearTimeout(flushTimer);
+    };
   }, []);
 
   useEffect(() => {
-    if (!isTauriRuntime() || pollingTaskIds.length === 0) return undefined;
-    let cancelled = false;
-    const tick = (): void => {
-      void Promise.all(
-        pollingTaskIds.map((id) =>
-          getTranslationTaskDetail(id)
-            .then((detail) => detail.task)
-            .catch(() => null),
-        ),
-      ).then((updatedTasks) => {
-        if (cancelled) return;
-        setTasks((current) => current.map((task) => {
-          const updated = updatedTasks.find((item) => item?.id === task.id);
-          return updated ?? task;
-        }));
-      });
+    if (!isTauriRuntime()) return undefined;
+    const syncOnFocus = (): void => {
+      if (document.visibilityState === "visible") void refresh();
     };
-    tick();
-    const interval = window.setInterval(tick, 1000);
+    window.addEventListener("focus", syncOnFocus);
+    document.addEventListener("visibilitychange", syncOnFocus);
     return () => {
-      cancelled = true;
-      window.clearInterval(interval);
+      window.removeEventListener("focus", syncOnFocus);
+      document.removeEventListener("visibilitychange", syncOnFocus);
     };
-  }, [pollingTaskIds]);
+  }, [refresh]);
 
   useEffect(() => {
     setPage(0);
@@ -728,13 +776,9 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
       return;
     }
     setBatchBusy(true);
-    setTasks((current) =>
-      current.map((task) =>
-        ids.includes(task.id) ? optimisticTaskStatus(task, "running") : task,
-      ),
-    );
     try {
-      await startTranslationTasksBatch({ ids });
+      const queued = await startTranslationTasksBatch({ ids });
+      setTasks((current) => mergeTaskList(current, queued));
       pushToast("已加入顺序开始队列", "success");
     } catch (error) {
       void refresh();
@@ -751,13 +795,9 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
       return;
     }
     setBatchBusy(true);
-    setTasks((current) =>
-      current.map((task) =>
-        ids.includes(task.id) ? optimisticTaskStatus(task, "running", true) : task,
-      ),
-    );
     try {
-      await retranslateTranslationTasksBatch({ ids });
+      const queued = await retranslateTranslationTasksBatch({ ids });
+      setTasks((current) => mergeTaskList(current, queued));
       pushToast("已加入重新翻译队列", "success");
     } catch (error) {
       void refresh();
@@ -1057,6 +1097,7 @@ function TasksTable({
   onExport,
   onDelete,
 }: TasksTableProps) {
+  const [contextTask, setContextTask] = useState<TranslationTaskView | null>(null);
   const [tableViewportRef, adaptiveWidths, tableViewportWidth] = useAdaptiveColumnWidths<HTMLDivElement>(
     widths,
     TASK_MIN_WIDTHS,
@@ -1138,67 +1179,50 @@ function TasksTable({
               <ActionHeader />
             </tr>
           </thead>
-          <tbody>
-            {loading ? (
-              <TableSkeletonRows columns={5} />
-            ) : tasks.length === 0 ? (
-              <TableMessage colSpan={5}>暂无任务</TableMessage>
-            ) : (
-              tasks.map((task) => (
-                <ContextMenu key={task.id}>
-                  <ContextMenuTrigger asChild>
-                    <tr className="cursor-default border-b align-top transition-colors duration-100 hover:bg-accent/35 active:bg-accent/60">
-                      <td className="h-11 min-w-0 px-3 py-2">
-                        <div className="truncate font-medium text-foreground" title={task.name}>
-                          {task.name}
-                        </div>
-                        <div className="mt-0.5 truncate text-2xs text-muted-foreground">
-                          更新于 {unixTimeLabel(task.updatedAt)}
-                        </div>
-                      </td>
-                      <td className="h-11 min-w-0 px-3 py-2">
-                        <TaskStatsCell task={task} />
-                      </td>
-                      <td className="h-11 min-w-0 px-3 py-2">
-                        <TaskTags tags={task.tags} />
-                      </td>
-                      <td className="h-11 min-w-0 truncate px-3 py-2 text-sm">
-                        {displayLanguagePair(task.sourceLanguage, task.targetLanguage)}
-                      </td>
-                      <td className="h-11 px-2 py-1.5 text-center">
-                        <TaskActionDropdown
-                          task={task}
-                          busy={busyId === task.id}
-                          onStart={onStart}
-                          onResume={onResume}
-                          onPause={onPause}
-                          onRetranslate={onRetranslate}
-                          onProofread={onProofread}
-                          onEditInfo={onEditInfo}
-                          onOpenFolder={onOpenFolder}
-                          onExport={onExport}
-                          onDelete={onDelete}
-                        />
-                      </td>
-                    </tr>
-                  </ContextMenuTrigger>
-                  <TaskContextMenuContent
-                    task={task}
-                    busy={busyId === task.id}
-                    onStart={onStart}
-                    onResume={onResume}
-                    onPause={onPause}
-                    onRetranslate={onRetranslate}
-                    onProofread={onProofread}
-                    onEditInfo={onEditInfo}
-                    onOpenFolder={onOpenFolder}
-                    onExport={onExport}
-                    onDelete={onDelete}
-                  />
-                </ContextMenu>
-              ))
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <tbody>
+                {loading ? (
+                  <TableSkeletonRows columns={5} />
+                ) : tasks.length === 0 ? (
+                  <TableMessage colSpan={5}>暂无任务</TableMessage>
+                ) : (
+                  tasks.map((task) => (
+                    <TaskRow
+                      key={task.id}
+                      task={task}
+                      busy={busyId === task.id}
+                      onContextTask={setContextTask}
+                      onStart={onStart}
+                      onResume={onResume}
+                      onPause={onPause}
+                      onRetranslate={onRetranslate}
+                      onProofread={onProofread}
+                      onEditInfo={onEditInfo}
+                      onOpenFolder={onOpenFolder}
+                      onExport={onExport}
+                      onDelete={onDelete}
+                    />
+                  ))
+                )}
+              </tbody>
+            </ContextMenuTrigger>
+            {contextTask && (
+              <TaskContextMenuContent
+                task={contextTask}
+                busy={busyId === contextTask.id}
+                onStart={onStart}
+                onResume={onResume}
+                onPause={onPause}
+                onRetranslate={onRetranslate}
+                onProofread={onProofread}
+                onEditInfo={onEditInfo}
+                onOpenFolder={onOpenFolder}
+                onExport={onExport}
+                onDelete={onDelete}
+              />
             )}
-          </tbody>
+          </ContextMenu>
         </table>
       </div>
       <PaginationBar
@@ -1212,6 +1236,65 @@ function TasksTable({
     </section>
   );
 }
+
+interface TaskRowProps extends TaskMenuProps {
+  onContextTask: (task: TranslationTaskView) => void;
+}
+
+const TaskRow = memo(function TaskRow({
+  task,
+  busy,
+  onContextTask,
+  onStart,
+  onResume,
+  onPause,
+  onRetranslate,
+  onProofread,
+  onEditInfo,
+  onOpenFolder,
+  onExport,
+  onDelete,
+}: TaskRowProps) {
+  return (
+    <tr
+      className="cursor-default border-b align-top transition-colors duration-100 hover:bg-accent/35 active:bg-accent/60"
+      onContextMenu={() => onContextTask(task)}
+    >
+      <td className="h-11 min-w-0 px-3 py-2">
+        <div className="truncate font-medium text-foreground" title={task.name}>
+          {task.name}
+        </div>
+        <div className="mt-0.5 truncate text-2xs text-muted-foreground">
+          更新于 {unixTimeLabel(task.updatedAt)}
+        </div>
+      </td>
+      <td className="h-11 min-w-0 px-3 py-2">
+        <TaskStatsCell task={task} />
+      </td>
+      <td className="h-11 min-w-0 px-3 py-2">
+        <TaskTags tags={task.tags} />
+      </td>
+      <td className="h-11 min-w-0 truncate px-3 py-2 text-sm">
+        {displayLanguagePair(task.sourceLanguage, task.targetLanguage)}
+      </td>
+      <td className="h-11 px-2 py-1.5 text-center">
+        <TaskActionDropdown
+          task={task}
+          busy={busy}
+          onStart={onStart}
+          onResume={onResume}
+          onPause={onPause}
+          onRetranslate={onRetranslate}
+          onProofread={onProofread}
+          onEditInfo={onEditInfo}
+          onOpenFolder={onOpenFolder}
+          onExport={onExport}
+          onDelete={onDelete}
+        />
+      </td>
+    </tr>
+  );
+}, (previous, next) => previous.busy === next.busy && sameTaskSignature(previous.task, next.task));
 
 function ProgressStepPill({ step }: { step: ProgressStep }) {
   return (
@@ -1305,6 +1388,12 @@ function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetrans
         <Item disabled={busy} onSelect={() => onStart(task)}>
           <Play className="size-3.5" />
           开始任务
+        </Item>
+      )}
+      {task.status === "queued" && (
+        <Item disabled>
+          <Loader2 className="size-3.5" />
+          排队中
         </Item>
       )}
       {task.status === "interrupted" && (

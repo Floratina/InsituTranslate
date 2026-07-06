@@ -137,6 +137,7 @@ pub fn run() {
             commands::delete_translation_task,
             commands::delete_translation_tasks,
             commands::get_translation_task_detail,
+            commands::get_translation_task_summary,
             commands::get_translation_config,
             commands::update_translation_config,
             commands::list_glossaries,

@@ -1043,7 +1043,7 @@ function ProviderSettingsPage() {
           <AlertDialogTitle className="font-semibold">
             删除 {deleteTarget?.name}？
           </AlertDialogTitle>
-          <AlertDialogDescription className="text-xs text-muted-foreground">
+          <AlertDialogDescription>
             此操作会同时删除该提供商的全部模型和系统凭据。
           </AlertDialogDescription>
           <div className="flex justify-end gap-2">

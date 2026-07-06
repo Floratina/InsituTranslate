@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { Loader2 } from "lucide-react";
 
 import { Progress } from "@/components/ui/progress";
@@ -25,6 +26,8 @@ interface TaskStatsLine {
 interface TaskStatsCellProps {
   task: TranslationTaskView;
 }
+
+type TaskStatsLineMotion = "fade" | "float-up" | "float-down";
 
 function liveTaskStatus(status: TranslationTaskStatus): boolean {
   return status === "running" || status === "interrupted-pending";
@@ -78,20 +81,40 @@ function taskStatsLine(task: TranslationTaskView): TaskStatsLine {
   };
 }
 
+function abnormalLineMode(mode: TaskStatsLineMode): boolean {
+  return mode === "retry" || mode === "failed" || mode === "interrupted";
+}
+
+function taskStatsLineMotion(
+  previousMode: TaskStatsLineMode,
+  nextMode: TaskStatsLineMode,
+): TaskStatsLineMotion {
+  const previousAbnormal = abnormalLineMode(previousMode);
+  const nextAbnormal = abnormalLineMode(nextMode);
+  if (!previousAbnormal && nextAbnormal) return "float-up";
+  if (previousAbnormal && !nextAbnormal) return "float-down";
+  return "fade";
+}
+
 export function TaskStatsCell({ task }: TaskStatsCellProps) {
   const line = taskStatsLine(task);
+  const previousModeRef = useRef<TaskStatsLineMode>(line.mode);
+  const motion = taskStatsLineMotion(previousModeRef.current, line.mode);
+
+  useEffect(() => {
+    previousModeRef.current = line.mode;
+  }, [line.mode]);
 
   return (
     <div className="grid min-w-0 gap-1.5">
-      <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
-        {liveTaskStatus(task.status) && (
-          <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />
-        )}
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-1.5 overflow-hidden">
         <div className="relative h-4 min-w-0 flex-1 overflow-hidden">
           <div
             key={line.mode}
             className={cn(
-              "absolute inset-x-0 top-0 truncate text-2xs leading-4 transition-colors duration-150",
+              "task-stats-line-fade absolute inset-x-0 top-0 truncate text-xs leading-4 transition-colors duration-150",
+              motion === "float-up" && "task-stats-line-float-up",
+              motion === "float-down" && "task-stats-line-float-down",
               taskStatsLineClass(line.severity),
             )}
             title={line.text}
@@ -99,13 +122,16 @@ export function TaskStatsCell({ task }: TaskStatsCellProps) {
             {line.text}
           </div>
         </div>
+        {liveTaskStatus(task.status) && (
+          <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />
+        )}
       </div>
       <div className="flex min-w-0 items-center gap-2">
         <Progress
           value={Math.round(Math.max(0, Math.min(1, task.progress)) * 100)}
           className="h-1.5 min-w-16 flex-1"
         />
-        <span className="shrink-0 text-2xs text-muted-foreground">
+        <span className="shrink-0 text-xs text-muted-foreground">
           {formatTokenK(task.tokenStats.totalTokens)} · {formatPercent(task.progress)}
         </span>
       </div>

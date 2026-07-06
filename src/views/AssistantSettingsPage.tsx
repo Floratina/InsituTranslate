@@ -639,7 +639,7 @@ export default function AssistantSettingsPage({
           <AlertDialogTitle className="font-semibold">
             删除 {deleteTarget?.name}？
           </AlertDialogTitle>
-          <AlertDialogDescription className="text-xs text-muted-foreground">
+          <AlertDialogDescription>
             此操作会永久删除该助手及其提示词和参数配置。
           </AlertDialogDescription>
           <div className="flex justify-end gap-2">
@@ -663,7 +663,7 @@ export default function AssistantSettingsPage({
       >
         <AlertDialogContent open={pendingAction !== null}>
           <AlertDialogTitle className="font-semibold">保存未提交的修改？</AlertDialogTitle>
-          <AlertDialogDescription className="text-xs text-muted-foreground">
+          <AlertDialogDescription>
             自定义参数尚未保存。保存后继续，或放弃这些修改。
           </AlertDialogDescription>
           <div className="flex justify-end gap-2">

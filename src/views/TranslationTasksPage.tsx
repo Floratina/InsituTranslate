@@ -1264,7 +1264,7 @@ const TaskRow = memo(function TaskRow({
         <div className="truncate font-medium text-foreground" title={task.name}>
           {task.name}
         </div>
-        <div className="mt-0.5 truncate text-2xs text-muted-foreground">
+        <div className="mt-0.5 truncate text-xs text-muted-foreground">
           更新于 {unixTimeLabel(task.updatedAt)}
         </div>
       </td>

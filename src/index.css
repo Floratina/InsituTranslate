@@ -282,6 +282,52 @@ body {
   will-change: transform, opacity;
 }
 
+@keyframes task-stats-line-fade {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes task-stats-line-float-up {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 15px, 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes task-stats-line-float-down {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -15px, 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.task-stats-line-fade {
+  animation: task-stats-line-fade 200ms cubic-bezier(0.03, 0.59, 0.19, 1) both;
+}
+
+.task-stats-line-float-up {
+  animation-name: task-stats-line-float-up;
+}
+
+.task-stats-line-float-down {
+  animation-name: task-stats-line-float-down;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .app-fade-up-enter {
     animation: none;

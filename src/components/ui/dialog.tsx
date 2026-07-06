@@ -98,7 +98,7 @@ function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="dialog-header"
-      className={cn("grid gap-1.5 pr-8", className)}
+      className={cn("grid gap-1.5", className)}
       {...props}
     />
   )
@@ -118,7 +118,7 @@ function DialogFooter({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="dialog-footer"
-      className={cn("flex items-center justify-end gap-3 border-t pt-4", className)}
+      className={cn("flex items-center justify-end gap-3", className)}
       {...props}
     />
   )
@@ -131,7 +131,7 @@ function DialogTitle({
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
-      className={cn("text-base font-semibold", className)}
+      className={cn("pr-8 text-base font-semibold", className)}
       {...props}
     />
   )
@@ -144,7 +144,7 @@ function DialogDescription({
   return (
     <DialogPrimitive.Description
       data-slot="dialog-description"
-      className={cn("text-xs text-muted-foreground", className)}
+      className={cn("text-sm text-muted-foreground", className)}
       {...props}
     />
   )

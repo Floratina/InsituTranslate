@@ -40,7 +40,7 @@ function AlertDialogContent({
                   transition={{ duration: 0.22, ease: [0.03, 0.59, 0.19, 1] }}
                   className={cn(
                     "fixed top-1/2 left-1/2 z-50 w-[calc(100%-2rem)] max-w-sm -translate-x-1/2 -translate-y-1/2 outline-none",
-                    "grid gap-4 rounded-[6px] border bg-background p-4 shadow-xl",
+                    "grid gap-4 rounded-[12px] border bg-popover p-4 shadow-xl",
                     className,
                   )}
                 >
@@ -73,7 +73,7 @@ function AlertDialogContent({
           animate={{ opacity: 1, y: 0, scale: 1 }}
           transition={{ duration: 0.25, ease: [0.03, 0.59, 0.19, 1] }}
           className={cn(
-            "grid gap-4 rounded-[6px] border bg-background p-4 shadow-xl",
+            "grid gap-4 rounded-[12px] border bg-popover p-4 shadow-xl",
             className,
           )}
         >

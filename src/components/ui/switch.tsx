@@ -41,7 +41,7 @@ function Switch({
         <motion.span
           {...CONTROLLED_STATE_MOTION_PROPS}
           data-slot="switch-thumb"
-          animate={{ x: resolvedChecked ? (size === "sm" ? 14 : 17) : 2 }}
+          animate={{ x: resolvedChecked ? (size === "sm" ? 13 : 17) : 2 }}
           className="pointer-events-none block rounded-full bg-background ring-0 group-data-[size=default]/switch:size-4 group-data-[size=sm]/switch:size-3 dark:data-[state=checked]:bg-primary-foreground dark:data-[state=unchecked]:bg-foreground"
         />
       </SwitchPrimitive.Thumb>

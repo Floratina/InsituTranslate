@@ -41,7 +41,7 @@ function DialogContent({
                   transition={{ duration: 0.22, ease: [0.03, 0.59, 0.19, 1] }}
                   className={cn(
                     "fixed top-1/2 left-1/2 z-50 w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 outline-none",
-                    "scrollbar-subtle grid max-h-[85vh] gap-4 overflow-y-auto rounded-[6px] border bg-background p-4 shadow-xl",
+                    "scrollbar-subtle grid max-h-[85vh] gap-4 overflow-y-auto rounded-[12px] border bg-popover p-4 shadow-xl",
                     className,
                   )}
                 >
@@ -79,7 +79,7 @@ function DialogContent({
           animate={{ opacity: 1, y: 0, scale: 1 }}
           transition={{ duration: 0.25, ease: [0.03, 0.59, 0.19, 1] }}
           className={cn(
-            "scrollbar-subtle relative grid max-h-[85vh] gap-4 overflow-y-auto rounded-[6px] border bg-background p-4 shadow-xl",
+            "scrollbar-subtle relative grid max-h-[85vh] gap-4 overflow-y-auto rounded-[12px] border bg-popover p-4 shadow-xl",
             className,
           )}
         >

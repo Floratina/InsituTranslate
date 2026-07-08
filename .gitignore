@@ -10,3 +10,4 @@ src-tauri/gen/
 *.sqlite
 *.sqlite3
 *.bak
+assets_references/

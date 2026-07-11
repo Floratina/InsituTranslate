@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -10,6 +11,10 @@ const APPEARANCE_NAMESPACE: &str = "appearance";
 const APPEARANCE_KEY: &str = "preferences";
 const SYSTEM_NAMESPACE: &str = "system";
 const SYSTEM_FONTS_KEY: &str = "fonts";
+const SCHEDULER_NAMESPACE: &str = "scheduler";
+const SCHEDULER_KEY: &str = "preferences";
+const DEFAULT_MAX_ACTIVE_TASKS: usize = 1;
+const MAX_ACTIVE_TASKS_LIMIT: usize = 4;
 const DEFAULT_CUSTOM_THEME_COLOR: &str = "#16B8C4";
 const SYSTEM_FONT_VALUE: &str = "system";
 
@@ -55,6 +60,20 @@ pub struct FontCacheRefresh {
     pub fonts: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSchedulerPreferences {
+    pub max_active_tasks: usize,
+}
+
+impl Default for TaskSchedulerPreferences {
+    fn default() -> Self {
+        Self {
+            max_active_tasks: DEFAULT_MAX_ACTIVE_TASKS,
+        }
+    }
+}
+
 impl Default for AppearancePreferences {
     fn default() -> Self {
         Self {
@@ -70,7 +89,8 @@ pub async fn connect(path: &Path) -> Result<SqlitePool, String> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
@@ -194,6 +214,38 @@ pub async fn update_appearance_preferences(
     Ok(preferences)
 }
 
+fn normalize_task_scheduler_preferences(
+    input: TaskSchedulerPreferences,
+) -> Result<TaskSchedulerPreferences, String> {
+    if !(1..=MAX_ACTIVE_TASKS_LIMIT).contains(&input.max_active_tasks) {
+        return Err(format!(
+            "Maximum active tasks must be between 1 and {MAX_ACTIVE_TASKS_LIMIT}"
+        ));
+    }
+    Ok(input)
+}
+
+pub async fn get_task_scheduler_preferences(
+    pool: &SqlitePool,
+) -> Result<TaskSchedulerPreferences, String> {
+    let Some(value) = read_entry(pool, SCHEDULER_NAMESPACE, SCHEDULER_KEY).await? else {
+        return Ok(TaskSchedulerPreferences::default());
+    };
+    let preferences = serde_json::from_str::<TaskSchedulerPreferences>(&value)
+        .map_err(|error| format!("Stored task scheduler preferences are invalid: {error}"))?;
+    normalize_task_scheduler_preferences(preferences)
+}
+
+pub async fn update_task_scheduler_preferences(
+    pool: &SqlitePool,
+    input: TaskSchedulerPreferences,
+) -> Result<TaskSchedulerPreferences, String> {
+    let preferences = normalize_task_scheduler_preferences(input)?;
+    let value = serde_json::to_string(&preferences).map_err(|error| error.to_string())?;
+    write_entry(pool, SCHEDULER_NAMESPACE, SCHEDULER_KEY, &value).await?;
+    Ok(preferences)
+}
+
 fn parse_font_cache(value: &str) -> Result<Vec<String>, String> {
     let fonts = serde_json::from_str::<Vec<String>>(value)
         .map_err(|error| format!("Stored system font cache is invalid: {error}"))?;
@@ -309,6 +361,69 @@ mod tests {
             .expect("load appearance");
         assert_eq!(loaded.preferences, saved);
         assert!(loaded.stored);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn scheduler_preferences_default_to_one_active_task() {
+        let path = temp_db_path();
+        let pool = connect(&path).await.expect("connect settings");
+
+        let preferences = get_task_scheduler_preferences(&pool)
+            .await
+            .expect("default scheduler preferences");
+
+        assert_eq!(preferences, TaskSchedulerPreferences::default());
+        assert_eq!(preferences.max_active_tasks, 1);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn scheduler_preferences_persist_values_between_one_and_four() {
+        let path = temp_db_path();
+        let pool = connect(&path).await.expect("connect settings");
+
+        let saved = update_task_scheduler_preferences(
+            &pool,
+            TaskSchedulerPreferences {
+                max_active_tasks: 4,
+            },
+        )
+        .await
+        .expect("save scheduler preferences");
+        let loaded = get_task_scheduler_preferences(&pool)
+            .await
+            .expect("load scheduler preferences");
+
+        assert_eq!(saved.max_active_tasks, 4);
+        assert_eq!(loaded, saved);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn scheduler_preferences_reject_out_of_range_values() {
+        let path = temp_db_path();
+        let pool = connect(&path).await.expect("connect settings");
+
+        assert!(update_task_scheduler_preferences(
+            &pool,
+            TaskSchedulerPreferences {
+                max_active_tasks: 0,
+            },
+        )
+        .await
+        .is_err());
+        assert!(update_task_scheduler_preferences(
+            &pool,
+            TaskSchedulerPreferences {
+                max_active_tasks: 5,
+            },
+        )
+        .await
+        .is_err());
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }

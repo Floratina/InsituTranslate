@@ -38,6 +38,7 @@ tauri-plugin-dialog = "2"
 text-splitter = { version = "0.32", features = ["tiktoken-rs"] }
 tiktoken-rs = "0.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 unicode-segmentation = "1"
 url = "2"
 xml5ever = "0.39.0"

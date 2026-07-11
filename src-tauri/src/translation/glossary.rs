@@ -580,7 +580,7 @@ async fn generate_glossary_for_chunk(
                     .unwrap_or_else(|| "Task interrupted".to_string()),
             };
         }
-        let Some(_permit) = limiter.acquire(&interrupted.flag).await else {
+        let Some(_permit) = limiter.acquire(interrupted.token()).await else {
             return AutoGlossaryChunkOutcome::Interrupted {
                 error: interrupted
                     .reason()

@@ -1,5 +1,5 @@
-import { Monitor, Moon, Palette, Settings, Sun, Terminal, Type } from "lucide-react";
-import { useState } from "react";
+import { ListTodo, Monitor, Moon, Palette, Settings, Sun, Terminal, Type } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -14,6 +14,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { useToast } from "@/components/ui/toast-stack";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { openBackendConsole } from "@/features/appearance/api";
 import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
 import { CustomThemeColorPicker } from "@/features/appearance/CustomThemeColorPicker";
@@ -26,6 +27,10 @@ import {
 } from "@/features/appearance/constants";
 import { getCustomThemeSwatches } from "@/features/appearance/theme-colors";
 import type { ColorMode, ThemeId } from "@/features/appearance/types";
+import {
+  dispatchSchedulerAction,
+  getTaskSchedulerPreferences,
+} from "@/features/scheduler/api";
 import { cn } from "@/lib/utils";
 
 const colorModes: readonly {
@@ -41,7 +46,7 @@ const colorModes: readonly {
 function getErrorMessage(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;
-  return "打开后端控制台失败";
+  return "设置操作失败";
 }
 
 function ThemeSwatches({ swatches }: { swatches: readonly [string, string, string, string] }) {
@@ -126,6 +131,8 @@ function CustomThemeOption({
 export default function AppearanceSettingsPage() {
   const { pushToast } = useToast();
   const [openingConsole, setOpeningConsole] = useState(false);
+  const [maxActiveTasks, setMaxActiveTasks] = useState(1);
+  const [savingScheduler, setSavingScheduler] = useState(false);
   const {
     preferences,
     setColorMode,
@@ -138,6 +145,34 @@ export default function AppearanceSettingsPage() {
       ? SYSTEM_FONT_STACK
       : `"${preferences.fontFamily.replaceAll('"', '\\"')}", ${SYSTEM_FONT_STACK}`;
   const customThemeSwatches = getCustomThemeSwatches(preferences.customThemeColor);
+
+  useEffect(() => {
+    void getTaskSchedulerPreferences()
+      .then((stored) => setMaxActiveTasks(stored.maxActiveTasks))
+      .catch((error: unknown) => pushToast(getErrorMessage(error), "error"));
+  }, [pushToast]);
+
+  async function updateMaxActiveTasks(value: string): Promise<void> {
+    const next = Number(value);
+    setSavingScheduler(true);
+    try {
+      const ack = await dispatchSchedulerAction({
+        type: "setConcurrency",
+        maxActiveTasks: next,
+      });
+      if (!ack.success) {
+        pushToast(ack.message ?? "任务并发设置未被接受", "error");
+        return;
+      }
+      const saved = await getTaskSchedulerPreferences();
+      setMaxActiveTasks(saved.maxActiveTasks);
+      pushToast("任务并发设置已保存", "success");
+    } catch (error) {
+      pushToast(getErrorMessage(error), "error");
+    } finally {
+      setSavingScheduler(false);
+    }
+  }
 
   async function handleOpenBackendConsole(): Promise<void> {
     if (openingConsole) return;
@@ -160,12 +195,45 @@ export default function AppearanceSettingsPage() {
           <h1 className="text-xl font-medium tracking-tight">设置</h1>
         </div>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          调整界面颜色与全局字体
+          调整界面外观与全局任务调度
         </p>
       </header>
 
       <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain pr-1">
         <div className="grid w-full max-w-4xl gap-3">
+          <Card size="sm" className="gap-3 rounded-[6px] py-3">
+            <CardHeader className="px-3">
+              <div className="flex items-center gap-2">
+                <ListTodo className="size-4 text-primary" />
+                <CardTitle>任务调度</CardTitle>
+              </div>
+            </CardHeader>
+            <CardContent className="flex flex-wrap items-center justify-between gap-3 px-3">
+              <div className="min-w-0">
+                <div className="text-sm font-medium">同时运行的任务数</div>
+                <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+                  控制同时翻译的文档数量，与单个文档内部的分块并发相互独立。
+                </p>
+              </div>
+              <Select
+                value={String(maxActiveTasks)}
+                disabled={savingScheduler}
+                onValueChange={(value) => void updateMaxActiveTasks(value)}
+              >
+                <SelectTrigger className="w-32">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {[1, 2, 3, 4].map((value) => (
+                    <SelectItem key={value} value={String(value)}>
+                      {value} 个任务
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </CardContent>
+          </Card>
+
           <Card size="sm" className="gap-3 rounded-[6px] py-3">
             <CardHeader className="px-3">
               <div className="flex items-center gap-2">

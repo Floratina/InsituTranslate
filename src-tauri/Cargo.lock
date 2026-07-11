@@ -2662,6 +2662,7 @@ dependencies = [
  "text-splitter",
  "tiktoken-rs",
  "tokio",
+ "tokio-util",
  "unicode-segmentation",
  "url",
  "xml5ever",
@@ -6031,6 +6032,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

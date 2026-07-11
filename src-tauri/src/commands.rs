@@ -29,22 +29,18 @@ use crate::glossaries::{
     GlossaryEntriesQuery, GlossaryEntryPage, GlossaryEntryView, GlossaryListQuery, GlossaryView,
     ImportGlossaryInput, PrepareAutoGlossaryInput, UpdateGlossaryEntryInput, UpdateGlossaryInput,
 };
-use crate::settings::{AppearancePreferences, AppearancePreferencesState, FontCacheRefresh};
+use crate::settings::{
+    AppearancePreferences, AppearancePreferencesState, FontCacheRefresh, TaskSchedulerPreferences,
+};
+use crate::task_scheduler::{SchedulerAck, SchedulerAction, TaskScheduler};
 use crate::translation_tasks::{
     self, CreateTranslationTaskInput, ExportTranslationTaskInput, ImportTranslationTaskInput,
-    ProgressStep, RunMode, StartTranslationTaskCreationResult, TranslationConfigView,
-    TranslationInterrupt, TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
+    ProgressStep, StartTranslationTaskCreationResult, TranslationConfigView,
+    TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
     TranslationTaskCreationStatus, TranslationTaskDetail, TranslationTaskFilters,
-    TranslationTaskIdsInput, TranslationTaskStatus, TranslationTaskView,
-    UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput,
-    UpdateTranslationTaskTagsInput,
+    TranslationTaskIdsInput, TranslationTaskView, UpdateTranslationConfigInput,
+    UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
 };
-
-#[derive(Debug, Clone)]
-pub struct RunningTranslationTask {
-    pub id: String,
-    pub interrupt: TranslationInterrupt,
-}
 
 #[derive(Debug, Clone)]
 pub struct TranslationTaskCreationJob {
@@ -64,8 +60,6 @@ pub struct AppState {
     pub translation_workspace_root: PathBuf,
     pub glossary_config_pool: SqlitePool,
     pub glossary_workspace_root: PathBuf,
-    pub running_translation_task: Arc<Mutex<Option<RunningTranslationTask>>>,
-    pub translation_batch_cancel: Arc<AtomicBool>,
     pub translation_task_creation_jobs: Arc<Mutex<HashMap<String, TranslationTaskCreationJob>>>,
     pub translation_task_staged_creations:
         Arc<Mutex<HashMap<String, StagedTranslationTaskCreation>>>,
@@ -85,6 +79,13 @@ pub async fn update_appearance_preferences(
     input: AppearancePreferences,
 ) -> Result<AppearancePreferences, String> {
     crate::settings::update_appearance_preferences(&state.settings_pool, input).await
+}
+
+#[tauri::command]
+pub async fn get_task_scheduler_preferences(
+    state: State<'_, AppState>,
+) -> Result<TaskSchedulerPreferences, String> {
+    crate::settings::get_task_scheduler_preferences(&state.settings_pool).await
 }
 
 #[tauri::command]
@@ -673,15 +674,6 @@ pub async fn get_translation_task_summary(
 
 #[tauri::command]
 pub async fn delete_translation_task(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    if state
-        .running_translation_task
-        .lock()
-        .await
-        .as_ref()
-        .is_some_and(|running| running.id == id)
-    {
-        return Err("Cannot delete a task while it is running".into());
-    }
     translation_tasks::delete_translation_task(
         &state.translation_config_pool,
         &state.translation_workspace_root,
@@ -695,14 +687,6 @@ pub async fn delete_translation_tasks(
     state: State<'_, AppState>,
     input: TranslationTaskIdsInput,
 ) -> Result<(), String> {
-    {
-        let running = state.running_translation_task.lock().await;
-        if let Some(running) = running.as_ref() {
-            if input.ids.iter().any(|id| id == &running.id) {
-                return Err("请先暂停正在运行的任务".into());
-            }
-        }
-    }
     translation_tasks::delete_translation_tasks(
         &state.translation_config_pool,
         &state.translation_workspace_root,
@@ -712,532 +696,11 @@ pub async fn delete_translation_tasks(
 }
 
 #[tauri::command]
-pub async fn start_translation_task(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<TranslationTaskView, String> {
-    start_translation_task_with_mode(app, state, id, RunMode::Start).await
-}
-
-#[tauri::command]
-pub async fn resume_translation_task(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<TranslationTaskView, String> {
-    start_translation_task_with_mode(app, state, id, RunMode::Resume).await
-}
-
-#[tauri::command]
-pub async fn retranslate_translation_task(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<TranslationTaskView, String> {
-    start_translation_task_with_mode(app, state, id, RunMode::Retranslate).await
-}
-
-#[tauri::command]
-pub async fn pause_translation_task(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<TranslationTaskView, String> {
-    let interrupt = {
-        let running = state.running_translation_task.lock().await;
-        running
-            .as_ref()
-            .filter(|running| running.id == id)
-            .map(|running| running.interrupt.clone())
-    };
-    if let Some(interrupt) = interrupt {
-        let task = translation_tasks::mark_task_interrupted_pending(
-            &app,
-            &state.translation_config_pool,
-            &state.translation_workspace_root,
-            &id,
-        )
-        .await?;
-        interrupt.interrupt("Task paused");
-        return Ok(task);
-    }
-    translation_tasks::list_translation_tasks(
-        &state.translation_config_pool,
-        Some(TranslationTaskFilters {
-            tag: None,
-            source_language: None,
-            target_language: None,
-        }),
-    )
-    .await?
-    .into_iter()
-    .find(|task| task.id == id)
-    .ok_or_else(|| "Translation task not found".to_string())
-}
-
-#[tauri::command]
-pub async fn start_translation_tasks_batch(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    input: TranslationTaskIdsInput,
-) -> Result<Vec<TranslationTaskView>, String> {
-    {
-        let running = state.running_translation_task.lock().await;
-        if let Some(current) = running.as_ref() {
-            return Err(format!(
-                "Translation task {} is already running",
-                current.id
-            ));
-        }
-    }
-    state
-        .translation_batch_cancel
-        .store(false, Ordering::SeqCst);
-    let requested_ids = input.ids;
-    let task_by_id =
-        translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
-            .await?
-            .into_iter()
-            .filter(|task| {
-                matches!(
-                    task.status,
-                    TranslationTaskStatus::Pending | TranslationTaskStatus::Interrupted
-                )
-            })
-            .map(|task| (task.id.clone(), task))
-            .collect::<HashMap<_, _>>();
-    let mut queue = Vec::new();
-    let mut queued_tasks = Vec::new();
-    for id in requested_ids {
-        let Some(task) = task_by_id.get(&id).cloned() else {
-            continue;
-        };
-        let mode = match task.status {
-            TranslationTaskStatus::Pending => RunMode::Start,
-            TranslationTaskStatus::Interrupted => RunMode::Resume,
-            _ => continue,
-        };
-        match translation_tasks::mark_task_queued(
-            &app,
-            &state.translation_config_pool,
-            &state.translation_workspace_root,
-            &task.id,
-            task.status,
-        )
-        .await
-        {
-            Ok(queued) => queued_tasks.push(queued),
-            Err(error) => {
-                let queued_ids = queued_tasks
-                    .iter()
-                    .map(|task| task.id.clone())
-                    .collect::<Vec<_>>();
-                let _ = translation_tasks::restore_queued_tasks(
-                    &app,
-                    &state.translation_config_pool,
-                    &queued_ids,
-                )
-                .await;
-                return Err(error);
-            }
-        }
-        queue.push((task.id, mode));
-    }
-    let provider_pool = state.pool.clone();
-    let config_pool = state.translation_config_pool.clone();
-    let glossary_config_pool = state.glossary_config_pool.clone();
-    let glossary_workspace_root = state.glossary_workspace_root.clone();
-    let workspace_root = state.translation_workspace_root.clone();
-    let client = state.client.clone();
-    let running = state.running_translation_task.clone();
-    let cancel = state.translation_batch_cancel.clone();
-    tauri::async_runtime::spawn(async move {
-        let backend_log = crate::diagnostics::BackendLog::from_app(&app).ok();
-        for (index, (id, mode)) in queue.iter().cloned().enumerate() {
-            if cancel.load(Ordering::SeqCst) {
-                let remaining = queue[index..]
-                    .iter()
-                    .map(|(id, _)| id.clone())
-                    .collect::<Vec<_>>();
-                let _ =
-                    translation_tasks::restore_queued_tasks(&app, &config_pool, &remaining).await;
-                break;
-            }
-            let interrupt = TranslationInterrupt::new();
-            let blocked_by_running = {
-                let mut guard = running.lock().await;
-                if guard.is_some() {
-                    true
-                } else {
-                    *guard = Some(RunningTranslationTask {
-                        id: id.clone(),
-                        interrupt: interrupt.clone(),
-                    });
-                    false
-                }
-            };
-            if blocked_by_running {
-                let remaining = queue[index..]
-                    .iter()
-                    .map(|(id, _)| id.clone())
-                    .collect::<Vec<_>>();
-                let _ =
-                    translation_tasks::restore_queued_tasks(&app, &config_pool, &remaining).await;
-                break;
-            }
-            let prepared = match translation_tasks::prepare_translation_run(
-                &app,
-                &provider_pool,
-                &client,
-                &config_pool,
-                &workspace_root,
-                &id,
-                mode,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    if let Some(log) = &backend_log {
-                        log.write(
-                            "ERROR",
-                            "translation",
-                            format!("Batch task id={id} prepare failed: {error}"),
-                        );
-                    }
-                    let mut guard = running.lock().await;
-                    if guard.as_ref().is_some_and(|current| current.id == id) {
-                        *guard = None;
-                    }
-                    drop(guard);
-                    let _ =
-                        translation_tasks::restore_queued_tasks(&app, &config_pool, &[id.clone()])
-                            .await;
-                    continue;
-                }
-            };
-            let inp_path = prepared.inp_path.clone();
-            let result = translation_tasks::run_translation_task(
-                app.clone(),
-                provider_pool.clone(),
-                config_pool.clone(),
-                glossary_config_pool.clone(),
-                glossary_workspace_root.clone(),
-                client.clone(),
-                prepared,
-                interrupt,
-            )
-            .await;
-            if let Err(error) = result {
-                if let Some(log) = &backend_log {
-                    log.write(
-                        "ERROR",
-                        "translation",
-                        format!("Batch task id={id} runtime error: {error}"),
-                    );
-                }
-                let _ = translation_tasks::mark_task_failed_after_runtime_error(
-                    &config_pool,
-                    &inp_path,
-                    error,
-                )
-                .await;
-            }
-            let mut guard = running.lock().await;
-            if guard.as_ref().is_some_and(|current| current.id == id) {
-                *guard = None;
-            }
-        }
-    });
-    Ok(queued_tasks)
-}
-
-#[tauri::command]
-pub async fn retranslate_translation_tasks_batch(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    input: TranslationTaskIdsInput,
-) -> Result<Vec<TranslationTaskView>, String> {
-    {
-        let running = state.running_translation_task.lock().await;
-        if let Some(current) = running.as_ref() {
-            return Err(format!(
-                "Translation task {} is already running",
-                current.id
-            ));
-        }
-    }
-    state
-        .translation_batch_cancel
-        .store(false, Ordering::SeqCst);
-    let requested_ids = input.ids;
-    let task_by_id =
-        translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
-            .await?
-            .into_iter()
-            .filter(|task| task.status == TranslationTaskStatus::Success)
-            .map(|task| (task.id.clone(), task))
-            .collect::<HashMap<_, _>>();
-    let mut queue = Vec::new();
-    let mut queued_tasks = Vec::new();
-    for id in requested_ids {
-        let Some(task) = task_by_id.get(&id).cloned() else {
-            continue;
-        };
-        match translation_tasks::mark_task_queued(
-            &app,
-            &state.translation_config_pool,
-            &state.translation_workspace_root,
-            &task.id,
-            task.status,
-        )
-        .await
-        {
-            Ok(queued) => queued_tasks.push(queued),
-            Err(error) => {
-                let queued_ids = queued_tasks
-                    .iter()
-                    .map(|task| task.id.clone())
-                    .collect::<Vec<_>>();
-                let _ = translation_tasks::restore_queued_tasks(
-                    &app,
-                    &state.translation_config_pool,
-                    &queued_ids,
-                )
-                .await;
-                return Err(error);
-            }
-        }
-        queue.push((task.id, RunMode::Retranslate));
-    }
-    let provider_pool = state.pool.clone();
-    let config_pool = state.translation_config_pool.clone();
-    let glossary_config_pool = state.glossary_config_pool.clone();
-    let glossary_workspace_root = state.glossary_workspace_root.clone();
-    let workspace_root = state.translation_workspace_root.clone();
-    let client = state.client.clone();
-    let running = state.running_translation_task.clone();
-    let cancel = state.translation_batch_cancel.clone();
-    tauri::async_runtime::spawn(async move {
-        let backend_log = crate::diagnostics::BackendLog::from_app(&app).ok();
-        for (index, (id, mode)) in queue.iter().cloned().enumerate() {
-            if cancel.load(Ordering::SeqCst) {
-                let remaining = queue[index..]
-                    .iter()
-                    .map(|(id, _)| id.clone())
-                    .collect::<Vec<_>>();
-                let _ =
-                    translation_tasks::restore_queued_tasks(&app, &config_pool, &remaining).await;
-                break;
-            }
-            let interrupt = TranslationInterrupt::new();
-            let blocked_by_running = {
-                let mut guard = running.lock().await;
-                if guard.is_some() {
-                    true
-                } else {
-                    *guard = Some(RunningTranslationTask {
-                        id: id.clone(),
-                        interrupt: interrupt.clone(),
-                    });
-                    false
-                }
-            };
-            if blocked_by_running {
-                let remaining = queue[index..]
-                    .iter()
-                    .map(|(id, _)| id.clone())
-                    .collect::<Vec<_>>();
-                let _ =
-                    translation_tasks::restore_queued_tasks(&app, &config_pool, &remaining).await;
-                break;
-            }
-            let prepared = match translation_tasks::prepare_translation_run(
-                &app,
-                &provider_pool,
-                &client,
-                &config_pool,
-                &workspace_root,
-                &id,
-                mode,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    if let Some(log) = &backend_log {
-                        log.write(
-                            "ERROR",
-                            "translation",
-                            format!("Batch retranslate task id={id} prepare failed: {error}"),
-                        );
-                    }
-                    let mut guard = running.lock().await;
-                    if guard.as_ref().is_some_and(|current| current.id == id) {
-                        *guard = None;
-                    }
-                    drop(guard);
-                    let _ =
-                        translation_tasks::restore_queued_tasks(&app, &config_pool, &[id.clone()])
-                            .await;
-                    continue;
-                }
-            };
-            let inp_path = prepared.inp_path.clone();
-            let result = translation_tasks::run_translation_task(
-                app.clone(),
-                provider_pool.clone(),
-                config_pool.clone(),
-                glossary_config_pool.clone(),
-                glossary_workspace_root.clone(),
-                client.clone(),
-                prepared,
-                interrupt,
-            )
-            .await;
-            if let Err(error) = result {
-                if let Some(log) = &backend_log {
-                    log.write(
-                        "ERROR",
-                        "translation",
-                        format!("Batch retranslate task id={id} runtime error: {error}"),
-                    );
-                }
-                let _ = translation_tasks::mark_task_failed_after_runtime_error(
-                    &config_pool,
-                    &inp_path,
-                    error,
-                )
-                .await;
-            }
-            let mut guard = running.lock().await;
-            if guard.as_ref().is_some_and(|current| current.id == id) {
-                *guard = None;
-            }
-        }
-    });
-    Ok(queued_tasks)
-}
-
-#[tauri::command]
-pub async fn pause_translation_tasks_batch(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    state.translation_batch_cancel.store(true, Ordering::SeqCst);
-    let running = state
-        .running_translation_task
-        .lock()
-        .await
-        .as_ref()
-        .map(|running| (running.id.clone(), running.interrupt.clone()));
-    if let Some((id, interrupt)) = running {
-        translation_tasks::mark_task_interrupted_pending(
-            &app,
-            &state.translation_config_pool,
-            &state.translation_workspace_root,
-            &id,
-        )
-        .await?;
-        interrupt.interrupt("Task paused");
-    }
-    let queued_ids =
-        translation_tasks::list_translation_tasks(&state.translation_config_pool, None)
-            .await?
-            .into_iter()
-            .filter(|task| task.status == TranslationTaskStatus::Queued)
-            .map(|task| task.id)
-            .collect::<Vec<_>>();
-    translation_tasks::restore_queued_tasks(&app, &state.translation_config_pool, &queued_ids)
-        .await?;
-    Ok(())
-}
-
-async fn start_translation_task_with_mode(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-    mode: RunMode,
-) -> Result<TranslationTaskView, String> {
-    state
-        .translation_batch_cancel
-        .store(false, Ordering::SeqCst);
-    let interrupt = TranslationInterrupt::new();
-    {
-        let mut running = state.running_translation_task.lock().await;
-        if let Some(current) = running.as_ref() {
-            return Err(format!(
-                "Translation task {} is already running",
-                current.id
-            ));
-        }
-        *running = Some(RunningTranslationTask {
-            id: id.clone(),
-            interrupt: interrupt.clone(),
-        });
-    }
-
-    let prepared = match translation_tasks::prepare_translation_run(
-        &app,
-        &state.pool,
-        &state.client,
-        &state.translation_config_pool,
-        &state.translation_workspace_root,
-        &id,
-        mode,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            *state.running_translation_task.lock().await = None;
-            return Err(error);
-        }
-    };
-    let view = prepared.task.clone();
-    let provider_pool = state.pool.clone();
-    let config_pool = state.translation_config_pool.clone();
-    let glossary_config_pool = state.glossary_config_pool.clone();
-    let glossary_workspace_root = state.glossary_workspace_root.clone();
-    let client = state.client.clone();
-    let running = state.running_translation_task.clone();
-    let task_id = view.id.clone();
-    let inp_path = prepared.inp_path.clone();
-    tauri::async_runtime::spawn(async move {
-        let backend_log = crate::diagnostics::BackendLog::from_app(&app).ok();
-        let result = translation_tasks::run_translation_task(
-            app,
-            provider_pool,
-            config_pool.clone(),
-            glossary_config_pool,
-            glossary_workspace_root,
-            client,
-            prepared,
-            interrupt,
-        )
-        .await;
-        if let Err(error) = result {
-            if let Some(log) = &backend_log {
-                log.write(
-                    "ERROR",
-                    "translation",
-                    format!("Task id={task_id} runtime error: {error}"),
-                );
-            }
-            let _ = translation_tasks::mark_task_failed_after_runtime_error(
-                &config_pool,
-                &inp_path,
-                error,
-            )
-            .await;
-        }
-        let mut guard = running.lock().await;
-        if guard.as_ref().is_some_and(|current| current.id == task_id) {
-            *guard = None;
-        }
-    });
-    Ok(view)
+pub async fn dispatch_scheduler_action(
+    scheduler: State<'_, TaskScheduler>,
+    action: SchedulerAction,
+) -> Result<SchedulerAck, String> {
+    scheduler.dispatch(action).await
 }
 
 #[tauri::command]

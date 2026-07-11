@@ -72,15 +72,12 @@ import {
   exportTranslationTask,
   listTranslationTasks,
   openTranslationTaskFolder,
-  pauseTranslationTask,
-  pauseTranslationTasksBatch,
-  retranslateTranslationTask,
-  retranslateTranslationTasksBatch,
-  resumeTranslationTask,
-  startTranslationTask,
-  startTranslationTasksBatch,
   updateTranslationTaskInfo,
 } from "@/features/translation/api";
+import {
+  dispatchSchedulerAction,
+  type SchedulerAction,
+} from "@/features/scheduler/api";
 import {
   formatPercent,
   formatTokenK,
@@ -197,10 +194,6 @@ function startableTaskStatus(status: TranslationTaskStatus): boolean {
   return status === "pending" || status === "interrupted";
 }
 
-function optimisticTimestamp(): string {
-  return Math.floor(Date.now() / 1000).toString();
-}
-
 function sameTaskSignature(left: TranslationTaskView, right: TranslationTaskView): boolean {
   return left.id === right.id
     && left.name === right.name
@@ -245,6 +238,20 @@ function mergeTaskList(
   return merged;
 }
 
+function mergeTaskProgress(
+  current: TranslationTaskView[],
+  updates: Iterable<TranslationTaskView>,
+): TranslationTaskView[] {
+  const statusById = new Map(current.map((task) => [task.id, task.status]));
+  return mergeTaskList(
+    current,
+    Array.from(updates, (task) => ({
+      ...task,
+      status: statusById.get(task.id) ?? task.status,
+    })),
+  );
+}
+
 function reconcileTaskList(
   current: TranslationTaskView[],
   refreshed: TranslationTaskView[],
@@ -258,50 +265,6 @@ function reconcileTaskList(
     return task;
   });
   return changed ? next : current;
-}
-
-function resetProgressStep(label: string, total: number): ProgressStep {
-  return {
-    state: "pending",
-    current: 0,
-    total,
-    percent: 0,
-    label: `${label} (0/${total})`,
-  };
-}
-
-function optimisticTaskStatus(
-  task: TranslationTaskView,
-  status: TranslationTaskStatus,
-  resetProgress = false,
-): TranslationTaskView {
-  const parsingAstStep: ProgressStep = {
-    state: "running",
-    current: 0,
-    total: 0,
-    percent: 0,
-    label: "AST 处理中",
-  };
-  const progressDetail = resetProgress && task.progressDetail
-    ? {
-        ...task.progressDetail,
-        ast: parsingAstStep,
-        chunking: resetProgressStep("分块", 0),
-        translating: resetProgressStep("翻译", task.totalChunks),
-        restore: resetProgressStep("占位符恢复", task.totalChunks),
-      }
-    : task.progressDetail;
-  return {
-    ...task,
-    status,
-    progress: resetProgress ? 0 : task.progress,
-    completedChunks: resetProgress ? 0 : task.completedChunks,
-    failedChunks: resetProgress ? 0 : task.failedChunks,
-    interruptedChunks: resetProgress ? 0 : task.interruptedChunks,
-    activeRetry: null,
-    progressDetail,
-    updatedAt: optimisticTimestamp(),
-  };
 }
 
 function nextSortMode(mode: SortMode): SortMode {
@@ -619,14 +582,15 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
 
   useEffect(() => {
     if (!isTauriRuntime()) return undefined;
-    let dispose: (() => void) | undefined;
+    let disposeProgress: (() => void) | undefined;
+    let disposeStatus: (() => void) | undefined;
     const pending = new Map<string, TranslationTaskView>();
     let flushTimer: number | null = null;
     const flush = (): void => {
       flushTimer = null;
       const updates = Array.from(pending.values());
       pending.clear();
-      setTasks((current) => mergeTaskList(current, updates));
+      setTasks((current) => mergeTaskProgress(current, updates));
     };
     void listen<TranslationProgressPayload>("translation-progress", (event) => {
       pending.set(event.payload.task.id, event.payload.task);
@@ -634,10 +598,16 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         flushTimer = window.setTimeout(flush, 250);
       }
     }).then((unlisten) => {
-      dispose = unlisten;
+      disposeProgress = unlisten;
+    });
+    void listen<TranslationProgressPayload>("task-status-changed", (event) => {
+      setTasks((current) => mergeTaskList(current, [event.payload.task]));
+    }).then((unlisten) => {
+      disposeStatus = unlisten;
     });
     return () => {
-      dispose?.();
+      disposeProgress?.();
+      disposeStatus?.();
       if (flushTimer !== null) window.clearTimeout(flushTimer);
     };
   }, []);
@@ -669,18 +639,15 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
 
   async function runTaskAction(
     task: TranslationTaskView,
-    action: (id: string) => Promise<TranslationTaskView>,
-    optimisticStatus?: TranslationTaskStatus,
-    resetProgress = false,
+    action: SchedulerAction,
   ): Promise<void> {
     setBusyId(task.id);
-    if (optimisticStatus) {
-      mergeTask(optimisticTaskStatus(task, optimisticStatus, resetProgress));
-    }
     try {
-      mergeTask(await action(task.id));
+      const ack = await dispatchSchedulerAction(action);
+      if (!ack.success) {
+        pushToast(ack.message ?? "调度指令未被接受", "error");
+      }
     } catch (error) {
-      if (optimisticStatus) mergeTask(task);
       pushToast(getErrorMessage(error), "error");
     } finally {
       setBusyId("");
@@ -777,11 +744,13 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     }
     setBatchBusy(true);
     try {
-      const queued = await startTranslationTasksBatch({ ids });
-      setTasks((current) => mergeTaskList(current, queued));
+      const ack = await dispatchSchedulerAction({ type: "enqueueBatch", taskIds: ids });
+      if (!ack.success) {
+        pushToast(ack.message ?? "批量开始指令未被接受", "error");
+        return;
+      }
       pushToast("已加入顺序开始队列", "success");
     } catch (error) {
-      void refresh();
       pushToast(getErrorMessage(error), "error");
     } finally {
       setBatchBusy(false);
@@ -796,11 +765,13 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     }
     setBatchBusy(true);
     try {
-      const queued = await retranslateTranslationTasksBatch({ ids });
-      setTasks((current) => mergeTaskList(current, queued));
+      const ack = await dispatchSchedulerAction({ type: "retranslateBatch", taskIds: ids });
+      if (!ack.success) {
+        pushToast(ack.message ?? "批量重新翻译指令未被接受", "error");
+        return;
+      }
       pushToast("已加入重新翻译队列", "success");
     } catch (error) {
-      void refresh();
       pushToast(getErrorMessage(error), "error");
     } finally {
       setBatchBusy(false);
@@ -808,18 +779,15 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   }
 
   async function pauseVisibleTasks(): Promise<void> {
-    const ids = tasks.filter((task) => task.status === "running").map((task) => task.id);
     setBatchBusy(true);
-    setTasks((current) =>
-      current.map((task) =>
-        ids.includes(task.id) ? optimisticTaskStatus(task, "interrupted-pending") : task,
-      ),
-    );
     try {
-      await pauseTranslationTasksBatch();
+      const ack = await dispatchSchedulerAction({ type: "pauseAll" });
+      if (!ack.success) {
+        pushToast(ack.message ?? "全部暂停指令未被接受", "error");
+        return;
+      }
       pushToast("已请求暂停任务", "success");
     } catch (error) {
-      void refresh();
       pushToast(getErrorMessage(error), "error");
     } finally {
       setBatchBusy(false);
@@ -947,7 +915,14 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
               variant="outline"
               className={compactStandardButtonClass}
               onClick={() => void pauseVisibleTasks()}
-              disabled={batchBusy || !tasks.some((task) => task.status === "running")}
+              disabled={
+                batchBusy
+                || !tasks.some((task) =>
+                  task.status === "queued"
+                  || task.status === "running"
+                  || task.status === "interrupted-pending"
+                )
+              }
             >
               <Pause className="size-4" />
               全部暂停
@@ -982,10 +957,10 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         onPageSizeChange={setPageSize}
         onResize={(event, index, renderedWidths) => startResize(event, index, renderedWidths, TASK_MIN_WIDTHS, setWidths)}
         onAutoFit={autoFitColumn}
-        onStart={(task) => void runTaskAction(task, startTranslationTask, "running")}
-        onResume={(task) => void runTaskAction(task, resumeTranslationTask, "running")}
-        onPause={(task) => void runTaskAction(task, pauseTranslationTask, "interrupted-pending")}
-        onRetranslate={(task) => void runTaskAction(task, retranslateTranslationTask, "running", true)}
+        onStart={(task) => void runTaskAction(task, { type: "enqueue", taskId: task.id })}
+        onResume={(task) => void runTaskAction(task, { type: "enqueue", taskId: task.id })}
+        onPause={(task) => void runTaskAction(task, { type: "pause", taskId: task.id })}
+        onRetranslate={(task) => void runTaskAction(task, { type: "retranslate", taskId: task.id })}
         onProofread={(task) => onOpenProofreading?.(task.id)}
         onEditInfo={(task) => setTaskInfoState({ task, name: task.name, tags: task.tags.join("，") })}
         onOpenFolder={(task) => {
@@ -1391,9 +1366,9 @@ function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetrans
         </Item>
       )}
       {task.status === "queued" && (
-        <Item disabled>
-          <Loader2 className="size-3.5" />
-          排队中
+        <Item disabled={busy} onSelect={() => onPause(task)}>
+          <Pause className="size-3.5" />
+          暂停任务
         </Item>
       )}
       {task.status === "interrupted" && (

@@ -2,11 +2,12 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, SqlitePool};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::DialogExt;
@@ -123,10 +124,43 @@ pub async fn connect_config_db(workspace_root: &Path) -> Result<SqlitePool, Stri
     tokio::fs::create_dir_all(workspace_root.join(TASKS_DIR))
         .await
         .map_err(|error| error.to_string())?;
-    let pool = connect_sqlite(&workspace_root.join(CONFIG_DB_FILE), 5).await?;
+    let options = SqliteConnectOptions::new()
+        .filename(workspace_root.join(CONFIG_DB_FILE))
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await
+        .map_err(|error| error.to_string())?;
+    verify_config_pragmas(&pool).await?;
     migrate_config_db(&pool).await?;
     recover_running_tasks(&pool).await?;
     Ok(pool)
+}
+
+async fn verify_config_pragmas(pool: &SqlitePool) -> Result<(), String> {
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(format!(
+            "Translation config database did not enter WAL mode: {journal_mode}"
+        ));
+    }
+    let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    if busy_timeout != 5_000 {
+        return Err(format!(
+            "Translation config database busy timeout is {busy_timeout}ms instead of 5000ms"
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn connect_sqlite(
@@ -136,7 +170,8 @@ pub(super) async fn connect_sqlite(
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
     SqlitePoolOptions::new()
         .max_connections(max_connections)
         .connect_with(options)
@@ -377,7 +412,8 @@ async fn connect_inp_read_only(path: &Path) -> Result<SqlitePool, String> {
         .filename(path)
         .create_if_missing(false)
         .read_only(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
     SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
@@ -629,17 +665,38 @@ async fn recover_running_tasks(config_pool: &SqlitePool) -> Result<(), String> {
             .try_get::<Option<String>, _>("queued_from_status")
             .unwrap_or(None)
             .and_then(|value| TranslationTaskStatus::parse(&value).ok());
-        let (next_status, message) = if status == TranslationTaskStatus::Queued {
-            (
-                queued_from_status.unwrap_or(TranslationTaskStatus::Pending),
-                "Application closed while the task was queued",
-            )
+        let mut update_inp = status != TranslationTaskStatus::Queued;
+        let mut next_status = if status == TranslationTaskStatus::Queued {
+            queued_from_status.unwrap_or(TranslationTaskStatus::Pending)
         } else {
-            (
-                TranslationTaskStatus::Interrupted,
-                "Application closed while the task was running",
-            )
+            TranslationTaskStatus::Interrupted
         };
+        let mut message = if status == TranslationTaskStatus::Queued {
+            "Application closed while the task was queued"
+        } else {
+            "Application closed while the task was running"
+        };
+        if status == TranslationTaskStatus::Queued {
+            if let Ok(inp_pool) = connect_inp(Path::new(&inp_path)).await {
+                let inp_status = sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM metadata WHERE task_id = ?",
+                )
+                .bind(&id)
+                .fetch_optional(&inp_pool)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| TranslationTaskStatus::parse(&value).ok());
+                inp_pool.close().await;
+                if inp_status == Some(TranslationTaskStatus::Running) {
+                    next_status = TranslationTaskStatus::Interrupted;
+                    message = "Application closed while publishing the running task";
+                    update_inp = true;
+                } else if inp_status == Some(TranslationTaskStatus::Queued) {
+                    update_inp = true;
+                }
+            }
+        }
         sqlx::query(
             "UPDATE task_index SET status = ?, queued_from_status = NULL, last_error = ?, updated_at = ? WHERE id = ?",
         )
@@ -650,8 +707,9 @@ async fn recover_running_tasks(config_pool: &SqlitePool) -> Result<(), String> {
         .execute(config_pool)
         .await
         .map_err(|error| error.to_string())?;
-        if let Ok(inp_pool) = connect_inp(Path::new(&inp_path)).await {
-            let _ = sqlx::query(
+        if update_inp {
+            if let Ok(inp_pool) = connect_inp(Path::new(&inp_path)).await {
+                let _ = sqlx::query(
                 "UPDATE metadata SET status = ?, queued_from_status = NULL, last_error = ?, updated_at = ? WHERE task_id = ?",
             )
             .bind(next_status.as_str())
@@ -660,7 +718,8 @@ async fn recover_running_tasks(config_pool: &SqlitePool) -> Result<(), String> {
             .bind(&id)
             .execute(&inp_pool)
             .await;
-            inp_pool.close().await;
+                inp_pool.close().await;
+            }
         }
     }
     Ok(())
@@ -2215,52 +2274,135 @@ pub async fn get_translation_task_summary(
     get_task_from_index(config_pool, id).await
 }
 
-pub async fn mark_task_queued(
-    app: &AppHandle,
+pub async fn reset_task_for_retranslation(
     config_pool: &SqlitePool,
     workspace_root: &Path,
     id: &str,
-    from_status: TranslationTaskStatus,
 ) -> Result<TranslationTaskView, String> {
-    let task = get_task_from_index(config_pool, id).await?;
-    let inp_path = PathBuf::from(&task.inp_path);
+    let indexed = get_task_from_index(config_pool, id).await?;
+    if !matches!(
+        indexed.status,
+        TranslationTaskStatus::Success | TranslationTaskStatus::Failed
+    ) {
+        return Err(format!(
+            "Task {} cannot be reset for retranslation from {:?} status",
+            indexed.id, indexed.status
+        ));
+    }
+    let inp_path = PathBuf::from(&indexed.inp_path);
     if !inp_path.starts_with(workspace_root) {
         return Err("Task file is outside the configured workspace".into());
     }
+    let inp_pool = connect_inp(&inp_path).await?;
+    let glossary_config = task_glossary_config(&inp_pool).await?;
+    let total_chunks = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chunks")
+        .fetch_one(&inp_pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .max(0) as u64;
+    let progress_detail = progress_detail_for_config(total_chunks, 0, &glossary_config);
+    let progress_detail_json = serialize_progress_detail(Some(&progress_detail))?;
     let now = unix_timestamp();
+    let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query(
-        "UPDATE task_index
-         SET status = ?, queued_from_status = ?, updated_at = ?
-         WHERE id = ?",
+        "UPDATE chunks SET
+            status = ?, after_translate_text = '', translated_text = '', retry_count = 0,
+            error_message = NULL, confidence = NULL, input_tokens = 0, output_tokens = 0,
+            cached_tokens = 0, thinking_tokens = 0, total_tokens = 0, target_tokens = 0,
+            updated_at = ?",
     )
-    .bind(TranslationTaskStatus::Queued.as_str())
-    .bind(from_status.as_str())
+    .bind(TranslationChunkStatus::Pending.as_str())
     .bind(&now)
-    .bind(id)
-    .execute(config_pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| error.to_string())?;
-    let inp_pool = connect_inp(&inp_path).await?;
     sqlx::query(
-        "UPDATE metadata
-         SET status = ?, queued_from_status = ?, updated_at = ?
+        "UPDATE metadata SET
+            status = ?, progress = 0, global_background = NULL,
+            completed_chunks = 0, failed_chunks = 0, interrupted_chunks = 0,
+            input_tokens = 0, output_tokens = 0, cached_tokens = 0, thinking_tokens = 0,
+            total_tokens = 0, source_text_tokens = 0, target_text_tokens = 0,
+            total_text_tokens = 0, error_rate = 0, last_error = NULL,
+            rate_limit_status = NULL, active_retry_json = NULL, queued_from_status = NULL,
+            progress_detail_json = ?, updated_at = ?
          WHERE task_id = ?",
     )
-    .bind(TranslationTaskStatus::Queued.as_str())
-    .bind(from_status.as_str())
+    .bind(TranslationTaskStatus::Pending.as_str())
+    .bind(progress_detail_json)
     .bind(&now)
     .bind(id)
-    .execute(&inp_pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    let local_task = metadata_task(&inp_pool, &inp_path).await?;
     inp_pool.close().await;
-    let queued = get_task_from_index(config_pool, id).await?;
-    let _ = app.emit(
-        TRANSLATION_PROGRESS_EVENT,
-        TranslationProgressPayload {
-            task: queued.clone(),
-        },
-    );
+    publish_task_index_snapshot(config_pool, &local_task).await
+}
+
+pub async fn mark_tasks_queued_atomically(
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    tasks: &[(String, TranslationTaskStatus)],
+) -> Result<Vec<TranslationTaskView>, String> {
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut transaction = config_pool
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
+    let now = unix_timestamp();
+    for (id, from_status) in tasks {
+        let row = sqlx::query("SELECT * FROM task_index WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Translation task not found".to_string())?;
+        let current = task_from_index_row(&row)?;
+        if current.status != *from_status {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| error.to_string())?;
+            return Err(format!(
+                "Task {} changed status before it could be queued",
+                current.id
+            ));
+        }
+        if !Path::new(&current.inp_path).starts_with(workspace_root) {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| error.to_string())?;
+            return Err("Task file is outside the configured workspace".into());
+        }
+        sqlx::query(
+            "UPDATE task_index
+             SET status = ?, queued_from_status = ?, updated_at = ?
+             WHERE id = ? AND status = ?",
+        )
+        .bind(TranslationTaskStatus::Queued.as_str())
+        .bind(from_status.as_str())
+        .bind(&now)
+        .bind(id)
+        .bind(from_status.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut queued = Vec::with_capacity(tasks.len());
+    for (id, _) in tasks {
+        queued.push(get_task_from_index(config_pool, id).await?);
+    }
     Ok(queued)
 }
 
@@ -2269,24 +2411,31 @@ pub async fn restore_queued_tasks(
     config_pool: &SqlitePool,
     ids: &[String],
 ) -> Result<Vec<TranslationTaskView>, String> {
-    let mut restored = Vec::new();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut transaction = config_pool
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut restored_ids = Vec::new();
+    let now = unix_timestamp();
     for id in ids {
-        let task = match get_task_from_index(config_pool, id).await {
-            Ok(task) if task.status == TranslationTaskStatus::Queued => task,
-            Ok(_) => continue,
-            Err(error) => return Err(error),
-        };
-        let row = sqlx::query("SELECT queued_from_status FROM task_index WHERE id = ?")
+        let row = sqlx::query("SELECT status, queued_from_status FROM task_index WHERE id = ?")
             .bind(id)
-            .fetch_one(config_pool)
+            .fetch_optional(&mut *transaction)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Translation task not found".to_string())?;
+        let status = TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())?;
+        if status != TranslationTaskStatus::Queued {
+            continue;
+        }
         let next_status = row
             .try_get::<Option<String>, _>("queued_from_status")
             .unwrap_or(None)
             .and_then(|value| TranslationTaskStatus::parse(&value).ok())
             .unwrap_or(TranslationTaskStatus::Pending);
-        let now = unix_timestamp();
         sqlx::query(
             "UPDATE task_index
              SET status = ?, queued_from_status = NULL, updated_at = ?
@@ -2295,23 +2444,18 @@ pub async fn restore_queued_tasks(
         .bind(next_status.as_str())
         .bind(&now)
         .bind(id)
-        .execute(config_pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| error.to_string())?;
-        if let Ok(inp_pool) = connect_inp(Path::new(&task.inp_path)).await {
-            let _ = sqlx::query(
-                "UPDATE metadata
-                 SET status = ?, queued_from_status = NULL, updated_at = ?
-                 WHERE task_id = ?",
-            )
-            .bind(next_status.as_str())
-            .bind(&now)
-            .bind(id)
-            .execute(&inp_pool)
-            .await;
-            inp_pool.close().await;
-        }
-        let task = get_task_from_index(config_pool, id).await?;
+        restored_ids.push(id.clone());
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut restored = Vec::with_capacity(restored_ids.len());
+    for id in restored_ids {
+        let task = get_task_from_index(config_pool, &id).await?;
         let _ = app.emit(
             TRANSLATION_PROGRESS_EVENT,
             TranslationProgressPayload { task: task.clone() },
@@ -2328,22 +2472,52 @@ pub async fn mark_task_interrupted_pending(
     id: &str,
 ) -> Result<TranslationTaskView, String> {
     let task = get_task_from_index(config_pool, id).await?;
+    if task.status == TranslationTaskStatus::Queued {
+        let mut transaction = config_pool
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
+        sqlx::query(
+            "UPDATE task_index
+             SET status = ?, queued_from_status = NULL, updated_at = ?
+             WHERE id = ? AND status = ?",
+        )
+        .bind(TranslationTaskStatus::InterruptedPending.as_str())
+        .bind(unix_timestamp())
+        .bind(id)
+        .bind(TranslationTaskStatus::Queued.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error.to_string())?;
+        return get_task_from_index(config_pool, id).await;
+    }
     let inp_path = PathBuf::from(&task.inp_path);
     if !inp_path.starts_with(workspace_root) {
         return Err("Task file is outside the configured workspace".into());
     }
     let inp_pool = connect_inp(&inp_path).await?;
-    sqlx::query(
+    let update = sqlx::query(
         "UPDATE metadata
          SET status = ?, updated_at = ?
-         WHERE task_id = ?",
+         WHERE task_id = ? AND status IN (?, ?, ?)",
     )
     .bind(TranslationTaskStatus::InterruptedPending.as_str())
     .bind(unix_timestamp())
     .bind(id)
+    .bind(TranslationTaskStatus::Queued.as_str())
+    .bind(TranslationTaskStatus::Running.as_str())
+    .bind(TranslationTaskStatus::InterruptedPending.as_str())
     .execute(&inp_pool)
     .await
     .map_err(|error| error.to_string())?;
+    if update.rows_affected() == 0 {
+        inp_pool.close().await;
+        return get_task_from_index(config_pool, id).await;
+    }
     let stats = aggregate_chunk_stats(&inp_pool).await?;
     let metadata = metadata_task(&inp_pool, &inp_path).await?;
     let glossary_config = task_glossary_config(&inp_pool).await?;
@@ -2360,6 +2534,58 @@ pub async fn mark_task_interrupted_pending(
         config_pool,
         &inp_path,
         Some(TranslationTaskStatus::InterruptedPending),
+    )
+    .await?;
+    let _ = app.emit(
+        TRANSLATION_PROGRESS_EVENT,
+        TranslationProgressPayload { task: task.clone() },
+    );
+    inp_pool.close().await;
+    Ok(task)
+}
+
+pub async fn mark_task_interrupted(
+    app: &AppHandle,
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    id: &str,
+    reason: String,
+) -> Result<TranslationTaskView, String> {
+    let task = get_task_from_index(config_pool, id).await?;
+    let inp_path = PathBuf::from(&task.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
+    let inp_pool = connect_inp(&inp_path).await?;
+    sqlx::query(
+        "UPDATE metadata
+         SET status = ?, last_error = ?, active_retry_json = NULL,
+             queued_from_status = NULL, updated_at = ?
+         WHERE task_id = ?",
+    )
+    .bind(TranslationTaskStatus::Interrupted.as_str())
+    .bind(reason)
+    .bind(unix_timestamp())
+    .bind(id)
+    .execute(&inp_pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let stats = aggregate_chunk_stats(&inp_pool).await?;
+    let metadata = metadata_task(&inp_pool, &inp_path).await?;
+    let glossary_config = task_glossary_config(&inp_pool).await?;
+    let detail = progress_detail_for_translation_stats(
+        metadata.progress_detail,
+        stats.total_chunks.max(0) as u64,
+        stats.completed_chunks.max(0) as u64,
+        TranslationTaskStatus::Interrupted,
+        &glossary_config,
+    );
+    set_progress_detail(&inp_pool, &detail).await?;
+    let task = refresh_task_stats(
+        &inp_pool,
+        config_pool,
+        &inp_path,
+        Some(TranslationTaskStatus::Interrupted),
     )
     .await?;
     let _ = app.emit(
@@ -2616,13 +2842,164 @@ pub(super) async fn refresh_task_stats(
     refresh_task_stats_internal(inp_pool, config_pool, inp_path, forced_status, true).await
 }
 
-async fn refresh_task_stats_without_index(
+pub(super) async fn refresh_task_stats_without_index(
     inp_pool: &SqlitePool,
     config_pool: &SqlitePool,
     inp_path: &Path,
     forced_status: Option<TranslationTaskStatus>,
 ) -> Result<TranslationTaskView, String> {
     refresh_task_stats_internal(inp_pool, config_pool, inp_path, forced_status, false).await
+}
+
+pub(super) async fn commit_prepared_run_state(
+    inp_pool: &SqlitePool,
+    inp_path: &Path,
+    token_limit: i64,
+    max_concurrency: i64,
+    max_retries: i64,
+    config_snapshot_json: String,
+    detail: &ProgressDetail,
+) -> Result<TranslationTaskView, String> {
+    let stats = aggregate_chunk_stats(inp_pool).await?;
+    let metadata = metadata_task(inp_pool, inp_path).await?;
+    let progress_detail_json = serialize_progress_detail(Some(detail))?;
+    let now = unix_timestamp();
+    let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
+    sqlx::query(
+        "UPDATE metadata SET
+            status = ?, token_limit = ?, max_concurrency = ?, max_retries = ?,
+            config_snapshot_json = ?, last_error = NULL, rate_limit_status = NULL,
+            active_retry_json = NULL, queued_from_status = NULL, progress_detail_json = ?,
+            progress = ?, total_chunks = ?, completed_chunks = ?, failed_chunks = ?,
+            interrupted_chunks = ?, input_tokens = ?, output_tokens = ?, cached_tokens = ?,
+            thinking_tokens = ?, total_tokens = ?, source_text_tokens = ?, target_text_tokens = ?,
+            total_text_tokens = ?, error_rate = ?, updated_at = ?
+         WHERE task_id = ?",
+    )
+    .bind(TranslationTaskStatus::Running.as_str())
+    .bind(token_limit)
+    .bind(max_concurrency)
+    .bind(max_retries)
+    .bind(config_snapshot_json)
+    .bind(progress_detail_json)
+    .bind(stats.progress)
+    .bind(stats.total_chunks)
+    .bind(stats.completed_chunks)
+    .bind(stats.failed_chunks)
+    .bind(stats.interrupted_chunks)
+    .bind(stats.token_stats.input_tokens as i64)
+    .bind(stats.token_stats.output_tokens as i64)
+    .bind(stats.token_stats.cached_tokens as i64)
+    .bind(stats.token_stats.thinking_tokens as i64)
+    .bind(stats.token_stats.total_tokens as i64)
+    .bind(stats.text_token_stats.source_tokens as i64)
+    .bind(stats.text_token_stats.target_tokens as i64)
+    .bind(stats.text_token_stats.total_tokens as i64)
+    .bind(stats.error_rate)
+    .bind(&now)
+    .bind(&metadata.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    metadata_task(inp_pool, inp_path).await
+}
+
+pub(super) async fn publish_task_index_snapshot(
+    config_pool: &SqlitePool,
+    task: &TranslationTaskView,
+) -> Result<TranslationTaskView, String> {
+    let active_retry_json = serialize_task_active_retry(task.active_retry.as_ref())?;
+    let progress_detail_json = serialize_progress_detail(task.progress_detail.as_ref())?;
+    let mut transaction = config_pool
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
+    let result = sqlx::query(
+        "UPDATE task_index SET
+            status = ?, progress = ?, total_chunks = ?, completed_chunks = ?,
+            failed_chunks = ?, interrupted_chunks = ?, input_tokens = ?, output_tokens = ?,
+            cached_tokens = ?, thinking_tokens = ?, total_tokens = ?, source_text_tokens = ?,
+            target_text_tokens = ?, total_text_tokens = ?, error_rate = ?, last_error = ?,
+            rate_limit_status = ?, active_retry_json = ?, progress_detail_json = ?,
+            queued_from_status = NULL, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(task.status.as_str())
+    .bind(task.progress)
+    .bind(task.total_chunks)
+    .bind(task.completed_chunks)
+    .bind(task.failed_chunks)
+    .bind(task.interrupted_chunks)
+    .bind(task.token_stats.input_tokens as i64)
+    .bind(task.token_stats.output_tokens as i64)
+    .bind(task.token_stats.cached_tokens as i64)
+    .bind(task.token_stats.thinking_tokens as i64)
+    .bind(task.token_stats.total_tokens as i64)
+    .bind(task.text_token_stats.source_tokens as i64)
+    .bind(task.text_token_stats.target_tokens as i64)
+    .bind(task.text_token_stats.total_tokens as i64)
+    .bind(task.error_rate)
+    .bind(task.last_error.as_deref())
+    .bind(task.rate_limit_status.as_deref())
+    .bind(active_retry_json)
+    .bind(progress_detail_json)
+    .bind(&task.updated_at)
+    .bind(&task.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    if result.rows_affected() != 1 {
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| error.to_string())?;
+        return Err("Translation task index was not updated".into());
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    get_task_from_index(config_pool, &task.id).await
+}
+
+pub async fn mark_task_index_failed(
+    config_pool: &SqlitePool,
+    id: &str,
+    error: String,
+) -> Result<TranslationTaskView, String> {
+    let mut transaction = config_pool
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
+    let result = sqlx::query(
+        "UPDATE task_index
+         SET status = ?, last_error = ?, active_retry_json = NULL,
+             queued_from_status = NULL, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(TranslationTaskStatus::Failed.as_str())
+    .bind(error)
+    .bind(unix_timestamp())
+    .bind(id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    if result.rows_affected() != 1 {
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| error.to_string())?;
+        return Err("Translation task not found".into());
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    get_task_from_index(config_pool, id).await
 }
 
 #[derive(Debug, Clone)]

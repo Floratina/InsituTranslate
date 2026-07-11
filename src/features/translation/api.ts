@@ -54,38 +54,6 @@ export function importTranslationTask(
   return invoke<TranslationTaskView>("import_translation_task", { input });
 }
 
-export function startTranslationTask(id: string): Promise<TranslationTaskView> {
-  return invoke<TranslationTaskView>("start_translation_task", { id });
-}
-
-export function resumeTranslationTask(id: string): Promise<TranslationTaskView> {
-  return invoke<TranslationTaskView>("resume_translation_task", { id });
-}
-
-export function retranslateTranslationTask(id: string): Promise<TranslationTaskView> {
-  return invoke<TranslationTaskView>("retranslate_translation_task", { id });
-}
-
-export function pauseTranslationTask(id: string): Promise<TranslationTaskView> {
-  return invoke<TranslationTaskView>("pause_translation_task", { id });
-}
-
-export function startTranslationTasksBatch(
-  input: TranslationTaskIdsInput,
-): Promise<TranslationTaskView[]> {
-  return invoke<TranslationTaskView[]>("start_translation_tasks_batch", { input });
-}
-
-export function retranslateTranslationTasksBatch(
-  input: TranslationTaskIdsInput,
-): Promise<TranslationTaskView[]> {
-  return invoke<TranslationTaskView[]>("retranslate_translation_tasks_batch", { input });
-}
-
-export function pauseTranslationTasksBatch(): Promise<void> {
-  return invoke("pause_translation_tasks_batch");
-}
-
 export function deleteTranslationTask(id: string): Promise<void> {
   return invoke("delete_translation_task", { id });
 }

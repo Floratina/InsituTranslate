@@ -76,6 +76,26 @@ fn split_text_into_chunks(
     chunks
 }
 
+#[tokio::test]
+async fn config_database_uses_wal_and_five_second_busy_timeout() {
+    let root = temp_root("config-pragmas");
+    let pool = connect_config_db(&root).await.expect("connect config");
+
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&pool)
+        .await
+        .expect("journal mode");
+    let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+        .fetch_one(&pool)
+        .await
+        .expect("busy timeout");
+
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(busy_timeout, 5_000);
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[cfg(test)]
 fn split_long_segment(segment: &str, max_chars: usize) -> Vec<String> {
     let mut parts = Vec::new();
@@ -102,6 +122,7 @@ fn push_raw_chunk(task_id: &str, chunks: &mut Vec<RawChunk>, source_text: String
     });
 }
 
+use super::db::{metadata_task, publish_task_index_snapshot};
 use super::*;
 use crate::document_parsing::types::{BlockRef, PlaceholderMap};
 use std::io::{Cursor, Read, Write};
@@ -1988,4 +2009,245 @@ async fn legacy_sliding_window_mode_maps_to_target_mode() {
     );
     pool.close().await;
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn atomic_queue_updates_only_config_index_and_leaves_inp_metadata_unchanged() {
+    let root = temp_root("atomic-queue");
+    let external_root = temp_root("atomic-queue-external");
+    let pool = connect_config_db(&root).await.expect("connect config");
+    let mut imported = Vec::new();
+    for index in 1..=2 {
+        let path = external_root.join(format!("task-{index}.inp"));
+        let id = format!("task-atomic-{index}");
+        write_test_inp(&path, &id, &format!("Atomic {index}"))
+            .await
+            .expect("write inp");
+        imported.push(
+            import_translation_task(
+                &pool,
+                &root,
+                ImportTranslationTaskInput {
+                    file_path: path.to_string_lossy().to_string(),
+                },
+            )
+            .await
+            .expect("import task"),
+        );
+    }
+
+    let requests = imported
+        .iter()
+        .map(|task| (task.id.clone(), TranslationTaskStatus::Pending))
+        .collect::<Vec<_>>();
+    let queued = mark_tasks_queued_atomically(&pool, &root, &requests)
+        .await
+        .expect("queue tasks");
+
+    assert!(queued
+        .iter()
+        .all(|task| task.status == TranslationTaskStatus::Queued));
+    for task in &imported {
+        let inp_pool = connect_inp(Path::new(&task.inp_path))
+            .await
+            .expect("open inp");
+        let row = sqlx::query("SELECT status, queued_from_status FROM metadata LIMIT 1")
+            .fetch_one(&inp_pool)
+            .await
+            .expect("read metadata");
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(
+            row.try_get::<Option<String>, _>("queued_from_status")
+                .unwrap_or(None),
+            None
+        );
+        inp_pool.close().await;
+    }
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(external_root);
+}
+
+#[tokio::test]
+async fn retranslation_reset_clears_completed_output_before_queueing() {
+    let root = temp_root("retranslation-reset");
+    let external_root = temp_root("retranslation-reset-external");
+    let pool = connect_config_db(&root).await.expect("connect config");
+    let external_path = external_root.join("completed.inp");
+    write_test_inp(&external_path, "task-retranslate-reset", "Completed task")
+        .await
+        .expect("write inp");
+    let imported = import_translation_task(
+        &pool,
+        &root,
+        ImportTranslationTaskInput {
+            file_path: external_path.to_string_lossy().to_string(),
+        },
+    )
+    .await
+    .expect("import task");
+    let inp_pool = connect_inp(Path::new(&imported.inp_path))
+        .await
+        .expect("open inp");
+    sqlx::query(
+        "UPDATE chunks SET status = ?, after_translate_text = 'restored',
+            translated_text = 'translated', retry_count = 2, error_message = 'old error',
+            confidence = 0.8, input_tokens = 10, output_tokens = 20, cached_tokens = 3,
+            thinking_tokens = 4, total_tokens = 34, target_tokens = 20",
+    )
+    .bind(TranslationChunkStatus::Success.as_str())
+    .execute(&inp_pool)
+    .await
+    .expect("complete chunks");
+    sqlx::query(
+        "UPDATE metadata SET status = ?, progress = 1, completed_chunks = 2,
+            input_tokens = 20, output_tokens = 40, total_tokens = 60,
+            target_text_tokens = 40, total_text_tokens = 50, last_error = 'old error',
+            rate_limit_status = 'limited', active_retry_json = '{}',
+            global_background = 'old background'",
+    )
+    .bind(TranslationTaskStatus::Success.as_str())
+    .execute(&inp_pool)
+    .await
+    .expect("complete metadata");
+    let completed = metadata_task(&inp_pool, Path::new(&imported.inp_path))
+        .await
+        .expect("read completed metadata");
+    inp_pool.close().await;
+    publish_task_index_snapshot(&pool, &completed)
+        .await
+        .expect("publish completed task");
+
+    let reset = reset_task_for_retranslation(&pool, &root, &imported.id)
+        .await
+        .expect("reset retranslation");
+
+    assert_eq!(reset.status, TranslationTaskStatus::Pending);
+    assert_eq!(reset.progress, 0.0);
+    assert_eq!(reset.completed_chunks, 0);
+    assert_eq!(reset.failed_chunks, 0);
+    assert_eq!(reset.interrupted_chunks, 0);
+    assert_eq!(reset.token_stats.total_tokens, 0);
+    assert_eq!(reset.text_token_stats.target_tokens, 0);
+    assert!(reset.last_error.is_none());
+    assert!(reset.rate_limit_status.is_none());
+    assert!(reset.active_retry.is_none());
+
+    let reset_inp = connect_inp(Path::new(&imported.inp_path))
+        .await
+        .expect("reopen inp");
+    let chunks = sqlx::query(
+        "SELECT status, after_translate_text, translated_text, retry_count, error_message,
+            confidence, input_tokens, output_tokens, cached_tokens, thinking_tokens,
+            total_tokens, target_tokens FROM chunks",
+    )
+    .fetch_all(&reset_inp)
+    .await
+    .expect("read reset chunks");
+    assert!(chunks.iter().all(|row| {
+        row.get::<String, _>("status") == TranslationChunkStatus::Pending.as_str()
+            && row.get::<String, _>("after_translate_text").is_empty()
+            && row.get::<String, _>("translated_text").is_empty()
+            && row.get::<i64, _>("retry_count") == 0
+            && row
+                .try_get::<Option<String>, _>("error_message")
+                .unwrap_or(None)
+                .is_none()
+            && row
+                .try_get::<Option<f64>, _>("confidence")
+                .unwrap_or(None)
+                .is_none()
+            && row.get::<i64, _>("input_tokens") == 0
+            && row.get::<i64, _>("output_tokens") == 0
+            && row.get::<i64, _>("cached_tokens") == 0
+            && row.get::<i64, _>("thinking_tokens") == 0
+            && row.get::<i64, _>("total_tokens") == 0
+            && row.get::<i64, _>("target_tokens") == 0
+    }));
+    let metadata = sqlx::query("SELECT status, global_background FROM metadata LIMIT 1")
+        .fetch_one(&reset_inp)
+        .await
+        .expect("read reset metadata");
+    assert_eq!(metadata.get::<String, _>("status"), "pending");
+    assert_eq!(
+        metadata
+            .try_get::<Option<String>, _>("global_background")
+            .unwrap_or(None),
+        None
+    );
+    reset_inp.close().await;
+
+    let queued = mark_tasks_queued_atomically(
+        &pool,
+        &root,
+        &[(imported.id.clone(), TranslationTaskStatus::Pending)],
+    )
+    .await
+    .expect("queue reset task");
+    assert_eq!(queued[0].status, TranslationTaskStatus::Queued);
+    let queue_row = sqlx::query("SELECT queued_from_status FROM task_index WHERE id = ?")
+        .bind(&imported.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read queued origin");
+    assert_eq!(
+        queue_row.get::<String, _>("queued_from_status"),
+        TranslationTaskStatus::Pending.as_str()
+    );
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(external_root);
+}
+
+#[tokio::test]
+async fn atomic_queue_rolls_back_every_update_when_second_update_aborts() {
+    let root = temp_root("atomic-queue-rollback");
+    let external_root = temp_root("atomic-queue-rollback-external");
+    let pool = connect_config_db(&root).await.expect("connect config");
+    let mut imported = Vec::new();
+    for index in 1..=2 {
+        let path = external_root.join(format!("task-{index}.inp"));
+        let id = format!("task-rollback-{index}");
+        write_test_inp(&path, &id, &format!("Rollback {index}"))
+            .await
+            .expect("write inp");
+        imported.push(
+            import_translation_task(
+                &pool,
+                &root,
+                ImportTranslationTaskInput {
+                    file_path: path.to_string_lossy().to_string(),
+                },
+            )
+            .await
+            .expect("import task"),
+        );
+    }
+    sqlx::query(
+        "CREATE TRIGGER fail_second_queue
+         BEFORE UPDATE OF status ON task_index
+         WHEN NEW.id = 'task-rollback-2' AND NEW.status = 'queued'
+         BEGIN SELECT RAISE(ABORT, 'forced queue failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("create failure trigger");
+
+    let requests = imported
+        .iter()
+        .map(|task| (task.id.clone(), TranslationTaskStatus::Pending))
+        .collect::<Vec<_>>();
+    assert!(mark_tasks_queued_atomically(&pool, &root, &requests)
+        .await
+        .is_err());
+    for task in &imported {
+        let indexed = get_task_from_index(&pool, &task.id)
+            .await
+            .expect("read task index");
+        assert_eq!(indexed.status, TranslationTaskStatus::Pending);
+    }
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(external_root);
 }

@@ -61,7 +61,7 @@ function taskStatsLine(task: TranslationTaskView): TaskStatsLine {
   if (task.status === "queued") {
     return {
       mode: "queued",
-      text: status.text || "排队中，等待当前任务完成",
+      text: status.text || "任务排队中，等待开始",
       severity: "muted",
     };
   }

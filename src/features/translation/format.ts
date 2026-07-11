@@ -146,6 +146,19 @@ function localizeTaskError(value: string): TaskStatusMessage {
 }
 
 export function taskStatusMessage(task: TranslationTaskView): TaskStatusMessage {
+  if (task.status === "queued") {
+    return {
+      text: "任务排队中，等待开始",
+      severity: "muted",
+    };
+  }
+  if (task.status === "interrupted-pending") {
+    return {
+      text: "正在中断，等待当前请求结束",
+      severity: "warning",
+    };
+  }
+
   const lastError = task.lastError?.trim();
   if (lastError) return localizeTaskError(lastError);
 
@@ -168,18 +181,6 @@ export function taskStatusMessage(task: TranslationTaskView): TaskStatusMessage 
     return {
       text: task.progressDetail.translating.label,
       severity: "muted",
-    };
-  }
-  if (task.status === "queued") {
-    return {
-      text: "排队中，等待当前任务完成",
-      severity: "muted",
-    };
-  }
-  if (task.status === "interrupted-pending") {
-    return {
-      text: "正在中断，等待当前请求结束",
-      severity: "warning",
     };
   }
   if (task.status === "interrupted") {

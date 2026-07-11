@@ -14,6 +14,7 @@ mod glossary_prompt;
 mod secrets;
 mod settings;
 mod system_fonts;
+mod task_scheduler;
 // Shared infrastructure for task-specific document prompt builders.
 #[allow(dead_code)]
 mod task_prompt;
@@ -67,6 +68,23 @@ pub fn run() {
             .map_err(|error| format!("Unable to rebase translation task paths: {error}"))?;
             let client = commands::build_http_client()
                 .map_err(|error| format!("Unable to initialize HTTP client: {error}"))?;
+            let scheduler_preferences = tauri::async_runtime::block_on(
+                settings::get_task_scheduler_preferences(&settings_pool),
+            )
+            .map_err(|error| format!("Unable to load task scheduler preferences: {error}"))?;
+            let task_scheduler = task_scheduler::TaskScheduler::start(
+                task_scheduler::TaskSchedulerContext {
+                    app: app.handle().clone(),
+                    provider_pool: pool.clone(),
+                    config_pool: translation_config_pool.clone(),
+                    settings_pool: settings_pool.clone(),
+                    glossary_config_pool: glossary_config_pool.clone(),
+                    glossary_workspace_root: glossary_workspace_root.clone(),
+                    workspace_root: workspace_root.clone(),
+                    client: client.clone(),
+                },
+                scheduler_preferences.max_active_tasks,
+            );
             app.manage(commands::AppState {
                 pool,
                 settings_pool,
@@ -74,17 +92,17 @@ pub fn run() {
                 translation_workspace_root: workspace_root,
                 glossary_config_pool,
                 glossary_workspace_root,
-                running_translation_task: Default::default(),
-                translation_batch_cancel: Default::default(),
                 translation_task_creation_jobs: Default::default(),
                 translation_task_staged_creations: Default::default(),
                 client,
             });
+            app.manage(task_scheduler);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_appearance_preferences,
             commands::update_appearance_preferences,
+            commands::get_task_scheduler_preferences,
             commands::open_backend_console,
             commands::get_cached_system_fonts,
             commands::refresh_system_fonts_cache,
@@ -127,13 +145,7 @@ pub fn run() {
             commands::update_translation_task_info,
             commands::open_translation_task_folder,
             commands::export_translation_task,
-            commands::start_translation_task,
-            commands::resume_translation_task,
-            commands::retranslate_translation_task,
-            commands::pause_translation_task,
-            commands::start_translation_tasks_batch,
-            commands::retranslate_translation_tasks_batch,
-            commands::pause_translation_tasks_batch,
+            commands::dispatch_scheduler_action,
             commands::delete_translation_task,
             commands::delete_translation_tasks,
             commands::get_translation_task_detail,

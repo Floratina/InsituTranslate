@@ -1,9 +1,8 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::domain::ThinkingEffort;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
@@ -547,16 +546,18 @@ pub enum RunMode {
 
 #[derive(Debug, Clone)]
 pub struct TranslationInterrupt {
-    pub(super) flag: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    token: CancellationToken,
     reason: Arc<StdMutex<Option<String>>>,
 }
 
 impl TranslationInterrupt {
     pub fn new() -> Self {
+        Self::from_token(CancellationToken::new())
+    }
+
+    pub(crate) fn from_token(token: CancellationToken) -> Self {
         Self {
-            flag: Arc::new(AtomicBool::new(false)),
-            notify: Arc::new(Notify::new()),
+            token,
             reason: Arc::new(StdMutex::new(None)),
         }
     }
@@ -565,23 +566,23 @@ impl TranslationInterrupt {
         if let Ok(mut current) = self.reason.lock() {
             *current = Some(reason.into());
         }
-        self.flag.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.token.cancel();
     }
 
-    pub(super) fn is_interrupted(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+    pub(crate) fn is_interrupted(&self) -> bool {
+        self.token.is_cancelled()
     }
 
-    pub(super) fn reason(&self) -> Option<String> {
+    pub(crate) fn reason(&self) -> Option<String> {
         self.reason.lock().ok().and_then(|current| current.clone())
     }
 
     pub(super) async fn cancelled(&self) {
-        if self.is_interrupted() {
-            return;
-        }
-        self.notify.notified().await;
+        self.token.cancelled().await;
+    }
+
+    pub(super) fn token(&self) -> &CancellationToken {
+        &self.token
     }
 }
 

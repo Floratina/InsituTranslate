@@ -36,9 +36,10 @@ pub use self::db::{
     default_workspace_root, delete_translation_task, delete_translation_tasks,
     discard_staged_translation_task, export_translation_task, get_translation_config,
     get_translation_task_detail, get_translation_task_summary, import_translation_task,
-    list_translation_tasks, mark_task_interrupted_pending, mark_task_queued,
-    migrate_legacy_workspace, open_translation_task_folder, publish_staged_translation_task,
-    rebase_task_index_paths, restore_queued_tasks, update_translation_config,
+    list_translation_tasks, mark_task_index_failed, mark_task_interrupted,
+    mark_task_interrupted_pending, mark_tasks_queued_atomically, migrate_legacy_workspace,
+    open_translation_task_folder, publish_staged_translation_task, rebase_task_index_paths,
+    reset_task_for_retranslation, restore_queued_tasks, update_translation_config,
     update_translation_task_info, update_translation_task_name, update_translation_task_tags,
 };
 

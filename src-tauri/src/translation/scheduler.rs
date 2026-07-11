@@ -27,14 +27,14 @@ use super::context::{
     previous_translation_context, unix_timestamp,
 };
 use super::db::{
-    aggregate_chunk_stats, apply_chunk_outcome, clear_active_retry_for_chunk, config_snapshot_json,
-    connect_inp, content_format_from_source_path, document_format_from_source_path,
-    effective_translation_concurrency, finalize_task, get_task_from_index, get_translation_config,
-    glossary_source_chunks, insert_assets, metadata_task, parse_source_file_for_task,
-    pending_chunks, progress_detail_for_config, progress_detail_for_translation_stats,
-    refresh_task_stats, resolve_source_file, set_active_retry_and_emit, set_progress_detail,
-    set_progress_detail_and_emit, task_assistant_custom_parameters, task_assistant_prompt,
-    task_glossary_config,
+    aggregate_chunk_stats, apply_chunk_outcome, clear_active_retry_for_chunk,
+    commit_prepared_run_state, config_snapshot_json, connect_inp, content_format_from_source_path,
+    document_format_from_source_path, effective_translation_concurrency, finalize_task,
+    get_task_from_index, get_translation_config, glossary_source_chunks, insert_assets,
+    metadata_task, parse_source_file_for_task, pending_chunks, progress_detail_for_config,
+    progress_detail_for_translation_stats, publish_task_index_snapshot, refresh_task_stats,
+    resolve_source_file, set_active_retry_and_emit, set_progress_detail,
+    task_assistant_custom_parameters, task_assistant_prompt, task_glossary_config,
 };
 use super::glossary::{prepare_task_glossary, TaskGlossaryMatcher, TaskGlossaryPreparation};
 use super::limiter::{
@@ -261,15 +261,7 @@ pub async fn prepare_translation_run(
                 translating: ProgressStep::pending(0, 0, count_label("翻译", 0, 0)),
                 restore: ProgressStep::pending(0, 0, count_label("占位符恢复", 0, 0)),
             };
-            set_progress_detail_and_emit(
-                app,
-                &inp_pool,
-                config_pool,
-                &inp_path,
-                &parsing_detail,
-                Some(TranslationTaskStatus::Running),
-            )
-            .await?;
+            set_progress_detail(&inp_pool, &parsing_detail).await?;
             let rebuilt_chunks = match rebuild_chunks_for_retranslate(
                 provider_pool,
                 client,
@@ -295,15 +287,7 @@ pub async fn prepare_translation_run(
                         translating: ProgressStep::pending(0, 0, count_label("翻译", 0, 0)),
                         restore: ProgressStep::pending(0, 0, count_label("占位符恢复", 0, 0)),
                     };
-                    set_progress_detail_and_emit(
-                        app,
-                        &inp_pool,
-                        config_pool,
-                        &inp_path,
-                        &failed_detail,
-                        Some(TranslationTaskStatus::Failed),
-                    )
-                    .await?;
+                    set_progress_detail(&inp_pool, &failed_detail).await?;
                     inp_pool.close().await;
                     return Err(error);
                 }
@@ -312,27 +296,6 @@ pub async fn prepare_translation_run(
             set_progress_detail(&inp_pool, &rebuilt_detail).await?;
         }
     }
-    sqlx::query(
-        "UPDATE metadata
-         SET status = ?, token_limit = ?, max_concurrency = ?, max_retries = ?,
-             config_snapshot_json = ?, last_error = NULL, rate_limit_status = NULL,
-             active_retry_json = NULL, queued_from_status = NULL, updated_at = ?
-         WHERE task_id = ?",
-    )
-    .bind(TranslationTaskStatus::Running.as_str())
-    .bind(config.chunk_token_limit)
-    .bind(config.max_concurrency)
-    .bind(config.max_retries)
-    .bind(config_snapshot_json(
-        &config,
-        &indexed.provider_id,
-        &indexed.model_id,
-    ))
-    .bind(&now)
-    .bind(id)
-    .execute(&inp_pool)
-    .await
-    .map_err(|error| error.to_string())?;
     let stats = aggregate_chunk_stats(&inp_pool).await?;
     let current_task = metadata_task(&inp_pool, &inp_path).await?;
     let detail = progress_detail_for_translation_stats(
@@ -342,15 +305,18 @@ pub async fn prepare_translation_run(
         TranslationTaskStatus::Running,
         &glossary_config,
     );
-    let task = set_progress_detail_and_emit(
-        app,
+    let local_task = commit_prepared_run_state(
         &inp_pool,
-        config_pool,
         &inp_path,
+        config.chunk_token_limit,
+        config.max_concurrency,
+        config.max_retries,
+        config_snapshot_json(&config, &indexed.provider_id, &indexed.model_id),
         &detail,
-        Some(TranslationTaskStatus::Running),
     )
     .await?;
+    inp_pool.close().await;
+    let task = publish_task_index_snapshot(config_pool, &local_task).await?;
     write_translation_log(
         &backend_log,
         "INFO",
@@ -363,7 +329,6 @@ pub async fn prepare_translation_run(
             config.max_retries
         ),
     );
-    inp_pool.close().await;
     Ok(PreparedRun {
         task,
         inp_path,
@@ -667,7 +632,7 @@ pub async fn run_translation_task(
                     } else {
                         None
                     };
-                let Some(_permit) = limiter.acquire(&interrupted.flag).await else {
+                let Some(_permit) = limiter.acquire(interrupted.token()).await else {
                     return;
                 };
                 if interrupted.is_interrupted() {
@@ -755,7 +720,7 @@ async fn run_sliding_window_translation(
                 return Err(error);
             }
         };
-        let Some(_permit) = limiter.acquire(&interrupt.flag).await else {
+        let Some(_permit) = limiter.acquire(interrupt.token()).await else {
             break;
         };
         if interrupt.is_interrupted() {

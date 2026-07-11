@@ -1,8 +1,9 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify};
+use tokio_util::sync::CancellationToken;
 
 use crate::adapters::RateLimitTelemetry;
 
@@ -200,10 +201,10 @@ impl AdaptiveLimiter {
 
     pub(super) async fn acquire(
         self: &Arc<Self>,
-        interrupted: &AtomicBool,
+        cancellation: &CancellationToken,
     ) -> Option<AdaptivePermit> {
         loop {
-            if interrupted.load(Ordering::SeqCst) {
+            if cancellation.is_cancelled() {
                 return None;
             }
             let window = self.window().await;
@@ -213,7 +214,10 @@ impl AdaptiveLimiter {
                     limiter: self.clone(),
                 });
             }
-            self.notify.notified().await;
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = cancellation.cancelled() => return None,
+            }
         }
     }
 

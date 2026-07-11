@@ -3,6 +3,10 @@ import { Check, ChevronDown } from "lucide-react"
 import { Select as SelectPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/utils"
+import {
+  scrollbarThumbClassName,
+  stopWheelPropagationWhenScrollable,
+} from "@/components/ui/scroll-area"
 
 interface SelectControlContextValue {
   disabled?: boolean
@@ -275,9 +279,12 @@ function SelectViewportScrollbar({
   }
 
   return (
-    <div className="pointer-events-none absolute top-0 right-0 bottom-0 z-10 w-1.5">
+    <div className="pointer-events-none absolute top-0 right-0 bottom-0 z-10 w-[var(--scrollbar-size)]">
       <div
-        className="pointer-events-auto absolute right-0 w-1.5 rounded-full bg-muted-foreground/45 transition-colors duration-150 hover:bg-ring/70"
+        className={cn(
+          scrollbarThumbClassName,
+          "pointer-events-auto absolute right-0 w-[var(--scrollbar-size)] min-h-[var(--scrollbar-min-thumb-size)]",
+        )}
         style={{
           height: metrics.thumbHeight,
           transform: `translateY(${metrics.thumbTop}px)`,
@@ -318,6 +325,7 @@ function SelectContent({
         >
           <SelectPrimitive.Viewport
             ref={viewportRef}
+            onWheel={(event) => stopWheelPropagationWhenScrollable(event)}
             className={cn(
               "scrollbar-hidden max-h-[min(22rem,var(--radix-select-content-available-height))] overflow-x-hidden overflow-y-auto overscroll-contain",
               viewportClassName,

@@ -3,6 +3,7 @@ import { X } from "lucide-react"
 import { Dialog as DialogPrimitive } from "radix-ui"
 import { AnimatePresence, motion } from "motion/react"
 
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 
 const Dialog = DialogPrimitive.Root
@@ -41,11 +42,16 @@ function DialogContent({
                   transition={{ duration: 0.22, ease: [0.03, 0.59, 0.19, 1] }}
                   className={cn(
                     "fixed top-1/2 left-1/2 z-50 w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 outline-none",
-                    "scrollbar-subtle grid max-h-[85vh] gap-4 overflow-y-auto rounded-[12px] border bg-popover p-4 shadow-xl",
+                    "max-h-[85vh] overflow-hidden rounded-[12px] border bg-popover shadow-xl",
                     className,
                   )}
                 >
-                  {children}
+                  <ScrollArea
+                    className="max-h-[85vh]"
+                    viewportClassName="h-auto max-h-[85vh] overscroll-contain"
+                  >
+                    <div className="grid gap-4 p-4">{children}</div>
+                  </ScrollArea>
                   <DialogPrimitive.Close className="absolute top-2 right-2 inline-flex size-7 items-center justify-center rounded-[6px] text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground">
                     <X className="size-4" strokeWidth={1.8} />
                     <span className="sr-only">关闭</span>
@@ -79,11 +85,16 @@ function DialogContent({
           animate={{ opacity: 1, y: 0, scale: 1 }}
           transition={{ duration: 0.25, ease: [0.03, 0.59, 0.19, 1] }}
           className={cn(
-            "scrollbar-subtle relative grid max-h-[85vh] gap-4 overflow-y-auto rounded-[12px] border bg-popover p-4 shadow-xl",
+            "relative max-h-[85vh] overflow-hidden rounded-[12px] border bg-popover shadow-xl",
             className,
           )}
         >
-          {children}
+          <ScrollArea
+            className="max-h-[85vh]"
+            viewportClassName="h-auto max-h-[85vh] overscroll-contain"
+          >
+            <div className="grid gap-4 p-4">{children}</div>
+          </ScrollArea>
           <DialogPrimitive.Close className="absolute top-2 right-2 inline-flex size-7 items-center justify-center rounded-[6px] text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground">
             <X className="size-4" strokeWidth={1.8} />
             <span className="sr-only">关闭</span>

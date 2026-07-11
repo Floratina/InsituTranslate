@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/popover";
 import { useToast } from "@/components/ui/toast-stack";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { openBackendConsole } from "@/features/appearance/api";
 import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
 import { CustomThemeColorPicker } from "@/features/appearance/CustomThemeColorPicker";
@@ -199,7 +200,10 @@ export default function AppearanceSettingsPage() {
         </p>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain pr-1">
+      <ScrollArea
+        className="-mr-1.5 min-h-0 flex-1"
+        viewportClassName="overscroll-contain pr-2.5"
+      >
         <div className="grid w-full max-w-4xl gap-3">
           <Card size="sm" className="gap-3 rounded-[6px] py-3">
             <CardHeader className="px-3">
@@ -339,7 +343,7 @@ export default function AppearanceSettingsPage() {
             </CardContent>
           </Card>
         </div>
-      </div>
+      </ScrollArea>
     </main>
   );
 }

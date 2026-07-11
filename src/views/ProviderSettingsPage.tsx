@@ -1252,7 +1252,10 @@ function ProviderSettingsPage() {
               onChange={(event) => setRemoteModelSearch(event.target.value)}
             />
           </div>
-          <div className="scrollbar-subtle max-h-[55vh] overflow-x-hidden overflow-y-auto overscroll-contain">
+          <ScrollArea
+            className="max-h-[55vh]"
+            viewportClassName="h-auto max-h-[55vh] overscroll-contain"
+          >
             <div>
               <SurfaceList>
                 {remoteModelsLoading ? (
@@ -1300,7 +1303,7 @@ function ProviderSettingsPage() {
                 )}
               </SurfaceList>
             </div>
-          </div>
+          </ScrollArea>
         </DialogContent>
       </Dialog>
 

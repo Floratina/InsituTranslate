@@ -62,6 +62,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
   SelectContent,
@@ -1181,13 +1182,11 @@ function GlossaryListTable({
 
   return (
       <section className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card">
-        <div
-          ref={tableViewportRef}
-          className={cn(
-            "h-full overflow-y-auto pb-20",
-            "scrollbar-subtle overscroll-contain",
-            tableNeedsHorizontalScroll ? "overflow-x-auto" : "overflow-x-hidden",
-          )}
+        <ScrollArea
+          axis={tableNeedsHorizontalScroll ? "both" : "vertical"}
+          className="h-full"
+          viewportClassName="overscroll-contain pb-20"
+          viewportRef={tableViewportRef}
         >
           <table
             className="table-fixed text-left text-sm"
@@ -1307,7 +1306,7 @@ function GlossaryListTable({
               )}
             </tbody>
           </table>
-        </div>
+        </ScrollArea>
         <PaginationBar
           page={page}
           pageSize={pageSize}
@@ -1545,13 +1544,11 @@ function GlossaryDetailView({
       </div>
 
       <section className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card">
-        <div
-          ref={tableViewportRef}
-          className={cn(
-            "h-full overflow-y-auto pb-20",
-            "scrollbar-subtle overscroll-contain",
-            tableNeedsHorizontalScroll ? "overflow-x-auto" : "overflow-x-hidden",
-          )}
+        <ScrollArea
+          axis={tableNeedsHorizontalScroll ? "both" : "vertical"}
+          className="h-full"
+          viewportClassName="overscroll-contain pb-20"
+          viewportRef={tableViewportRef}
         >
           <table
             className="table-fixed text-left text-sm"
@@ -1634,7 +1631,7 @@ function GlossaryDetailView({
               )}
             </tbody>
           </table>
-        </div>
+        </ScrollArea>
         <PaginationBar
           page={entryPage.page}
           pageSize={entryPage.pageSize}

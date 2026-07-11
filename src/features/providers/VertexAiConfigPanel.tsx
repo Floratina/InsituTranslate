@@ -132,7 +132,7 @@ function VertexLocationCombobox({
             />
           </div>
         </div>
-        <ScrollArea className="h-64">
+        <ScrollArea className="h-64" viewportClassName="overscroll-contain">
           {options.length === 0 ? (
             <div className="px-2 py-4 text-center text-xs text-muted-foreground">
               没有匹配的地区

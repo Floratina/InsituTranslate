@@ -84,6 +84,8 @@
   --latency-danger: oklch(60.527% 0.1991 27.653);
   --task-status-warning: oklch(62% 0.14 75);
   --task-status-danger: oklch(56% 0.20 27);
+  --scrollbar-size: 6px;
+  --scrollbar-min-thumb-size: 20px;
   --scrollbar-thumb: oklch(0.556 0 0 / 0.45);
   --scrollbar-thumb-hover: oklch(0.62 0.18 255 / 0.7);
   --destructive: oklch(0.577 0.245 27.325);
@@ -393,26 +395,26 @@ body {
   height: 0;
 }
 
-.scrollbar-subtle {
+.scrollbar-native {
   scrollbar-color: var(--scrollbar-thumb) transparent;
   scrollbar-width: thin;
 }
 
-.scrollbar-subtle::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+.scrollbar-native::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
 }
 
-.scrollbar-subtle::-webkit-scrollbar-track {
+.scrollbar-native::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.scrollbar-subtle::-webkit-scrollbar-thumb {
+.scrollbar-native::-webkit-scrollbar-thumb {
   border-radius: 999px;
   background-color: var(--scrollbar-thumb);
 }
 
-.scrollbar-subtle::-webkit-scrollbar-thumb:hover {
+.scrollbar-native::-webkit-scrollbar-thumb:hover {
   background-color: var(--scrollbar-thumb-hover);
 }
 

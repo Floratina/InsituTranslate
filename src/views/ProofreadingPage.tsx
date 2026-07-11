@@ -9,6 +9,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
   SelectContent,
@@ -239,10 +240,12 @@ function TextPanel({ title, text }: { title: string; text: string }) {
           <CardTitle>{title}</CardTitle>
         </div>
       </CardHeader>
-      <CardContent className="min-h-0 overflow-y-auto px-3">
-        <pre className="min-h-[20rem] whitespace-pre-wrap break-words rounded-[6px] border bg-muted/25 p-3 text-xs leading-relaxed">
-          {text || "暂无内容"}
-        </pre>
+      <CardContent className="min-h-0 flex-1 px-0">
+        <ScrollArea className="h-full" viewportClassName="px-3">
+          <pre className="min-h-[20rem] whitespace-pre-wrap break-words rounded-[6px] border bg-muted/25 p-3 text-xs leading-relaxed">
+            {text || "暂无内容"}
+          </pre>
+        </ScrollArea>
       </CardContent>
     </Card>
   );
@@ -257,15 +260,17 @@ function TextPanelSkeleton() {
           <Skeleton className="h-5 w-20" />
         </div>
       </CardHeader>
-      <CardContent className="min-h-0 overflow-y-auto px-3">
-        <div className="grid min-h-[20rem] gap-2 rounded-[6px] border bg-muted/25 p-3">
-          {Array.from({ length: 9 }).map((_, index) => (
-            <Skeleton
-              key={index}
-              className={index % 3 === 2 ? "h-4 w-2/3" : "h-4 w-full"}
-            />
-          ))}
-        </div>
+      <CardContent className="min-h-0 flex-1 px-0">
+        <ScrollArea className="h-full" viewportClassName="px-3">
+          <div className="grid min-h-[20rem] gap-2 rounded-[6px] border bg-muted/25 p-3">
+            {Array.from({ length: 9 }).map((_, index) => (
+              <Skeleton
+                key={index}
+                className={index % 3 === 2 ? "h-4 w-2/3" : "h-4 w-full"}
+              />
+            ))}
+          </div>
+        </ScrollArea>
       </CardContent>
     </Card>
   );

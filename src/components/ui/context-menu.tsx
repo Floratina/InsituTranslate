@@ -2,12 +2,40 @@ import * as React from "react"
 import { Check, ChevronRight } from "lucide-react"
 import { ContextMenu as ContextMenuPrimitive } from "radix-ui"
 
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 
 const ContextMenu = ContextMenuPrimitive.Root
 const ContextMenuTrigger = ContextMenuPrimitive.Trigger
 const ContextMenuSub = ContextMenuPrimitive.Sub
 const ContextMenuSubTrigger = ContextMenuPrimitive.SubTrigger
+
+function ContextMenuSurface({
+  className,
+  children,
+}: {
+  className?: string
+  children: React.ReactNode
+}) {
+  return (
+    <div
+      style={{
+        transformOrigin: "var(--radix-context-menu-content-transform-origin)",
+      }}
+      className={cn(
+        "floating-menu-enter-y overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
+        className,
+      )}
+    >
+      <ScrollArea
+        className="max-h-[min(22rem,var(--radix-context-menu-content-available-height))]"
+        viewportClassName="h-auto max-h-[min(22rem,var(--radix-context-menu-content-available-height))] overscroll-contain"
+      >
+        {children}
+      </ScrollArea>
+    </div>
+  )
+}
 
 function ContextMenuContent({
   className,
@@ -20,17 +48,9 @@ function ContextMenuContent({
         className="z-[70] min-w-40"
         {...props}
       >
-        <div
-          style={{
-            transformOrigin: "var(--radix-context-menu-content-transform-origin)",
-          }}
-          className={cn(
-            "floating-menu-enter-y overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
-            className,
-          )}
-        >
+        <ContextMenuSurface className={className}>
           {children}
-        </div>
+        </ContextMenuSurface>
       </ContextMenuPrimitive.Content>
     </ContextMenuPrimitive.Portal>
   )
@@ -48,17 +68,9 @@ function ContextMenuSubContent({
         sideOffset={4}
         {...props}
       >
-        <div
-          style={{
-            transformOrigin: "var(--radix-context-menu-content-transform-origin)",
-          }}
-          className={cn(
-            "floating-menu-enter-y overflow-hidden rounded-[6px] border bg-popover text-popover-foreground shadow-lg transform-gpu",
-            className,
-          )}
-        >
+        <ContextMenuSurface className={className}>
           {children}
-        </div>
+        </ContextMenuSurface>
       </ContextMenuPrimitive.SubContent>
     </ContextMenuPrimitive.Portal>
   )

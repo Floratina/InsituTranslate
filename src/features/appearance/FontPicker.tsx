@@ -250,7 +250,7 @@ export function FontPicker({ value, onValueChange }: FontPickerProps) {
             />
           </div>
         </div>
-        <ScrollArea className="h-64">
+        <ScrollArea className="h-64" viewportClassName="overscroll-contain">
           <div>
             {showLoadingState ? (
               <FontListSkeleton />

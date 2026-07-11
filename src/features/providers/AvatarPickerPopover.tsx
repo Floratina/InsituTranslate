@@ -5,6 +5,7 @@ import { motion } from "motion/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
@@ -119,7 +120,7 @@ export function AvatarPickerPopover({
                   onChange={(event) => setSearch(event.target.value)}
                 />
               </div>
-              <div className="scrollbar-subtle h-52 overflow-x-hidden overflow-y-auto overscroll-contain">
+              <ScrollArea className="h-52" viewportClassName="overscroll-contain">
                 <div className="grid grid-cols-2 gap-1">
                   {filteredAvatars.map((item) => (
                     <button
@@ -144,7 +145,7 @@ export function AvatarPickerPopover({
                     </div>
                   )}
                 </div>
-              </div>
+              </ScrollArea>
             </motion.div>
           </TabsContent>
         </Tabs>

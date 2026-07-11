@@ -64,6 +64,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/toast-stack";
 import {
@@ -1084,12 +1085,11 @@ function TasksTable({
 
   return (
     <section className="relative min-h-0 flex-1 overflow-hidden rounded-[6px] border bg-card">
-      <div
-        ref={tableViewportRef}
-        className={cn(
-          "scrollbar-subtle h-full overflow-y-auto overscroll-contain pb-20",
-          tableNeedsHorizontalScroll ? "overflow-x-auto" : "overflow-x-hidden",
-        )}
+      <ScrollArea
+        axis={tableNeedsHorizontalScroll ? "both" : "vertical"}
+        className="h-full"
+        viewportClassName="overscroll-contain pb-20"
+        viewportRef={tableViewportRef}
       >
         <table
           className="table-fixed text-left text-sm"
@@ -1199,7 +1199,7 @@ function TasksTable({
             )}
           </ContextMenu>
         </table>
-      </div>
+      </ScrollArea>
       <PaginationBar
         page={page}
         pageSize={pageSize}

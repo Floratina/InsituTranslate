@@ -29,6 +29,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { useToast } from "@/components/ui/toast-stack";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import type { AssistantView } from "@/features/assistants/types";
 import { listGlossaries } from "@/features/glossary/api";
 import type { GlossaryView } from "@/features/glossary/types";
@@ -909,8 +910,8 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
         </p>
       </header>
 
-      <div className="scrollbar-hidden min-h-0 flex-1 overflow-y-auto pb-28">
-        <div className="grid w-full gap-3">
+      <ScrollArea className="-mr-1.5 min-h-0 flex-1" viewportClassName="pr-1.5">
+        <div className="grid w-full gap-3 pb-28">
           <Card size="sm" className="rounded-[6px] py-3">
             <CardHeader className="px-3">
               <div className="flex items-center gap-2">
@@ -948,18 +949,23 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
               </motion.button>
 
               {fileRowCount > 0 && (
-                <div className="grid max-h-32 gap-1 overflow-y-auto rounded-[6px] border bg-muted/20 p-1.5">
-                  {idleFilePaths.map((path) => (
-                    <IdleFileRow key={path} path={path} onRemove={removeIdleFile} />
-                  ))}
-                  {creationJobs.map((job) => (
-                    <CreationFileRow
-                      key={job.clientTaskId}
-                      job={job}
-                      onRemove={(target) => void removeCreationJob(target)}
-                    />
-                  ))}
-                </div>
+                <ScrollArea
+                  className="max-h-32 rounded-[6px] border bg-muted/20"
+                  viewportClassName="h-auto max-h-32"
+                >
+                  <div className="grid gap-1 p-1.5">
+                    {idleFilePaths.map((path) => (
+                      <IdleFileRow key={path} path={path} onRemove={removeIdleFile} />
+                    ))}
+                    {creationJobs.map((job) => (
+                      <CreationFileRow
+                        key={job.clientTaskId}
+                        job={job}
+                        onRemove={(target) => void removeCreationJob(target)}
+                      />
+                    ))}
+                  </div>
+                </ScrollArea>
               )}
             </CardContent>
           </Card>
@@ -990,7 +996,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
             />
           )}
         </div>
-      </div>
+      </ScrollArea>
 
       <div className="absolute right-5 bottom-5 z-20 flex items-center gap-2">
         <Button

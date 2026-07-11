@@ -115,6 +115,13 @@
  - **交互效果: **
   - 所有按钮必须有按下悬停高亮和点击按下的反馈。按下按钮最多只允许轻微缩放，不允许有位移动画，按钮内的图标和文字也不允许有位移动画。
 
+### 7. 滚动区域与滚动条规范
+- 所有新增的页面、面板、列表、表格和浮层滚动区域，必须复用 `src/components/ui/scroll-area.tsx` 中的 `ScrollArea`，禁止直接新增未经规范化的 `overflow-auto`、`overflow-scroll` 或浏览器默认可见滚动条。
+- 需要横向滚动或双轴滚动时，必须通过 `ScrollArea` 的 `axis="horizontal"` 或 `axis="both"` 配置实现。
+- Textarea 等滚动发生在原生输入控件内部、无法安全替换滚动宿主的组件，必须使用全局 `scrollbar-native` 类并消费统一滚动条颜色与尺寸变量。
+- Select 等受第三方组件滚动契约约束的控件，可以保留其滚动宿主，但自绘滑块必须复用共享滚动条 Token，禁止维护独立的尺寸或颜色定义。
+- 禁止通过全局 `preventDefault()` 或手动修改滚动距离模拟滚轮。浮层中的滚动区域必须保证鼠标滚轮和触控板事件命中实际 viewport，并使用 `overscroll-contain` 防止滚动穿透到背景页面。
+
 ---
 
 ## 💡 TypeScript 指南

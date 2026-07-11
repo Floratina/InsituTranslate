@@ -24,20 +24,20 @@ export interface ToastMessage {
 }
 
 const motionEase = [0.03, 0.59, 0.19, 1] as const;
-const toastExitDistance = 420;
+const toastExitOffset = 40;
 
 const toastTransition = {
   x: { duration: 0.2, ease: motionEase },
   layout: { duration: 0.2, ease: motionEase },
-  opacity: { duration: 0.14 },
+  opacity: { duration: 0.2, ease: motionEase },
 };
 
 const toastVariants = {
   initial: { opacity: 0, x: 40 },
   animate: { opacity: 1, x: 0 },
-  exit: (direction: ToastDismissDirection) => ({
+  exit: (exitX: number) => ({
     opacity: 0,
-    x: direction * toastExitDistance,
+    x: exitX,
   }),
 };
 
@@ -137,7 +137,7 @@ const ToastBubble = forwardRef<HTMLButtonElement, ToastBubbleProps>(function Toa
   { toast, onDismiss, onCopy },
   ref,
 ) {
-  const [dismissDirection, setDismissDirection] = useState<ToastDismissDirection>(1);
+  const [exitX, setExitX] = useState(toastExitOffset);
   const dragged = useRef(false);
 
   const Icon =
@@ -155,7 +155,9 @@ const ToastBubble = forwardRef<HTMLButtonElement, ToastBubbleProps>(function Toa
       Math.abs(distance) >= swipeDismissThreshold ||
       Math.abs(info.velocity.x) >= 650;
     if (shouldDismiss) {
-      setDismissDirection(distance < 0 || info.velocity.x < 0 ? -1 : 1);
+      const direction: ToastDismissDirection =
+        distance < 0 || info.velocity.x < 0 ? -1 : 1;
+      setExitX(distance + direction * toastExitOffset);
       window.setTimeout(() => onDismiss(toast.id), 0);
       return;
     }
@@ -174,7 +176,7 @@ const ToastBubble = forwardRef<HTMLButtonElement, ToastBubbleProps>(function Toa
       dragElastic={0.32}
       dragMomentum={false}
       ref={ref}
-      custom={dismissDirection}
+      custom={exitX}
       variants={toastVariants}
       initial="initial"
       animate="animate"
@@ -190,16 +192,17 @@ const ToastBubble = forwardRef<HTMLButtonElement, ToastBubbleProps>(function Toa
       }}
       data-toast-id={toast.id}
       className={cn(
-        "pointer-events-auto flex min-h-10 w-full transform-gpu cursor-default items-center gap-2 rounded-[6px] border bg-clip-padding px-3 py-2 text-left text-xs shadow-[0_8px_24px_rgba(15,23,42,0.16)]",
+        "pointer-events-auto flex min-h-10 w-full transform-gpu cursor-default items-center gap-2 rounded-[6px] border bg-clip-padding px-3 py-2 text-left text-xs backdrop-blur-xl backdrop-saturate-150",
+        "shadow-[0_8px_24px_rgba(15,23,42,0.18),inset_0_1px_0_rgba(255,255,255,0.42)] dark:shadow-[0_10px_28px_rgba(0,0,0,0.36),inset_0_1px_0_rgba(255,255,255,0.08)]",
         "focus-visible:ring-3 focus-visible:ring-ring/35 focus-visible:outline-none",
         toast.variant === "default" &&
-          "!border-sky-200 bg-sky-50 text-sky-800 hover:bg-sky-100 dark:!border-sky-700 dark:bg-[#08283a] dark:text-sky-100 dark:hover:bg-[#0b344b]",
+          "!border-sky-300/80 bg-sky-50/74 text-sky-900 hover:bg-sky-100/84 dark:!border-sky-700/80 dark:bg-[#08283a]/56 dark:text-sky-100 dark:hover:bg-[#0b344b]/66",
         toast.variant === "error" &&
-          "!border-red-200 bg-red-50 text-red-700 hover:bg-red-100 dark:!border-red-700 dark:bg-[#3a1016] dark:text-red-200 dark:hover:bg-[#48151d]",
+          "!border-red-300/80 bg-red-50/74 text-red-800 hover:bg-red-100/84 dark:!border-red-700/80 dark:bg-[#3a1016]/56 dark:text-red-200 dark:hover:bg-[#48151d]/66",
         toast.variant === "success" &&
-          "!border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:!border-emerald-700 dark:bg-[#0b3025] dark:text-emerald-200 dark:hover:bg-[#0f3d2f]",
+          "!border-emerald-300/80 bg-emerald-50/74 text-emerald-800 hover:bg-emerald-100/84 dark:!border-emerald-700/80 dark:bg-[#0b3025]/56 dark:text-emerald-200 dark:hover:bg-[#0f3d2f]/66",
         toast.variant === "warning" &&
-          "!border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:!border-amber-700 dark:bg-[#3a2a08] dark:text-amber-100 dark:hover:bg-[#47340b]",
+          "!border-amber-400/80 bg-amber-50/74 text-amber-900 hover:bg-amber-100/84 dark:!border-amber-700/80 dark:bg-[#3a2a08]/56 dark:text-amber-100 dark:hover:bg-[#47340b]/66",
       )}
     >
       <Icon className="size-3.5 shrink-0" strokeWidth={1.8} />

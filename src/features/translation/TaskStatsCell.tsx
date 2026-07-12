@@ -27,6 +27,18 @@ interface TaskStatsCellProps {
   task: TranslationTaskView;
 }
 
+function glossaryProgressStep(task: TranslationTaskView) {
+  if (task.status !== "running" || !task.progressDetail) return null;
+  const { glossary, translating } = task.progressDetail;
+  if (
+    glossary.state === "running"
+    || (glossary.state === "pending" && translating.state === "pending")
+  ) {
+    return glossary;
+  }
+  return null;
+}
+
 type TaskStatsLineMotion = "fade" | "float-up" | "float-down";
 
 function liveTaskStatus(status: TranslationTaskStatus): boolean {
@@ -41,6 +53,7 @@ function taskStatsLineClass(severity: TaskStatsLineSeverity): string {
 
 function taskStatsLine(task: TranslationTaskView): TaskStatsLine {
   const status = taskStatusMessage(task);
+  const glossary = glossaryProgressStep(task);
 
   if (task.status === "failed") {
     return {
@@ -74,6 +87,14 @@ function taskStatsLine(task: TranslationTaskView): TaskStatsLine {
     };
   }
 
+  if (glossary) {
+    return {
+      mode: "normal",
+      text: `正在生成自动术语表... (${glossary.current}/${glossary.total})`,
+      severity: "muted",
+    };
+  }
+
   return {
     mode: "normal",
     text: `翻译进度 (${task.completedChunks}/${task.totalChunks}) · 失败 (${task.failedChunks})`,
@@ -98,6 +119,8 @@ function taskStatsLineMotion(
 
 export function TaskStatsCell({ task }: TaskStatsCellProps) {
   const line = taskStatsLine(task);
+  const glossary = glossaryProgressStep(task);
+  const displayedProgress = glossary?.percent ?? task.progress;
   const previousModeRef = useRef<TaskStatsLineMode>(line.mode);
   const motion = taskStatsLineMotion(previousModeRef.current, line.mode);
 
@@ -128,11 +151,13 @@ export function TaskStatsCell({ task }: TaskStatsCellProps) {
       </div>
       <div className="flex min-w-0 items-center gap-2">
         <Progress
-          value={Math.round(Math.max(0, Math.min(1, task.progress)) * 100)}
+          value={Math.round(Math.max(0, Math.min(1, displayedProgress)) * 100)}
           className="h-1.5 min-w-16 flex-1"
         />
         <span className="shrink-0 text-xs text-muted-foreground">
-          {formatTokenK(task.tokenStats.totalTokens)} · {formatPercent(task.progress)}
+          {glossary
+            ? formatPercent(displayedProgress)
+            : `${formatTokenK(task.tokenStats.totalTokens)} · ${formatPercent(displayedProgress)}`}
         </span>
       </div>
     </div>

@@ -5,7 +5,7 @@ const DEFAULT_MAX_CONCURRENCY: i64 = 5;
 const DEFAULT_MAX_RETRIES: i64 = 5;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: i64 = 60;
 const DEFAULT_MAX_TOKENS_PER_MINUTE: i64 = 60_000;
-const INP_SCHEMA_VERSION: i64 = 10;
+const INP_SCHEMA_VERSION: i64 = 11;
 const GLOBAL_BACKGROUND_TARGET_TOKENS: u64 = 1000;
 const GLOBAL_BACKGROUND_BATCH_CHUNKS: i64 = 20;
 const MAX_TASK_TAGS: usize = 12;
@@ -34,22 +34,28 @@ pub use self::scheduler::{
 pub use self::db::{
     connect_config_db, create_translation_task, create_translation_task_with_progress,
     default_workspace_root, delete_translation_task, delete_translation_tasks,
-    discard_staged_translation_task, export_translation_task, get_translation_config,
-    get_translation_task_detail, get_translation_task_summary, import_translation_task,
-    list_translation_tasks, mark_task_index_failed, mark_task_interrupted,
+    discard_staged_translation_task, export_translation_task, get_task_runtime_action_required,
+    get_translation_config, get_translation_task_detail, get_translation_task_summary,
+    import_translation_task, list_translation_tasks, mark_task_index_failed, mark_task_interrupted,
     mark_task_interrupted_pending, mark_tasks_queued_atomically, migrate_legacy_workspace,
     open_translation_task_folder, publish_staged_translation_task, rebase_task_index_paths,
-    reset_task_for_retranslation, restore_queued_tasks, update_translation_config,
-    update_translation_task_info, update_translation_task_name, update_translation_task_tags,
+    replace_task_runtime_snapshot, reset_task_for_retranslation, restore_queued_tasks,
+    update_translation_config_validated, update_translation_task_info,
+    update_translation_task_name, update_translation_task_tags,
 };
+
+#[cfg(test)]
+pub use self::db::update_translation_config;
 
 #[allow(unused_imports)]
 pub use self::types::{
     ConfidenceMode, ContextHandlingMode, CreateTranslationTaskInput, ExportTranslationTaskInput,
-    GlossaryMode, ImportTranslationTaskInput, PreparedRun, ProgressDetail, ProgressStep,
-    RateLimitStrategy, RunMode, StartTranslationTaskCreationResult, TextTokenStats, TokenStats,
-    TranslationChunkStatus, TranslationChunkView, TranslationConfigView, TranslationInterrupt,
-    TranslationProgressPayload, TranslationTaskActiveRetry, TranslationTaskCreationProgressPayload,
+    GlossaryGenerationConfig, GlossaryMode, ImportTranslationTaskInput, PreparedRun,
+    ProgressDetail, ProgressStep, RateLimitStrategy, ReplaceTaskRuntimeSnapshotInput, RunMode,
+    StartTranslationTaskCreationResult, TaskRuntimeActionReason, TaskRuntimeActionRequired,
+    TaskRuntimeConfigDomain, TextTokenStats, TokenStats, TranslationChunkStatus,
+    TranslationChunkView, TranslationConfigView, TranslationInterrupt, TranslationProgressPayload,
+    TranslationTaskActiveRetry, TranslationTaskCreationProgressPayload,
     TranslationTaskCreationStage, TranslationTaskCreationStatus, TranslationTaskDetail,
     TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskIdsInput,
     TranslationTaskPdfOptions, TranslationTaskStatus, TranslationTaskView,

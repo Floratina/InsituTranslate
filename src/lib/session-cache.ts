@@ -214,6 +214,10 @@ export const appSessionCache = {
     return resourceForPurpose(assistantResources, purpose);
   },
 
+  invalidateProviders(): void {
+    providerResources.forEach((resource) => resource.invalidate());
+  },
+
   proofreadingDetail(id: string): SessionResource<TranslationTaskDetail> {
     return proofreadingDetailResource(id);
   },

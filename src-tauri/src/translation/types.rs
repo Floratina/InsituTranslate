@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::domain::ThinkingEffort;
+use crate::domain::{ThinkingConfig, ThinkingEffort};
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
 use crate::pdf_parsing::PdfParsingMode;
 
@@ -289,6 +289,17 @@ pub struct TextTokenStats {
     pub total_tokens: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GlossaryGenerationConfig {
+    pub provider_id: String,
+    pub model_id: String,
+    pub assistant_id: Option<String>,
+    pub thinking_effort: ThinkingEffort,
+    pub use_web_search: bool,
+    pub use_custom_parameters: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TranslationConfigView {
@@ -311,6 +322,7 @@ pub struct TranslationConfigView {
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
+    pub glossary_generation_config: GlossaryGenerationConfig,
     pub thinking_effort: ThinkingEffort,
     pub use_web_search: bool,
     pub use_custom_parameters: bool,
@@ -339,6 +351,7 @@ impl Default for TranslationConfigView {
             use_glossary: false,
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
+            glossary_generation_config: GlossaryGenerationConfig::default(),
             thinking_effort: ThinkingEffort::None,
             use_web_search: false,
             use_custom_parameters: false,
@@ -372,6 +385,8 @@ pub struct UpdateTranslationConfigInput {
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
     #[serde(default)]
+    pub glossary_generation_config: GlossaryGenerationConfig,
+    #[serde(default)]
     pub thinking_effort: ThinkingEffort,
     #[serde(default)]
     pub use_web_search: bool,
@@ -394,6 +409,14 @@ pub struct CreateTranslationTaskInput {
     pub provider_id: String,
     pub model_id: String,
     pub assistant_id: Option<String>,
+    #[serde(default)]
+    pub use_glossary: bool,
+    #[serde(default)]
+    pub glossary_mode: GlossaryMode,
+    #[serde(default)]
+    pub glossary_id: Option<String>,
+    #[serde(default)]
+    pub glossary_generation_config: GlossaryGenerationConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -606,6 +629,53 @@ pub(super) struct TaskGlossaryConfig {
     pub(super) use_glossary: bool,
     pub(super) glossary_mode: GlossaryMode,
     pub(super) glossary_id: Option<String>,
+}
+
+pub(super) const GLOSSARY_GENERATION_SNAPSHOT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct GlossaryGenerationSnapshot {
+    pub(super) version: u32,
+    pub(super) provider_id: String,
+    pub(super) model_id: String,
+    pub(super) model_request_name: String,
+    pub(super) assistant_id: Option<String>,
+    pub(super) assistant_system_prompt: Option<String>,
+    pub(super) assistant_custom_parameters: serde_json::Value,
+    pub(super) temperature: Option<f64>,
+    pub(super) top_p: Option<f64>,
+    pub(super) web_search: bool,
+    pub(super) thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskRuntimeConfigDomain {
+    Translation,
+    Glossary,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskRuntimeActionReason {
+    LocalConfigMissing,
+    RemoteModelUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRuntimeActionRequired {
+    pub task_id: String,
+    pub domains: Vec<TaskRuntimeConfigDomain>,
+    pub reason: TaskRuntimeActionReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceTaskRuntimeSnapshotInput {
+    pub task_id: String,
+    pub config: TranslationConfigView,
 }
 
 #[derive(Debug, Clone)]

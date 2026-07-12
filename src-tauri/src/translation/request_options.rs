@@ -9,10 +9,39 @@ use crate::features::{is_feature_supported, native_web_search_supported, Feature
 use super::TranslationConfigView;
 
 #[derive(Debug, Clone)]
-pub(super) struct TranslationRequestOptions {
+pub(super) struct ModelRequestSettings {
+    pub thinking_effort: ThinkingEffort,
+    pub use_web_search: bool,
+    pub use_custom_parameters: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ModelRequestOptions {
     pub custom_parameters: Value,
     pub web_search: bool,
     pub thinking: Option<ThinkingConfig>,
+}
+
+pub(super) type TranslationRequestOptions = ModelRequestOptions;
+
+pub(super) fn resolve_model_request_options(
+    settings: &ModelRequestSettings,
+    runtime: &ProviderRuntimeConfig,
+    model: &ModelView,
+    custom_parameters: Value,
+) -> Result<ModelRequestOptions, String> {
+    let custom_parameters = if settings.use_custom_parameters {
+        validate_custom_parameters(custom_parameters)?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    let thinking = resolve_model_thinking(settings.thinking_effort, runtime, model)?;
+    let web_search = resolve_model_web_search(settings.use_web_search, runtime, model)?;
+    Ok(ModelRequestOptions {
+        custom_parameters,
+        web_search,
+        thinking,
+    })
 }
 
 pub(super) fn resolve_translation_request_options(
@@ -21,18 +50,16 @@ pub(super) fn resolve_translation_request_options(
     model: &ModelView,
     custom_parameters: Value,
 ) -> Result<TranslationRequestOptions, String> {
-    let custom_parameters = if config.use_custom_parameters {
-        validate_custom_parameters(custom_parameters)?
-    } else {
-        Value::Object(serde_json::Map::new())
-    };
-    let thinking = resolve_translation_thinking(config.thinking_effort, runtime, model)?;
-    let web_search = resolve_translation_web_search(config.use_web_search, runtime, model)?;
-    Ok(TranslationRequestOptions {
+    resolve_model_request_options(
+        &ModelRequestSettings {
+            thinking_effort: config.thinking_effort,
+            use_web_search: config.use_web_search,
+            use_custom_parameters: config.use_custom_parameters,
+        },
+        runtime,
+        model,
         custom_parameters,
-        web_search,
-        thinking,
-    })
+    )
 }
 
 fn validate_custom_parameters(custom_parameters: Value) -> Result<Value, String> {
@@ -43,7 +70,7 @@ fn validate_custom_parameters(custom_parameters: Value) -> Result<Value, String>
     }
 }
 
-fn resolve_translation_web_search(
+fn resolve_model_web_search(
     enabled: bool,
     runtime: &ProviderRuntimeConfig,
     model: &ModelView,
@@ -67,7 +94,7 @@ fn resolve_translation_web_search(
     Ok(true)
 }
 
-fn resolve_translation_thinking(
+fn resolve_model_thinking(
     effort: ThinkingEffort,
     runtime: &ProviderRuntimeConfig,
     model: &ModelView,
@@ -78,6 +105,14 @@ fn resolve_translation_thinking(
     if !model.capability_reasoning {
         return Err(format!(
             "Model \"{}\" does not have reasoning capability enabled. Set thinking effort to None or enable reasoning for this model.",
+            model.alias_or_request_name()
+        ));
+    }
+    if !model.supported_thinking_efforts.is_empty()
+        && !model.supported_thinking_efforts.contains(&effort)
+    {
+        return Err(format!(
+            "Thinking effort {effort:?} is not supported by model \"{}\".",
             model.alias_or_request_name()
         ));
     }
@@ -273,6 +308,41 @@ mod tests {
         .expect_err("reasoning capability error");
 
         assert!(error.contains("reasoning capability"));
+    }
+
+    #[test]
+    fn rejects_effort_outside_non_empty_supported_effort_list() {
+        let mut model = model("deepseek-v4", true);
+        model.supported_thinking_efforts = vec![
+            ThinkingEffort::None,
+            ThinkingEffort::High,
+            ThinkingEffort::Max,
+        ];
+        let error = resolve_translation_request_options(
+            &config(ThinkingEffort::Low),
+            &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
+            &model,
+            json!({}),
+        )
+        .expect_err("unsupported effort");
+
+        assert!(error.contains("not supported"));
+    }
+
+    #[test]
+    fn empty_supported_effort_list_keeps_legacy_mapping_compatibility() {
+        let options = resolve_translation_request_options(
+            &config(ThinkingEffort::Low),
+            &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
+            &model("deepseek-v4", true),
+            json!({}),
+        )
+        .expect("legacy unknown effort list");
+
+        assert_eq!(
+            options.thinking.as_ref().and_then(|item| item.effort),
+            Some(ThinkingEffort::High)
+        );
     }
 
     #[test]

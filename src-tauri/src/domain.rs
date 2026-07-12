@@ -374,6 +374,8 @@ pub struct UnifiedChatRequest {
     pub thinking: Option<ThinkingConfig>,
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
     pub stream: bool,
     #[serde(default)]
     pub logprobs: bool,

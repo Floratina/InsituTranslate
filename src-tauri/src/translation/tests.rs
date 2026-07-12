@@ -4,7 +4,7 @@ use crate::adapters::{
 use crate::db as app_db;
 use crate::domain::{
     AddModelInput, CreateProviderInput, ProviderProtocol, ProviderPurpose, ProviderRuntimeConfig,
-    ThinkingEffort, UpdateAssistantCustomParametersInput,
+    SetProviderEnabledInput, ThinkingEffort, UpdateAssistantCustomParametersInput,
 };
 use crate::glossary_prompt::GlossaryEntry;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
@@ -432,6 +432,7 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
             use_glossary: true,
             glossary_mode: GlossaryMode::Existing,
             glossary_id: Some("glossary-freeze-id".into()),
+            glossary_generation_config: GlossaryGenerationConfig::default(),
             thinking_effort: ThinkingEffort::None,
             use_web_search: false,
             use_custom_parameters: false,
@@ -459,6 +460,10 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
             provider_id: provider.id,
             model_id: model.id,
             assistant_id: None,
+            use_glossary: true,
+            glossary_mode: GlossaryMode::Existing,
+            glossary_id: Some("glossary-freeze-id".into()),
+            glossary_generation_config: GlossaryGenerationConfig::default(),
         },
     )
     .await
@@ -487,6 +492,246 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
     assert_eq!(snapshot["glossaryId"], "glossary-freeze-id");
 
     inp_pool.close().await;
+    provider_pool.close().await;
+    config_pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn create_task_rejects_disabled_translation_provider() {
+    let root = temp_root("disabled-translation-provider");
+    tokio::fs::create_dir_all(&root).await.expect("create root");
+    let provider_pool = app_db::connect(&root.join("providers.sqlite"))
+        .await
+        .expect("provider db");
+    let config_pool = connect_config_db(&root).await.expect("config db");
+    let provider = app_db::create_provider(
+        &provider_pool,
+        CreateProviderInput {
+            name: "Disabled Translation Provider".into(),
+            protocol: ProviderProtocol::OpenaiChat,
+            purpose: ProviderPurpose::Translation,
+            avatar: None,
+        },
+    )
+    .await
+    .expect("provider");
+    let model = app_db::add_model(
+        &provider_pool,
+        AddModelInput {
+            provider_id: provider.id.clone(),
+            request_name: "disabled-provider-model".into(),
+            alias: "Disabled Provider Model".into(),
+            source: "manual".into(),
+        },
+    )
+    .await
+    .expect("model");
+    app_db::set_provider_enabled(
+        &provider_pool,
+        SetProviderEnabledInput {
+            id: provider.id.clone(),
+            enabled: false,
+        },
+    )
+    .await
+    .expect("disable provider");
+    let source_path = root.join("source.txt");
+    tokio::fs::write(&source_path, "Apple animation.")
+        .await
+        .expect("write source");
+
+    let error = create_translation_task(
+        &provider_pool,
+        &Client::new(),
+        &config_pool,
+        &root,
+        CreateTranslationTaskInput {
+            file_path: source_path.to_string_lossy().to_string(),
+            source_language: "en".into(),
+            target_language: "zh-CN".into(),
+            tags: Vec::new(),
+            provider_id: provider.id,
+            model_id: model.id,
+            assistant_id: None,
+            use_glossary: false,
+            glossary_mode: GlossaryMode::Auto,
+            glossary_id: None,
+            glossary_generation_config: GlossaryGenerationConfig::default(),
+        },
+    )
+    .await
+    .expect_err("disabled provider must be rejected");
+
+    assert!(error.contains("disabled"));
+    provider_pool.close().await;
+    config_pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn auto_glossary_snapshot_is_frozen_and_legacy_backfill_missing_model_requires_action() {
+    let root = temp_root("auto-glossary-snapshot");
+    tokio::fs::create_dir_all(&root).await.expect("create root");
+    let provider_pool = app_db::connect(&root.join("providers.sqlite"))
+        .await
+        .expect("provider db");
+    let config_pool = connect_config_db(&root).await.expect("config db");
+
+    let translation_provider = app_db::create_provider(
+        &provider_pool,
+        CreateProviderInput {
+            name: "Translation Snapshot Provider".into(),
+            protocol: ProviderProtocol::OpenaiChat,
+            purpose: ProviderPurpose::Translation,
+            avatar: None,
+        },
+    )
+    .await
+    .expect("translation provider");
+    let translation_model = app_db::add_model(
+        &provider_pool,
+        AddModelInput {
+            provider_id: translation_provider.id.clone(),
+            request_name: "translation-snapshot-model".into(),
+            alias: "Translation Snapshot Model".into(),
+            source: "manual".into(),
+        },
+    )
+    .await
+    .expect("translation model");
+    let glossary_provider = app_db::create_provider(
+        &provider_pool,
+        CreateProviderInput {
+            name: "Glossary Snapshot Provider".into(),
+            protocol: ProviderProtocol::OpenaiChat,
+            purpose: ProviderPurpose::Glossary,
+            avatar: None,
+        },
+    )
+    .await
+    .expect("glossary provider");
+    let glossary_model = app_db::add_model(
+        &provider_pool,
+        AddModelInput {
+            provider_id: glossary_provider.id.clone(),
+            request_name: "glossary-snapshot-model".into(),
+            alias: "Glossary Snapshot Model".into(),
+            source: "manual".into(),
+        },
+    )
+    .await
+    .expect("glossary model");
+    let glossary_assistant = app_db::list_assistants(&provider_pool, ProviderPurpose::Glossary)
+        .await
+        .expect("glossary assistants")
+        .into_iter()
+        .next()
+        .expect("default glossary assistant");
+    let source_path = root.join("source.txt");
+    tokio::fs::write(&source_path, "Apple animation.")
+        .await
+        .expect("write source");
+
+    let task = create_translation_task(
+        &provider_pool,
+        &Client::new(),
+        &config_pool,
+        &root,
+        CreateTranslationTaskInput {
+            file_path: source_path.to_string_lossy().to_string(),
+            source_language: "en".into(),
+            target_language: "zh-CN".into(),
+            tags: Vec::new(),
+            provider_id: translation_provider.id.clone(),
+            model_id: translation_model.id.clone(),
+            assistant_id: None,
+            use_glossary: true,
+            glossary_mode: GlossaryMode::Auto,
+            glossary_id: None,
+            glossary_generation_config: GlossaryGenerationConfig {
+                provider_id: glossary_provider.id.clone(),
+                model_id: glossary_model.id.clone(),
+                assistant_id: Some(glossary_assistant.id.clone()),
+                thinking_effort: ThinkingEffort::None,
+                use_web_search: false,
+                use_custom_parameters: true,
+            },
+        },
+    )
+    .await
+    .expect("create task");
+    let inp_pool = connect_inp(Path::new(&task.inp_path)).await.expect("inp");
+    let snapshot_json: String =
+        sqlx::query_scalar("SELECT glossary_generation_snapshot_json FROM metadata LIMIT 1")
+            .fetch_one(&inp_pool)
+            .await
+            .expect("glossary snapshot");
+    let snapshot: Value = serde_json::from_str(&snapshot_json).expect("snapshot json");
+    assert_eq!(snapshot["modelRequestName"], "glossary-snapshot-model");
+    assert_eq!(snapshot["assistantId"], glossary_assistant.id);
+    assert!(snapshot.get("credential").is_none());
+    assert!(snapshot.get("headers").is_none());
+    sqlx::query("UPDATE metadata SET glossary_generation_snapshot_json = NULL")
+        .execute(&inp_pool)
+        .await
+        .expect("clear glossary snapshot");
+    inp_pool.close().await;
+
+    let fallback_config = TranslationConfigView {
+        provider_id: translation_provider.id,
+        model_id: translation_model.id,
+        use_glossary: true,
+        glossary_mode: GlossaryMode::Auto,
+        glossary_generation_config: GlossaryGenerationConfig {
+            provider_id: glossary_provider.id.clone(),
+            model_id: glossary_model.id.clone(),
+            assistant_id: Some(glossary_assistant.id.clone()),
+            thinking_effort: ThinkingEffort::None,
+            use_web_search: false,
+            use_custom_parameters: true,
+        },
+        ..TranslationConfigView::default()
+    };
+    sqlx::query("UPDATE translation_config SET config_json = ? WHERE id = 1")
+        .bind(serde_json::to_string(&fallback_config).expect("fallback config json"))
+        .execute(&config_pool)
+        .await
+        .expect("persist legacy fallback config");
+
+    app_db::set_provider_enabled(
+        &provider_pool,
+        SetProviderEnabledInput {
+            id: glossary_provider.id.clone(),
+            enabled: false,
+        },
+    )
+    .await
+    .expect("disable glossary provider");
+    let error = get_task_runtime_action_required(&provider_pool, &config_pool, &root, &task.id)
+        .await
+        .expect_err("disabled glossary provider must be a hard error");
+    assert!(error.contains("glossary provider is disabled"));
+    app_db::set_provider_enabled(
+        &provider_pool,
+        SetProviderEnabledInput {
+            id: glossary_provider.id,
+            enabled: true,
+        },
+    )
+    .await
+    .expect("enable glossary provider");
+
+    app_db::delete_model(&provider_pool, &glossary_model.id)
+        .await
+        .expect("delete glossary model");
+    let action = get_task_runtime_action_required(&provider_pool, &config_pool, &root, &task.id)
+        .await
+        .expect("runtime action")
+        .expect("action required");
+    assert_eq!(action.reason, TaskRuntimeActionReason::LocalConfigMissing);
+    assert_eq!(action.domains, vec![TaskRuntimeConfigDomain::Glossary]);
+
     provider_pool.close().await;
     config_pool.close().await;
     let _ = std::fs::remove_dir_all(root);
@@ -563,6 +808,7 @@ async fn create_task_injects_custom_parameters_only_when_enabled() {
                 use_glossary: false,
                 glossary_mode: GlossaryMode::Auto,
                 glossary_id: None,
+                glossary_generation_config: GlossaryGenerationConfig::default(),
                 thinking_effort: ThinkingEffort::None,
                 use_web_search: false,
                 use_custom_parameters: enabled,
@@ -585,6 +831,10 @@ async fn create_task_injects_custom_parameters_only_when_enabled() {
                 provider_id: provider.id.clone(),
                 model_id: model.id.clone(),
                 assistant_id: Some(assistant.id.clone()),
+                use_glossary: false,
+                glossary_mode: GlossaryMode::Auto,
+                glossary_id: None,
+                glossary_generation_config: GlossaryGenerationConfig::default(),
             },
         )
         .await
@@ -644,6 +894,106 @@ async fn inp_migration_adds_confidence_column() {
         .iter()
         .any(|row| row.get::<String, _>("name") == "confidence"));
     migrated.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+async fn downgrade_inp_fixture(path: &Path, schema_version: i64) {
+    let pool = connect_sqlite(path, 1).await.expect("open fixture");
+    let versioned_columns = [
+        (2, "chunks", "map_json"),
+        (2, "chunks", "preprocessed_text"),
+        (2, "chunks", "after_translate_text"),
+        (3, "chunks", "confidence"),
+        (6, "metadata", "use_glossary"),
+        (6, "metadata", "glossary_mode"),
+        (6, "metadata", "glossary_id"),
+        (7, "metadata", "global_background"),
+        (8, "metadata", "progress_detail_json"),
+        (9, "metadata", "active_retry_json"),
+        (10, "metadata", "source_text_tokens"),
+        (10, "metadata", "target_text_tokens"),
+        (10, "metadata", "total_text_tokens"),
+        (10, "metadata", "queued_from_status"),
+        (10, "chunks", "source_tokens"),
+        (10, "chunks", "target_tokens"),
+        (11, "metadata", "assistant_temperature"),
+        (11, "metadata", "assistant_top_p"),
+        (11, "metadata", "glossary_generation_snapshot_json"),
+        (11, "metadata", "runtime_action_required_json"),
+    ];
+    for (introduced, table, column) in versioned_columns {
+        if schema_version < introduced {
+            sqlx::query(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("drop {table}.{column}: {error}"));
+        }
+    }
+    if schema_version < 5 {
+        sqlx::query("DROP TABLE source_file")
+            .execute(&pool)
+            .await
+            .expect("drop source_file");
+    }
+    if schema_version < 4 {
+        sqlx::query("DROP TABLE assets")
+            .execute(&pool)
+            .await
+            .expect("drop assets");
+    }
+    sqlx::query("UPDATE metadata SET schema_version = ?")
+        .bind(schema_version)
+        .execute(&pool)
+        .await
+        .expect("set fixture schema version");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn read_only_validation_accepts_each_historical_inp_schema() {
+    let root = temp_root("read-only-schema-versions");
+    tokio::fs::create_dir_all(&root).await.expect("create root");
+    for schema_version in 1..=INP_SCHEMA_VERSION {
+        let path = root.join(format!("legacy-v{schema_version}.inp"));
+        write_test_inp(
+            &path,
+            &format!("task-v{schema_version}"),
+            &format!("Schema v{schema_version}"),
+        )
+        .await
+        .expect("write fixture");
+        downgrade_inp_fixture(&path, schema_version).await;
+        validate_inp_file(&path)
+            .await
+            .unwrap_or_else(|error| panic!("validate schema v{schema_version}: {error}"));
+
+        let migrated = connect_inp(&path).await.expect("migrate validated fixture");
+        let migrated_version: i64 =
+            sqlx::query_scalar("SELECT schema_version FROM metadata LIMIT 1")
+                .fetch_one(&migrated)
+                .await
+                .expect("read migrated version");
+        assert_eq!(migrated_version, INP_SCHEMA_VERSION);
+        migrated.close().await;
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_only_validation_rejects_missing_current_version_column() {
+    let root = temp_root("read-only-schema-required-column");
+    let path = root.join("invalid-v2.inp");
+    write_test_inp(&path, "task-invalid-v2", "Invalid v2")
+        .await
+        .expect("write fixture");
+    downgrade_inp_fixture(&path, 2).await;
+    let pool = connect_sqlite(&path, 1).await.expect("open fixture");
+    sqlx::query("ALTER TABLE chunks DROP COLUMN map_json")
+        .execute(&pool)
+        .await
+        .expect("drop required v2 column");
+    pool.close().await;
+    assert!(validate_inp_file(&path).await.is_err());
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1107,6 +1457,8 @@ async fn translate_chunk_retries_transient_429_without_interrupting_task() {
         },
         None,
         None,
+        None,
+        None,
         Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
         DocumentFormat::Txt,
         ContentFormat::PlainText,
@@ -1162,6 +1514,8 @@ async fn translate_chunk_interruption_returns_empty_interrupted_outcome() {
             web_search: false,
             thinking: None,
         },
+        None,
+        None,
         None,
         None,
         Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
@@ -1230,6 +1584,8 @@ async fn translate_chunk_interrupts_immediately_on_permanent_provider_error() {
             web_search: false,
             thinking: None,
         },
+        None,
+        None,
         None,
         None,
         Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
@@ -1304,6 +1660,8 @@ async fn translate_chunk_marks_transient_exhaustion_failed_without_interrupt() {
             web_search: false,
             thinking: None,
         },
+        None,
+        None,
         None,
         None,
         Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
@@ -1877,6 +2235,7 @@ async fn migrates_legacy_defaults_only_once() {
             use_glossary: true,
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
+            glossary_generation_config: GlossaryGenerationConfig::default(),
             thinking_effort: ThinkingEffort::None,
             use_web_search: false,
             use_custom_parameters: false,

@@ -86,6 +86,14 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   thinkingEffort: "none",
   useWebSearch: false,
   useCustomParameters: false,
+  glossaryGenerationConfig: {
+    providerId: "",
+    modelId: "",
+    assistantId: null,
+    thinkingEffort: "none",
+    useWebSearch: false,
+    useCustomParameters: false,
+  },
   confidenceMode: "off",
   pdfParsingMode: "local-first",
 };
@@ -107,7 +115,7 @@ const SUPPORTED_EXTENSIONS = new Set([
   "lrc",
 ]);
 
-const CREATION_STAGES: TranslationTaskCreationStage[] = ["ast", "chunking", "glossary"];
+const CREATION_STAGES: TranslationTaskCreationStage[] = ["ast", "chunking"];
 const activeCreationStatuses = new Set<TranslationTaskCreationStatus>(["queued", "running"]);
 const ignoredCreationIds = new Set<string>();
 const ignoredCreationPaths = new Set<string>();
@@ -146,23 +154,10 @@ function progressStep(
   return { state, current, total, percent, label };
 }
 
-function glossaryCreationStep(config?: TranslationConfigView): ProgressStep {
-  if (!config) {
-    return progressStep("pending", 0, 0, "术语表等待中");
-  }
-  if (!config.useGlossary) {
-    return progressStep("success", 1, 1, "术语表已忽略");
-  }
-  if (config.glossaryMode === "existing" || config.glossaryId) {
-    return progressStep("success", 1, 1, "术语表已选择");
-  }
-  return progressStep("success", 1, 1, "自动术语表将在翻译时建立");
-}
-
 function createCreationJob(
   filePath: string,
   clientTaskId: string,
-  config?: TranslationConfigView,
+  _config?: TranslationConfigView,
 ): StartCreationJob {
   return {
     clientTaskId,
@@ -171,7 +166,7 @@ function createCreationJob(
     stages: {
       ast: progressStep("pending", 0, 0, "AST 等待中"),
       chunking: progressStep("pending", 0, 0, "分块等待中"),
-      glossary: glossaryCreationStep(config),
+      glossary: progressStep("success", 1, 1, "术语表将在任务运行时处理"),
     },
     taskId: null,
     error: null,
@@ -275,7 +270,7 @@ function activeCreationStage(job: StartCreationJob): TranslationTaskCreationStag
   return CREATION_STAGES.find((stage) => job.stages[stage].state === "failed")
     ?? CREATION_STAGES.find((stage) => job.stages[stage].state === "running")
     ?? CREATION_STAGES.find((stage) => job.stages[stage].state === "pending")
-    ?? "glossary";
+    ?? "chunking";
 }
 
 function creationStepWidth(step: ProgressStep): number {
@@ -344,8 +339,28 @@ function normalizeGlossaryConfig(
   }
   return {
     ...config,
-    glossaryMode: "auto",
     glossaryId: null,
+  };
+}
+
+function initializeEmptyRuntimeConfig(
+  config: TranslationConfigView,
+  translationProviders: ProviderView[],
+  glossaryProviders: ProviderView[],
+): TranslationConfigView {
+  const translationProvider = !config.providerId ? translationProviders[0] : undefined;
+  const glossaryProvider = !config.glossaryGenerationConfig.providerId
+    ? glossaryProviders[0]
+    : undefined;
+  return {
+    ...config,
+    providerId: translationProvider?.id ?? config.providerId,
+    modelId: translationProvider?.models[0]?.id ?? config.modelId,
+    glossaryGenerationConfig: {
+      ...config.glossaryGenerationConfig,
+      providerId: glossaryProvider?.id ?? config.glossaryGenerationConfig.providerId,
+      modelId: glossaryProvider?.models[0]?.id ?? config.glossaryGenerationConfig.modelId,
+    },
   };
 }
 
@@ -374,6 +389,9 @@ function normalizeStartConfig(
     thinkingEffort: config.thinkingEffort ?? "none",
     useWebSearch: config.useWebSearch ?? false,
     useCustomParameters: config.useCustomParameters ?? false,
+    glossaryGenerationConfig: config.glossaryGenerationConfig ?? {
+      ...DEFAULT_CONFIG.glossaryGenerationConfig,
+    },
     confidenceMode: config.confidenceMode ?? "off",
     pdfParsingMode: config.pdfParsingMode ?? "local-first",
   };
@@ -382,17 +400,28 @@ function normalizeStartConfig(
 
 export default function StartPage({ onTaskCreated }: StartPageProps) {
   const cachedDraft = appSessionCache.startDraft.read();
-  const cachedProviderOptions = appSessionCache.providers("translation").read();
-  const cachedAssistantOptions = appSessionCache.assistants("translation").read();
+  const cachedTranslationProviderOptions = appSessionCache.providers("translation").read();
+  const cachedGlossaryProviderOptions = appSessionCache.providers("glossary").read();
+  const cachedTranslationAssistantOptions = appSessionCache.assistants("translation").read();
+  const cachedGlossaryAssistantOptions = appSessionCache.assistants("glossary").read();
   const cachedGlossaryIndex = appSessionCache.glossaryIndex.read();
   const cachedGlossaries = cachedGlossaryIndex?.filterSeed;
   const cachedConfig = cachedDraft?.config ?? appSessionCache.translationConfig.read();
-  const initialConfig = cachedConfig
+  const normalizedInitialConfig = cachedConfig
     ? normalizeStartConfig(cachedConfig, cachedGlossaries)
     : normalizeStartConfig(cachedDraft?.config ?? DEFAULT_CONFIG);
+  const initialConfig = initializeEmptyRuntimeConfig(
+    normalizedInitialConfig,
+    (cachedTranslationProviderOptions ?? []).filter((provider) => provider.enabled),
+    (cachedGlossaryProviderOptions ?? []).filter((provider) => provider.enabled),
+  );
   const hasCachedOptions = Boolean(
-    cachedDraft
-      || (cachedProviderOptions && cachedAssistantOptions && cachedGlossaries && cachedConfig),
+    cachedTranslationProviderOptions
+      && cachedGlossaryProviderOptions
+      && cachedTranslationAssistantOptions
+      && cachedGlossaryAssistantOptions
+      && cachedGlossaries
+      && cachedConfig,
   );
 
   const [filePaths, setFilePaths] = useState<string[]>(cachedDraft?.filePaths ?? []);
@@ -406,20 +435,19 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   const [targetLanguage, setTargetLanguage] = useState(
     cachedDraft?.targetLanguage ?? initialConfig.targetLanguage,
   );
-  const [providers, setProviders] = useState<ProviderView[]>(
-    (cachedProviderOptions ?? []).filter((provider) => provider.enabled),
+  const [translationProviders, setTranslationProviders] = useState<ProviderView[]>(
+    (cachedTranslationProviderOptions ?? []).filter((provider) => provider.enabled),
   );
-  const [assistants, setAssistants] = useState<AssistantView[]>(
-    cachedAssistantOptions ?? [],
+  const [glossaryProviders, setGlossaryProviders] = useState<ProviderView[]>(
+    (cachedGlossaryProviderOptions ?? []).filter((provider) => provider.enabled),
+  );
+  const [translationAssistants, setTranslationAssistants] = useState<AssistantView[]>(
+    cachedTranslationAssistantOptions ?? [],
+  );
+  const [glossaryAssistants, setGlossaryAssistants] = useState<AssistantView[]>(
+    cachedGlossaryAssistantOptions ?? [],
   );
   const [glossaries, setGlossaries] = useState<GlossaryView[]>(cachedGlossaries ?? []);
-  const [providerId, setProviderId] = useState(
-    cachedDraft?.providerId ?? initialConfig.providerId,
-  );
-  const [modelId, setModelId] = useState(cachedDraft?.modelId ?? initialConfig.modelId);
-  const [assistantId, setAssistantId] = useState<string>(
-    cachedDraft?.assistantId ?? initialConfig.assistantId,
-  );
   const [config, setConfig] = useState<TranslationConfigView>(initialConfig);
   const [loading, setLoading] = useState(!hasCachedOptions);
   const [busy, setBusy] = useState(false);
@@ -462,12 +490,6 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     [creationJobs, idleFilePaths],
   );
 
-  const selectedProvider = useMemo(
-    () => providers.find((provider) => provider.id === providerId) ?? null,
-    [providerId, providers],
-  );
-  const models = selectedProvider?.models ?? [];
-
   const addFilePaths = useCallback((paths: string[]): void => {
     const supported = paths.filter(supportedFile);
     supported.forEach((path) => ignoredCreationPaths.delete(path));
@@ -478,12 +500,9 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
       void startPreprocessingForPaths(supported);
     }
   }, [
-    assistantId,
     config,
     filePaths,
     loading,
-    modelId,
-    providerId,
     pushToast,
     sourceLanguage,
     targetLanguage,
@@ -550,19 +569,16 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
       sourceLanguage,
       detectedSourceLanguage,
       targetLanguage,
-      providerId,
-      modelId,
-      assistantId,
+      providerId: config.providerId,
+      modelId: config.modelId,
+      assistantId: config.assistantId,
       config,
     });
   }, [
-    assistantId,
     config,
     detectedSourceLanguage,
     idleFilePaths,
     loading,
-    modelId,
-    providerId,
     sourceLanguage,
     targetLanguage,
   ]);
@@ -591,47 +607,22 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     void refreshOptions();
   }, []);
 
-  useEffect(() => {
-    if (providers.length === 0) {
-      setProviderId("");
-      return;
-    }
-    if (!providers.some((provider) => provider.id === providerId)) {
-      setProviderId(providers[0].id);
-    }
-  }, [providerId, providers]);
-
-  useEffect(() => {
-    if (!modelId && models.length > 0) {
-      setModelId(models[0].id);
-      return;
-    }
-    if (modelId && !models.some((model) => model.id === modelId)) {
-      setModelId(models[0]?.id ?? "");
-    }
-  }, [modelId, models]);
-
-  useEffect(() => {
-    if (assistantId !== "__none__" && !assistants.some((assistant) => assistant.id === assistantId)) {
-      setAssistantId("__none__");
-    }
-  }, [assistantId, assistants]);
-
   async function refreshOptions(): Promise<void> {
     setLoading(true);
     try {
       if (!isTauriRuntime()) {
-        setProviders([]);
-        setAssistants([]);
+        setTranslationProviders([]);
+        setGlossaryProviders([]);
+        setTranslationAssistants([]);
+        setGlossaryAssistants([]);
         setGlossaries([]);
         setConfig(DEFAULT_CONFIG);
         setSourceLanguage(DEFAULT_CONFIG.sourceLanguage);
         setTargetLanguage(DEFAULT_CONFIG.targetLanguage);
-        setProviderId("");
-        setModelId("");
-        setAssistantId(DEFAULT_CONFIG.assistantId);
         appSessionCache.providers("translation").set([]);
+        appSessionCache.providers("glossary").set([]);
         appSessionCache.assistants("translation").set([]);
+        appSessionCache.assistants("glossary").set([]);
         appSessionCache.translationConfig.set(DEFAULT_CONFIG);
         appSessionCache.glossaryIndex.set({
           glossaries: [],
@@ -648,13 +639,26 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
         });
         return;
       }
-      const [providerResult, assistantResult, configResult, glossaryIndex] = await Promise.all([
+      const [
+        translationProviderResult,
+        glossaryProviderResult,
+        translationAssistantResult,
+        glossaryAssistantResult,
+        configResult,
+        glossaryIndex,
+      ] = await Promise.all([
         appSessionCache
           .providers("translation")
           .loadOnce(() => invoke<ProviderView[]>("list_providers", { purpose: "translation" })),
         appSessionCache
+          .providers("glossary")
+          .loadOnce(() => invoke<ProviderView[]>("list_providers", { purpose: "glossary" })),
+        appSessionCache
           .assistants("translation")
           .loadOnce(() => invoke<AssistantView[]>("list_assistants", { purpose: "translation" })),
+        appSessionCache
+          .assistants("glossary")
+          .loadOnce(() => invoke<AssistantView[]>("list_assistants", { purpose: "glossary" })),
         appSessionCache.translationConfig.loadOnce(getTranslationConfig),
         appSessionCache.glossaryIndex.loadOnce(async () => {
           const glossaries = await listGlossaries(null);
@@ -674,16 +678,25 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
         }),
       ]);
       const glossaryResult = glossaryIndex.filterSeed;
-      setProviders(providerResult.filter((provider) => provider.enabled));
-      setAssistants(assistantResult);
+      const enabledTranslationProviders = translationProviderResult.filter(
+        (provider) => provider.enabled,
+      );
+      const enabledGlossaryProviders = glossaryProviderResult.filter(
+        (provider) => provider.enabled,
+      );
+      setTranslationProviders(enabledTranslationProviders);
+      setGlossaryProviders(enabledGlossaryProviders);
+      setTranslationAssistants(translationAssistantResult);
+      setGlossaryAssistants(glossaryAssistantResult);
       setGlossaries(glossaryResult);
-      const normalizedConfig = normalizeGlossaryConfig(configResult, glossaryResult);
+      const normalizedConfig = initializeEmptyRuntimeConfig(
+        normalizeStartConfig(cachedDraft?.config ?? configResult, glossaryResult),
+        enabledTranslationProviders,
+        enabledGlossaryProviders,
+      );
       setConfig(normalizedConfig);
       setSourceLanguage(normalizedConfig.sourceLanguage);
       setTargetLanguage(normalizedConfig.targetLanguage);
-      setProviderId(normalizedConfig.providerId);
-      setModelId(normalizedConfig.modelId);
-      setAssistantId(normalizedConfig.assistantId);
     } catch (error) {
       pushToast(getErrorMessage(error), "error");
     } finally {
@@ -735,17 +748,12 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
         customSourceLanguage: "",
         targetLanguage,
         customTargetLanguage: "",
-        providerId,
-        modelId,
-        assistantId,
       });
-      setConfig(saved);
+      const normalizedSaved = normalizeStartConfig(saved, glossaries);
+      setConfig(normalizedSaved);
       setSourceLanguage(saved.sourceLanguage);
       setTargetLanguage(saved.targetLanguage);
-      setProviderId(saved.providerId);
-      setModelId(saved.modelId);
-      setAssistantId(saved.assistantId);
-      appSessionCache.translationConfig.set(saved);
+      appSessionCache.translationConfig.set(normalizedSaved);
       if (showSuccess) pushToast("全部设置已保存", "success");
       return true;
     } catch (error) {
@@ -768,7 +776,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
       pushToast("配置仍在加载，请稍后再添加文件", "warning");
       return;
     }
-    if (!providerId || !modelId) {
+    if (!config.providerId || !config.modelId) {
       pushToast("请先选择已启用的翻译提供商和模型，再添加文件", "warning");
       return;
     }
@@ -791,9 +799,13 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
           sourceLanguage: resolvedSourceLanguage,
           targetLanguage: resolvedTargetLanguage,
           tags: [],
-          providerId,
-          modelId,
-          assistantId: assistantId === "__none__" ? null : assistantId,
+          providerId: config.providerId,
+          modelId: config.modelId,
+          assistantId: config.assistantId === "__none__" ? null : config.assistantId,
+          useGlossary: config.useGlossary,
+          glossaryMode: config.glossaryMode,
+          glossaryId: config.glossaryId,
+          glossaryGenerationConfig: config.glossaryGenerationConfig,
         });
         if (ignoredCreationPaths.has(path)) {
           ignoredCreationIds.add(result.clientTaskId);
@@ -977,20 +989,15 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
               sourceLanguage={sourceLanguage}
               detectedSourceLanguage={detectedSourceLanguage}
               targetLanguage={targetLanguage}
-              providers={providers}
-              models={models}
-              assistants={assistants}
+              translationProviders={translationProviders}
+              glossaryProviders={glossaryProviders}
+              translationAssistants={translationAssistants}
+              glossaryAssistants={glossaryAssistants}
               glossaries={glossaries}
-              providerId={providerId}
-              modelId={modelId}
-              assistantId={assistantId}
               config={config}
               loading={loading}
               onSourceLanguageChange={setSourceLanguage}
               onTargetLanguageChange={setTargetLanguage}
-              onProviderChange={setProviderId}
-              onModelChange={setModelId}
-              onAssistantChange={setAssistantId}
               onConfigChange={setConfig}
               onNumberChange={updateNumber}
             />

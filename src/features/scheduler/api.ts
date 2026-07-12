@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { TaskRuntimeActionRequired } from "@/features/translation/types";
 
 export type SchedulerAction =
   | { type: "enqueue"; taskId: string }
@@ -12,6 +13,7 @@ export type SchedulerAction =
 export interface SchedulerAck {
   success: boolean;
   message: string | null;
+  actionRequired: TaskRuntimeActionRequired | null;
 }
 
 export interface TaskSchedulerPreferences {

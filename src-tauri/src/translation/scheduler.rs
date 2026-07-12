@@ -7,6 +7,7 @@ use reqwest::Client;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::adapters::{
     finish_reason_is_truncation, ProviderChatError, ProviderChatMeta, RateLimitTelemetry,
@@ -34,7 +35,8 @@ use super::db::{
     metadata_task, parse_source_file_for_task, pending_chunks, progress_detail_for_config,
     progress_detail_for_translation_stats, publish_task_index_snapshot, refresh_task_stats,
     resolve_source_file, set_active_retry_and_emit, set_progress_detail,
-    task_assistant_custom_parameters, task_assistant_prompt, task_glossary_config,
+    task_assistant_custom_parameters, task_assistant_prompt, task_assistant_sampling,
+    task_glossary_config,
 };
 use super::glossary::{prepare_task_glossary, TaskGlossaryMatcher, TaskGlossaryPreparation};
 use super::limiter::{
@@ -68,7 +70,21 @@ pub(super) struct ActiveRetryReporter {
 }
 
 impl ActiveRetryReporter {
-    async fn report(
+    pub(super) fn new(
+        app: AppHandle,
+        inp_pool: SqlitePool,
+        config_pool: SqlitePool,
+        inp_path: PathBuf,
+    ) -> Self {
+        Self {
+            app,
+            inp_pool,
+            config_pool,
+            inp_path,
+        }
+    }
+
+    pub(super) async fn report(
         &self,
         chunk_id: &str,
         current: u32,
@@ -488,6 +504,7 @@ pub async fn run_translation_task(
     let model = app_db::get_model(&provider_pool, &task.model_id).await?;
     let config = app_db::runtime_config(&provider_pool, &task.provider_id).await?;
     let assistant_prompt = task_assistant_prompt(&inp_pool).await?;
+    let (assistant_temperature, assistant_top_p) = task_assistant_sampling(&inp_pool).await?;
     let assistant_custom_parameters = task_assistant_custom_parameters(&inp_pool).await?;
     let request_options = resolve_translation_request_options(
         &prepared.config,
@@ -538,6 +555,8 @@ pub async fn run_translation_task(
             target_language,
             assistant_prompt,
             request_options,
+            assistant_temperature,
+            assistant_top_p,
             global_background,
             glossary_matcher,
             document_format,
@@ -585,16 +604,18 @@ pub async fn run_translation_task(
             let quota = quota.clone();
             let manual_limiter = manual_limiter.clone();
             let backend_log = backend_log.clone();
-            let retry_reporter = ActiveRetryReporter {
-                app: app.clone(),
-                inp_pool: inp_pool.clone(),
-                config_pool: config_pool.clone(),
-                inp_path: prepared.inp_path.clone(),
-            };
+            let retry_reporter = ActiveRetryReporter::new(
+                app.clone(),
+                inp_pool.clone(),
+                config_pool.clone(),
+                prepared.inp_path.clone(),
+            );
             let model_request_name = model.request_name.clone();
             let target_language = target_language.clone();
             let assistant_prompt = assistant_prompt.clone();
             let request_options = request_options.clone();
+            let assistant_temperature = assistant_temperature;
+            let assistant_top_p = assistant_top_p;
             let glossary_matcher = glossary_matcher.clone();
             let global_background = global_background.clone();
             let inp_pool = inp_pool.clone();
@@ -644,6 +665,8 @@ pub async fn run_translation_task(
                     target_language,
                     assistant_prompt,
                     request_options,
+                    assistant_temperature,
+                    assistant_top_p,
                     global_background,
                     previous_context,
                     glossary_matcher,
@@ -689,6 +712,8 @@ async fn run_sliding_window_translation(
     target_language: String,
     assistant_prompt: Option<String>,
     request_options: TranslationRequestOptions,
+    assistant_temperature: Option<f64>,
+    assistant_top_p: Option<f64>,
     global_background: Option<String>,
     glossary_matcher: Arc<TaskGlossaryMatcher>,
     document_format: DocumentFormat,
@@ -732,6 +757,8 @@ async fn run_sliding_window_translation(
             target_language.clone(),
             assistant_prompt.clone(),
             request_options.clone(),
+            assistant_temperature,
+            assistant_top_p,
             global_background.clone(),
             previous_context,
             glossary_matcher.clone(),
@@ -745,12 +772,12 @@ async fn run_sliding_window_translation(
             manual_limiter.clone(),
             backend_log.clone(),
             interrupt.clone(),
-            Some(ActiveRetryReporter {
-                app: app.clone(),
-                inp_pool: inp_pool.clone(),
-                config_pool: config_pool.clone(),
-                inp_path: inp_path.to_path_buf(),
-            }),
+            Some(ActiveRetryReporter::new(
+                app.clone(),
+                inp_pool.clone(),
+                config_pool.clone(),
+                inp_path.to_path_buf(),
+            )),
         )
         .await;
         let interrupt_task = outcome.interrupt_task;
@@ -905,6 +932,8 @@ pub(super) async fn translate_chunk(
     target_language: String,
     assistant_prompt: Option<String>,
     request_options: TranslationRequestOptions,
+    assistant_temperature: Option<f64>,
+    assistant_top_p: Option<f64>,
     global_background: Option<String>,
     previous_context: Option<String>,
     glossary_matcher: Arc<TaskGlossaryMatcher>,
@@ -1007,7 +1036,8 @@ pub(super) async fn translate_chunk(
             web_search: request_options.web_search,
             thinking: request_options.thinking.clone(),
             max_output_tokens: None,
-            temperature: Some(0.0),
+            temperature: assistant_temperature,
+            top_p: assistant_top_p,
             stream: false,
             logprobs: confidence_mode.enabled(),
             custom_parameters: request_options.custom_parameters.clone(),
@@ -1023,37 +1053,34 @@ pub(super) async fn translate_chunk(
                 .unwrap_or(0)
             + 256;
         if let Some(manual_limiter) = manual_limiter.as_ref() {
-            tokio::select! {
-                _ = manual_limiter.before_request(estimated_tokens) => {}
-                _ = interrupt.cancelled() => {
-                    return interrupted_outcome(chunk, retry_count, interrupt.reason());
-                }
-            }
-        }
-        tokio::select! {
-            _ = quota.before_request(estimated_tokens) => {}
-            _ = interrupt.cancelled() => {
+            if !manual_limiter
+                .before_request(estimated_tokens, interrupt.token())
+                .await
+            {
                 return interrupted_outcome(chunk, retry_count, interrupt.reason());
             }
         }
-        let request_result = tokio::select! {
-            result = send_chat_with_logprobs_fallback(
-                &adapter,
-                &request,
-                estimated_tokens,
-                &quota,
-                &limiter,
-                manual_limiter.as_ref(),
-            ) => result,
-            _ = interrupt.cancelled() => {
-                return interrupted_outcome(chunk, retry_count, interrupt.reason());
-            }
-        };
+        if !quota
+            .before_request(estimated_tokens, interrupt.token())
+            .await
+        {
+            return interrupted_outcome(chunk, retry_count, interrupt.reason());
+        }
+        let request_result = send_chat_with_logprobs_fallback(
+            &adapter,
+            &request,
+            estimated_tokens,
+            &quota,
+            &limiter,
+            manual_limiter.as_ref(),
+            interrupt.token(),
+        )
+        .await;
         if interrupt.is_interrupted() {
             return interrupted_outcome(chunk, retry_count, interrupt.reason());
         }
         match request_result {
-            Ok(meta) => {
+            Ok(Some(meta)) => {
                 quota.update(&meta.rate_limits).await;
                 limiter
                     .on_result(meta.rate_limits.has_quota_headers(), true, false)
@@ -1283,6 +1310,9 @@ pub(super) async fn translate_chunk(
                     confidence,
                 };
             }
+            Ok(None) => {
+                return interrupted_outcome(chunk, retry_count, interrupt.reason());
+            }
             Err(error) => {
                 quota.update(&error.rate_limits).await;
                 limiter
@@ -1294,6 +1324,18 @@ pub(super) async fn translate_chunk(
                     .await;
                 let rate_status =
                     current_rate_limit_status(&error.rate_limits, &limiter, &manual_limiter).await;
+                if error.is_model_unavailable() {
+                    return failed_outcome(
+                        chunk,
+                        TranslationChunkStatus::Failed,
+                        retry_count,
+                        Some(format!("MODEL_UNAVAILABLE:TRANSLATION:{error}")),
+                        last_text,
+                        last_stats,
+                        rate_status,
+                        true,
+                    );
+                }
                 last_error = Some(error.to_string());
                 log_chunk_issue(
                     &backend_log,
@@ -1389,9 +1431,17 @@ async fn send_chat_with_logprobs_fallback(
     quota: &HeaderQuotaPolicy,
     limiter: &AdaptiveLimiter,
     manual_limiter: Option<&Arc<ManualRateLimiter>>,
-) -> Result<ProviderChatMeta, ProviderChatError> {
-    match adapter.send_chat_with_meta(request).await {
-        Ok(meta) => Ok(meta),
+    cancellation: &CancellationToken,
+) -> Result<Option<ProviderChatMeta>, ProviderChatError> {
+    let initial = tokio::select! {
+        result = adapter.send_chat_with_meta(request) => Some(result),
+        _ = cancellation.cancelled() => None,
+    };
+    let Some(initial) = initial else {
+        return Ok(None);
+    };
+    match initial {
+        Ok(meta) => Ok(Some(meta)),
         Err(error) if request.logprobs && logprobs_parameter_rejected(&error) => {
             quota.update(&error.rate_limits).await;
             limiter
@@ -1404,10 +1454,20 @@ async fn send_chat_with_logprobs_fallback(
             let mut fallback = request.clone();
             fallback.logprobs = false;
             if let Some(manual_limiter) = manual_limiter {
-                manual_limiter.before_request(estimated_tokens).await;
+                if !manual_limiter
+                    .before_request(estimated_tokens, cancellation)
+                    .await
+                {
+                    return Ok(None);
+                }
             }
-            quota.before_request(estimated_tokens).await;
-            adapter.send_chat_with_meta(&fallback).await
+            if !quota.before_request(estimated_tokens, cancellation).await {
+                return Ok(None);
+            }
+            tokio::select! {
+                result = adapter.send_chat_with_meta(&fallback) => result.map(Some),
+                _ = cancellation.cancelled() => Ok(None),
+            }
         }
         Err(error) => Err(error),
     }

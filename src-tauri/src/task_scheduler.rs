@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::diagnostics::BackendLog;
 use crate::settings::{self, TaskSchedulerPreferences};
 use crate::translation_tasks::{
-    self, RunMode, TranslationInterrupt, TranslationProgressPayload, TranslationTaskStatus,
-    TranslationTaskView,
+    self, RunMode, TaskRuntimeActionRequired, TranslationInterrupt, TranslationProgressPayload,
+    TranslationTaskStatus, TranslationTaskView,
 };
 
 const TASK_STATUS_CHANGED_EVENT: &str = "task-status-changed";
@@ -46,6 +46,7 @@ pub enum SchedulerAction {
 pub struct SchedulerAck {
     pub success: bool,
     pub message: Option<String>,
+    pub action_required: Option<TaskRuntimeActionRequired>,
 }
 
 impl SchedulerAck {
@@ -53,6 +54,7 @@ impl SchedulerAck {
         Self {
             success: true,
             message: None,
+            action_required: None,
         }
     }
 
@@ -60,6 +62,15 @@ impl SchedulerAck {
         Self {
             success: false,
             message: Some(message),
+            action_required: None,
+        }
+    }
+
+    fn action_required(action: TaskRuntimeActionRequired) -> Self {
+        Self {
+            success: false,
+            message: Some("Task runtime configuration requires user action".into()),
+            action_required: Some(action),
         }
     }
 }
@@ -114,6 +125,7 @@ struct TaskSchedulerWorker {
 
 enum DispatchError {
     Rejected(String),
+    ActionRequired(TaskRuntimeActionRequired),
     Infrastructure(String),
 }
 
@@ -159,6 +171,9 @@ impl TaskSchedulerWorker {
                     let result = match self.dispatch_action(action).await {
                         Ok(()) => Ok(SchedulerAck::accepted()),
                         Err(DispatchError::Rejected(error)) => Ok(SchedulerAck::rejected(error)),
+                        Err(DispatchError::ActionRequired(action)) => {
+                            Ok(SchedulerAck::action_required(action))
+                        }
                         Err(DispatchError::Infrastructure(error)) => Err(error),
                     };
                     let _ = reply.send(result);
@@ -242,6 +257,17 @@ impl TaskSchedulerWorker {
                     }
                 }
             };
+            if let Some(action) = translation_tasks::get_task_runtime_action_required(
+                &self.context.provider_pool,
+                &self.context.config_pool,
+                &self.context.workspace_root,
+                &id,
+            )
+            .await
+            .map_err(DispatchError::Infrastructure)?
+            {
+                return Err(DispatchError::ActionRequired(action));
+            }
             scheduled.push(ScheduledTask {
                 id: id.clone(),
                 mode,
@@ -471,6 +497,41 @@ async fn execute_task(
             }
         };
     let inp_path = PathBuf::from(&indexed.inp_path);
+    match translation_tasks::get_task_runtime_action_required(
+        &context.provider_pool,
+        &context.config_pool,
+        &context.workspace_root,
+        &task.id,
+    )
+    .await
+    {
+        Ok(Some(action)) => {
+            if let Err(error) = translation_tasks::restore_queued_tasks(
+                &context.app,
+                &context.config_pool,
+                std::slice::from_ref(&task.id),
+            )
+            .await
+            {
+                mark_execution_failed(&context, &task.id, &inp_path, error).await;
+                return;
+            }
+            log_execution_error(
+                &context.app,
+                &task.id,
+                &format!(
+                    "Task runtime configuration requires action: {:?}",
+                    action.reason
+                ),
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            mark_execution_failed(&context, &task.id, &inp_path, error).await;
+            return;
+        }
+    }
     let prepared = match translation_tasks::prepare_translation_run(
         &context.app,
         &context.provider_pool,

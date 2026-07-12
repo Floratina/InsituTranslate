@@ -327,9 +327,14 @@ function ProviderSettingsPage() {
     },
     [purpose],
   );
+  const handleProviderUpdated = useCallback((provider: ProviderView): void => {
+    appSessionCache.invalidateProviders();
+    void refreshProviders(provider.id, true);
+  }, [purpose]);
   const { setEnabledOptimistically, syncProviders } = useProviderEnabledToggle({
     setProviders: setProvidersAndCache,
     onError: setError,
+    onUpdated: handleProviderUpdated,
   });
 
   const selectedProvider = useMemo(
@@ -458,6 +463,11 @@ function ProviderSettingsPage() {
     }
   }
 
+  async function refreshProvidersAfterMutation(preferredId?: string): Promise<void> {
+    appSessionCache.invalidateProviders();
+    await refreshProviders(preferredId, true);
+  }
+
   function flash(message: string): void {
     pushToast(message);
   }
@@ -473,7 +483,7 @@ function ProviderSettingsPage() {
       });
       setAddProviderOpen(false);
       setProviderForm(EMPTY_PROVIDER_FORM);
-      await refreshProviders(created.id, true);
+      await refreshProvidersAfterMutation(created.id);
       flash("提供商已添加");
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -491,9 +501,7 @@ function ProviderSettingsPage() {
         input,
       });
       providerDraftBaseline.current = JSON.stringify(input);
-      setProvidersAndCache((items) =>
-        items.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      await refreshProvidersAfterMutation(updated.id);
       setError("");
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -505,9 +513,7 @@ function ProviderSettingsPage() {
       const updated = await invoke<ProviderView>("update_vertex_ai_config", {
         input,
       });
-      setProvidersAndCache((items) =>
-        items.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      await refreshProvidersAfterMutation(updated.id);
       setError("");
     } catch (cause) {
       throw new Error(getErrorMessage(cause));
@@ -536,9 +542,7 @@ function ProviderSettingsPage() {
               location: vertexConfig.location,
             } satisfies ImportVertexAiServiceAccountInput,
           });
-      setProvidersAndCache((items) =>
-        items.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      await refreshProvidersAfterMutation(updated.id);
       setServiceAccountJson("");
       setServiceAccountOpen(false);
       pushToast(clear ? "服务账号私钥已清空" : "服务账号 JSON 已解析并安全保存", "success");
@@ -580,9 +584,7 @@ function ProviderSettingsPage() {
           privateKey: clear ? "" : privateKeyValue,
         } satisfies UpdateVertexAiConfigInput,
       });
-      setProvidersAndCache((items) =>
-        items.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      await refreshProvidersAfterMutation(updated.id);
       setPrivateKeyValue("");
       setPrivateKeyOpen(false);
       pushToast(clear ? "私钥已清空" : "私钥已安全保存", "success");
@@ -598,7 +600,7 @@ function ProviderSettingsPage() {
     try {
       await invoke("delete_provider", { id: provider.id });
       setDeleteTarget(null);
-      await refreshProviders(undefined, true);
+      await refreshProvidersAfterMutation();
       flash("提供商已删除");
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -633,9 +635,7 @@ function ProviderSettingsPage() {
       const updated = await invoke<ProviderView>("update_provider_metadata", {
         input: { id: editingProviderId, ...providerForm },
       });
-      setProvidersAndCache((items) =>
-        items.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      await refreshProvidersAfterMutation(updated.id);
       setAddProviderOpen(false);
       setEditingProviderId(null);
       flash("提供商已更新");
@@ -651,11 +651,9 @@ function ProviderSettingsPage() {
       const copied = await invoke<ProviderView>("copy_provider", {
         input: { providerId: provider.id, purpose: targetPurpose },
       });
-      if (targetPurpose === purpose) {
-        await refreshProviders(copied.id, true);
-      } else {
-        appSessionCache.providers(targetPurpose).invalidate();
-      }
+      await refreshProvidersAfterMutation(targetPurpose === purpose
+        ? copied.id
+        : selectedProviderId);
       flash(`已复制到${purposeLabel(targetPurpose)}`);
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -676,6 +674,7 @@ function ProviderSettingsPage() {
       await invoke<ProviderView[]>("reorder_providers", {
         input: { purpose, providerIds: providerOrderRef.current },
       });
+      await refreshProvidersAfterMutation(selectedProviderId);
     } catch (cause) {
       setError(getErrorMessage(cause));
       await refreshProviders(selectedProviderId, true);
@@ -692,7 +691,7 @@ function ProviderSettingsPage() {
       });
       setCredentialValue("");
       setCredentialOpen(false);
-      await refreshProviders(selectedProvider.id, true);
+      await refreshProvidersAfterMutation(selectedProvider.id);
       flash(clear ? "凭据已清除" : "凭据已安全保存");
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -711,7 +710,7 @@ function ProviderSettingsPage() {
       });
       setHeadersJson("");
       setHeadersOpen(false);
-      await refreshProviders(selectedProvider.id, true);
+      await refreshProvidersAfterMutation(selectedProvider.id);
       flash(clear ? "自定义请求头已清除" : "自定义请求头已安全保存");
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -765,7 +764,7 @@ function ProviderSettingsPage() {
             : item,
         ),
       );
-      await refreshProviders(selectedProvider.id, true);
+      await refreshProvidersAfterMutation(selectedProvider.id);
     } catch (cause) {
       setError(getErrorMessage(cause));
     } finally {
@@ -787,7 +786,7 @@ function ProviderSettingsPage() {
       });
       setAddModelOpen(false);
       setModelForm(EMPTY_MODEL_FORM);
-      await refreshProviders(selectedProvider.id, true);
+      await refreshProvidersAfterMutation(selectedProvider.id);
       flash("模型已添加");
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -809,7 +808,7 @@ function ProviderSettingsPage() {
         },
       });
       setSettingsModel(null);
-      await refreshProviders(selectedProvider.id, true);
+      await refreshProvidersAfterMutation(selectedProvider.id);
       flash("模型设置已保存");
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -824,7 +823,7 @@ function ProviderSettingsPage() {
     try {
       await invoke("delete_model", { id: settingsModel.id });
       setSettingsModel(null);
-      await refreshProviders(selectedProvider.id, true);
+      await refreshProvidersAfterMutation(selectedProvider.id);
       flash("模型已删除");
     } catch (cause) {
       setError(getErrorMessage(cause));
@@ -841,7 +840,7 @@ function ProviderSettingsPage() {
         "test_model_connectivity",
         { modelId: model.id },
       );
-      await refreshProviders(selectedProvider.id, true);
+      await refreshProvidersAfterMutation(selectedProvider.id);
       flash(
         result.success
           ? `连接正常，${result.latencyMs}ms`

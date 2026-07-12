@@ -89,6 +89,7 @@ export interface TranslationConfigView {
   thinkingEffort: ThinkingEffort;
   useWebSearch: boolean;
   useCustomParameters: boolean;
+  glossaryGenerationConfig: GlossaryGenerationConfig;
   confidenceMode: ConfidenceMode;
   pdfParsingMode: PdfParsingMode;
 }
@@ -108,6 +109,15 @@ export type ThinkingEffort =
   | "high"
   | "xhigh"
   | "max";
+
+export interface GlossaryGenerationConfig {
+  providerId: string;
+  modelId: string;
+  assistantId: string | null;
+  thinkingEffort: ThinkingEffort;
+  useWebSearch: boolean;
+  useCustomParameters: boolean;
+}
 export type ConfidenceMode = "off" | "confidence-index";
 export type PdfParsingMode = "local-first" | "mineru-first" | "local-only" | "mineru-only";
 
@@ -121,6 +131,24 @@ export interface CreateTranslationTaskInput {
   providerId: string;
   modelId: string;
   assistantId: string | null;
+  useGlossary: boolean;
+  glossaryMode: GlossaryMode;
+  glossaryId: string | null;
+  glossaryGenerationConfig: GlossaryGenerationConfig;
+}
+
+export type TaskRuntimeConfigDomain = "translation" | "glossary";
+export type TaskRuntimeActionReason = "local-config-missing" | "remote-model-unavailable";
+
+export interface TaskRuntimeActionRequired {
+  taskId: string;
+  domains: TaskRuntimeConfigDomain[];
+  reason: TaskRuntimeActionReason;
+}
+
+export interface ReplaceTaskRuntimeSnapshotInput {
+  taskId: string;
+  config: TranslationConfigView;
 }
 
 export interface TranslationTaskFilters {

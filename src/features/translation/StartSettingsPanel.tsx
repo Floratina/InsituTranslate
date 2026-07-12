@@ -1,13 +1,11 @@
 import {
   BookOpen,
-  Bot,
   FileCheck2,
   Languages,
   SlidersHorizontal,
   type LucideIcon,
 } from "lucide-react";
 import {
-  useEffect,
   useMemo,
   useState,
   type Dispatch,
@@ -20,19 +18,20 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
-import { AssistantIcon } from "@/features/assistants/AssistantIcon";
 import type { AssistantView } from "@/features/assistants/types";
 import { displayLanguagePair } from "@/features/glossary/languages";
 import type { GlossaryView } from "@/features/glossary/types";
 import { LanguageCombobox } from "@/features/languages/LanguageCombobox";
 import { displayLanguage } from "@/features/languages/languageOptions";
-import { ProviderAvatar } from "@/features/providers/ProviderAvatar";
-import type { ModelView, ProviderView } from "@/features/providers/types";
+import type { ProviderView } from "@/features/providers/types";
+import {
+  ModelRuntimeSettings,
+  type ModelRuntimeSettingsValue,
+} from "@/features/translation/ModelRuntimeSettings";
 import type {
   ContextHandlingMode,
   PdfParsingMode,
   RateLimitStrategy,
-  ThinkingEffort,
   TranslationConfigView,
 } from "@/features/translation/types";
 import { cn } from "@/lib/utils";
@@ -51,20 +50,15 @@ interface StartSettingsPanelProps {
   sourceLanguage: string;
   detectedSourceLanguage: string | null;
   targetLanguage: string;
-  providers: ProviderView[];
-  models: ModelView[];
-  assistants: AssistantView[];
+  translationProviders: ProviderView[];
+  glossaryProviders: ProviderView[];
+  translationAssistants: AssistantView[];
+  glossaryAssistants: AssistantView[];
   glossaries: GlossaryView[];
-  providerId: string;
-  modelId: string;
-  assistantId: string;
   config: TranslationConfigView;
   loading: boolean;
   onSourceLanguageChange: (value: string) => void;
   onTargetLanguageChange: (value: string) => void;
-  onProviderChange: (value: string) => void;
-  onModelChange: (value: string) => void;
-  onAssistantChange: (value: string) => void;
   onConfigChange: Dispatch<SetStateAction<TranslationConfigView>>;
   onNumberChange: (key: StartSettingsNumberKey, value: string) => void;
 }
@@ -165,29 +159,6 @@ const PDF_PARSING_OPTIONS: Array<{
   },
 ];
 
-const THINKING_EFFORT_OPTIONS: Array<{
-  value: ThinkingEffort;
-  label: string;
-}> = [
-  { value: "none", label: "None" },
-  { value: "minimal", label: "Minimal" },
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "xhigh", label: "Xhigh" },
-  { value: "max", label: "Max" },
-];
-
-const THINKING_EFFORT_ORDER: ThinkingEffort[] = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-];
-
 const PROOFREADING_OPTIONS: ProofreadingOption[] = [
   {
     id: "rule",
@@ -283,14 +254,9 @@ function NumberControl({
   );
 }
 
-function glossarySelectedValue(config: TranslationConfigView, glossaries: GlossaryView[]): string {
-  const hasSelectedGlossary = Boolean(
-    config.glossaryId
-      && glossaries.some((glossary) => glossary.id === config.glossaryId),
-  );
-  return config.glossaryMode === "existing" && hasSelectedGlossary
-    ? config.glossaryId!
-    : "auto";
+function glossarySelectedValue(config: TranslationConfigView): string {
+  if (config.glossaryMode === "auto") return "auto";
+  return config.glossaryId ?? "__missing__";
 }
 
 function selectedRateLimitLabel(strategy: RateLimitStrategy): string {
@@ -306,41 +272,6 @@ function selectedContextHandlingLabel(mode: ContextHandlingMode): string {
 function selectedPdfParsingLabel(mode: PdfParsingMode): string {
   return PDF_PARSING_OPTIONS.find((option) => option.value === mode)?.label
     ?? PDF_PARSING_OPTIONS[0].label;
-}
-
-function supportedThinkingEffortsForModel(model: ModelView | null): ThinkingEffort[] {
-  if (!model?.capabilityReasoning) {
-    return ["none"];
-  }
-  const supported = model.supportedThinkingEfforts;
-  if (Array.isArray(supported) && supported.length > 0) {
-    return supported.includes("none") ? supported : ["none", ...supported];
-  }
-  return THINKING_EFFORT_OPTIONS.map((option) => option.value);
-}
-
-function normalizeThinkingEffort(
-  effort: ThinkingEffort,
-  supportedEfforts: ThinkingEffort[],
-): ThinkingEffort {
-  if (supportedEfforts.includes(effort)) {
-    return effort;
-  }
-  if (effort === "none") {
-    return "none";
-  }
-  const candidates = supportedEfforts.filter((value) => value !== "none");
-  if (candidates.length === 0) {
-    return "none";
-  }
-  const effortIndex = THINKING_EFFORT_ORDER.indexOf(effort);
-  return candidates.reduce((best, candidate) => {
-    const bestDistance = Math.abs(THINKING_EFFORT_ORDER.indexOf(best) - effortIndex);
-    const candidateDistance = Math.abs(
-      THINKING_EFFORT_ORDER.indexOf(candidate) - effortIndex,
-    );
-    return candidateDistance < bestDistance ? candidate : best;
-  }, candidates[0]);
 }
 
 export function StartSettingsSkeleton() {
@@ -379,20 +310,15 @@ export function StartSettingsPanel({
   sourceLanguage,
   detectedSourceLanguage,
   targetLanguage,
-  providers,
-  models,
-  assistants,
+  translationProviders,
+  glossaryProviders,
+  translationAssistants,
+  glossaryAssistants,
   glossaries,
-  providerId,
-  modelId,
-  assistantId,
   config,
   loading,
   onSourceLanguageChange,
   onTargetLanguageChange,
-  onProviderChange,
-  onModelChange,
-  onAssistantChange,
   onConfigChange,
   onNumberChange,
 }: StartSettingsPanelProps) {
@@ -402,63 +328,12 @@ export function StartSettingsPanel({
     assistant: false,
   });
   const selectedGlossaryValue = useMemo(
-    () => glossarySelectedValue(config, glossaries),
-    [config, glossaries],
+    () => glossarySelectedValue(config),
+    [config],
   );
-  const selectedModel = useMemo(
-    () => models.find((model) => model.id === modelId) ?? null,
-    [modelId, models],
-  );
-  const supportedThinkingEfforts = useMemo(
-    () => supportedThinkingEffortsForModel(selectedModel),
-    [selectedModel],
-  );
-  const thinkingEffortOptions = useMemo(
-    () =>
-      THINKING_EFFORT_OPTIONS.filter((option) =>
-        supportedThinkingEfforts.includes(option.value)
-      ),
-    [supportedThinkingEfforts],
-  );
-  const selectedThinkingEffort = normalizeThinkingEffort(
-    config.thinkingEffort,
-    supportedThinkingEfforts,
-  );
-  const reasoningAvailable = supportedThinkingEfforts.some((value) => value !== "none");
-  const webSearchAvailable = Boolean(selectedModel?.capabilityWeb);
-
-  useEffect(() => {
-    const normalized = normalizeThinkingEffort(config.thinkingEffort, supportedThinkingEfforts);
-    if (normalized !== config.thinkingEffort) {
-      onConfigChange((current) => ({ ...current, thinkingEffort: normalized }));
-    }
-  }, [config.thinkingEffort, onConfigChange, supportedThinkingEfforts]);
-
-  useEffect(() => {
-    if (!webSearchAvailable && config.useWebSearch) {
-      onConfigChange((current) => ({
-        ...current,
-        useWebSearch: webSearchAvailable ? current.useWebSearch : false,
-      }));
-    }
-  }, [
-    config.useWebSearch,
-    onConfigChange,
-    webSearchAvailable,
-  ]);
 
   function updateGlossaryEnabled(enabled: boolean): void {
-    onConfigChange((current) => {
-      if (
-        enabled
-        && current.glossaryMode === "existing"
-        && !current.glossaryId
-        && glossaries.length > 0
-      ) {
-        return { ...current, useGlossary: enabled, glossaryId: glossaries[0].id };
-      }
-      return { ...current, useGlossary: enabled };
-    });
+    onConfigChange((current) => ({ ...current, useGlossary: enabled }));
   }
 
   function updateGlossarySelection(value: string): void {
@@ -474,6 +349,21 @@ export function StartSettingsPanel({
       ...current,
       glossaryMode: "existing",
       glossaryId: value,
+    }));
+  }
+
+  function updateTranslationRuntime(value: ModelRuntimeSettingsValue): void {
+    onConfigChange((current) => ({
+      ...current,
+      ...value,
+      assistantId: value.assistantId ?? "__none__",
+    }));
+  }
+
+  function updateGlossaryRuntime(value: ModelRuntimeSettingsValue): void {
+    onConfigChange((current) => ({
+      ...current,
+      glossaryGenerationConfig: value,
     }));
   }
 
@@ -533,177 +423,87 @@ export function StartSettingsPanel({
 
         <div className="min-w-0">
           {activeTab === "translation" && (
-            <div className={THREE_COLUMN_GRID_CLASS}>
-              <FieldBlock label="模型提供商">
-                <Select value={providerId} onValueChange={onProviderChange} disabled={loading}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="选择提供商" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {providers.map((provider) => (
-                      <SelectItem key={provider.id} value={provider.id}>
-                        <span className="flex items-center gap-2">
-                          <ProviderAvatar
-                            name={provider.name}
-                            avatar={provider.avatar}
-                            size="2xs"
-                          />
-                          <span>{provider.name}</span>
-                        </span>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </FieldBlock>
-
-              <FieldBlock label="翻译模型">
-                <Select
-                  value={modelId}
-                  onValueChange={onModelChange}
-                  disabled={loading || models.length === 0}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="选择模型" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {models.map((model) => (
-                      <SelectItem key={model.id} value={model.id}>
-                        {model.alias || model.requestName}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </FieldBlock>
-
-              <FieldBlock label="助手配置">
-                <Select value={assistantId} onValueChange={onAssistantChange} disabled={loading}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="选择助手" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__none__">
-                      <span className="flex items-center gap-2">
-                        <Bot className="size-4 text-muted-foreground" />
-                        <span>不使用助手</span>
-                      </span>
-                    </SelectItem>
-                    {assistants.map((assistant) => (
-                      <SelectItem key={assistant.id} value={assistant.id}>
-                        <span className="flex items-center gap-2">
-                          <AssistantIcon
-                            kind={assistant.iconKind}
-                            value={assistant.iconValue}
-                            className="size-4 border-0 bg-transparent text-xs"
-                            glyphClassName="size-3.5"
-                          />
-                          <span>{assistant.name}</span>
-                        </span>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </FieldBlock>
-
-              <FieldBlock label="思考强度">
-                <Select
-                  value={selectedThinkingEffort}
-                  onValueChange={(value) =>
-                    onConfigChange((current) => ({
-                      ...current,
-                      thinkingEffort: value as ThinkingEffort,
-                    }))
-                  }
-                  disabled={loading || !reasoningAvailable}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="选择思考强度" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {thinkingEffortOptions.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>
-                        {option.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </FieldBlock>
-
-              <FieldBlock label="联网搜索">
-                <div className="flex h-8 items-center">
-                  <Switch
-                    size="sm"
-                    checked={webSearchAvailable ? config.useWebSearch : false}
-                    disabled={loading || !webSearchAvailable}
-                    onCheckedChange={(checked) =>
-                      onConfigChange((current) => ({
-                        ...current,
-                        useWebSearch: checked,
-                      }))
-                    }
-                  />
-                </div>
-              </FieldBlock>
-
-              <FieldBlock label="自定义参数">
-                <div className="flex h-8 items-center">
-                  <Switch
-                    size="sm"
-                    checked={config.useCustomParameters}
-                    disabled={loading}
-                    onCheckedChange={(checked) =>
-                      onConfigChange((current) => ({
-                        ...current,
-                        useCustomParameters: checked,
-                      }))
-                    }
-                  />
-                </div>
-              </FieldBlock>
-            </div>
+            <ModelRuntimeSettings
+              value={{
+                providerId: config.providerId,
+                modelId: config.modelId,
+                assistantId: config.assistantId === "__none__" ? null : config.assistantId,
+                thinkingEffort: config.thinkingEffort,
+                useWebSearch: config.useWebSearch,
+                useCustomParameters: config.useCustomParameters,
+              }}
+              providers={translationProviders}
+              assistants={translationAssistants}
+              providerLabel="模型提供商"
+              modelLabel="翻译模型"
+              assistantLabel="助手配置"
+              disabled={loading}
+              onChange={updateTranslationRuntime}
+            />
           )}
 
           {activeTab === "glossary" && (
-            <div className={TWO_COLUMN_GRID_CLASS}>
-              <FieldBlock label="使用术语表">
-                <div className="flex h-8 items-center">
-                  <Switch
-                    size="sm"
-                    checked={config.useGlossary}
-                    disabled={loading}
-                    onCheckedChange={updateGlossaryEnabled}
-                  />
-                </div>
-              </FieldBlock>
+            <div className="grid gap-3">
+              <div className={TWO_COLUMN_GRID_CLASS}>
+                <FieldBlock label="使用术语表">
+                  <div className="flex h-8 items-center">
+                    <Switch
+                      size="sm"
+                      checked={config.useGlossary}
+                      disabled={loading}
+                      onCheckedChange={updateGlossaryEnabled}
+                    />
+                  </div>
+                </FieldBlock>
 
-              <FieldBlock label="选择术语表">
-                <Select
-                  value={selectedGlossaryValue}
-                  disabled={loading || !config.useGlossary}
-                  onValueChange={updateGlossarySelection}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="选择术语表" />
-                  </SelectTrigger>
-                  <SelectContent viewportClassName="max-h-72">
-                    <SelectItem value="auto">自动建立术语表</SelectItem>
-                    {glossaries.map((glossary) => (
-                      <SelectItem key={glossary.id} value={glossary.id}>
-                        <span className="flex min-w-0 items-center gap-2">
-                          <span className="truncate">{glossary.name}</span>
-                          <span className="shrink-0 text-xs text-muted-foreground">
-                            {displayLanguagePair(glossary.sourceLanguage, glossary.targetLanguage)}
+                <FieldBlock label="选择术语表">
+                  <Select
+                    value={selectedGlossaryValue}
+                    disabled={loading || !config.useGlossary}
+                    onValueChange={updateGlossarySelection}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="选择术语表" />
+                    </SelectTrigger>
+                    <SelectContent viewportClassName="max-h-72">
+                      <SelectItem value="auto">自动建立术语表</SelectItem>
+                      {config.glossaryMode === "existing" && !config.glossaryId && (
+                        <SelectItem value="__missing__" disabled>请选择已有术语表</SelectItem>
+                      )}
+                      {config.glossaryId
+                        && !glossaries.some((glossary) => glossary.id === config.glossaryId) && (
+                          <SelectItem value={config.glossaryId} disabled>已失效的术语表</SelectItem>
+                        )}
+                      {glossaries.map((glossary) => (
+                        <SelectItem key={glossary.id} value={glossary.id}>
+                          <span className="flex min-w-0 items-center gap-2">
+                            <span className="truncate">{glossary.name}</span>
+                            <span className="shrink-0 text-xs text-muted-foreground">
+                              {displayLanguagePair(glossary.sourceLanguage, glossary.targetLanguage)}
+                            </span>
                           </span>
-                        </span>
-                      </SelectItem>
-                    ))}
-                    {glossaries.length === 0 && (
-                      <div className="px-3 py-2 text-xs text-muted-foreground">
-                        暂无已有术语表
-                      </div>
-                    )}
-                  </SelectContent>
-                </Select>
-              </FieldBlock>
+                        </SelectItem>
+                      ))}
+                      {glossaries.length === 0 && (
+                        <div className="px-3 py-2 text-xs text-muted-foreground">
+                          暂无已有术语表
+                        </div>
+                      )}
+                    </SelectContent>
+                  </Select>
+                </FieldBlock>
+              </div>
+
+              <ModelRuntimeSettings
+                value={config.glossaryGenerationConfig}
+                providers={glossaryProviders}
+                assistants={glossaryAssistants}
+                providerLabel="术语表提供商"
+                modelLabel="术语表模型"
+                assistantLabel="术语表配置"
+                disabled={loading || !config.useGlossary || config.glossaryMode !== "auto"}
+                onChange={updateGlossaryRuntime}
+              />
             </div>
           )}
 

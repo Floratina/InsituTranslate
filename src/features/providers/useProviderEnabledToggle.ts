@@ -6,6 +6,7 @@ import type { ProviderView } from "./types";
 interface UseProviderEnabledToggleOptions {
   setProviders: Dispatch<SetStateAction<ProviderView[]>>;
   onError: (message: string) => void;
+  onUpdated?: (provider: ProviderView) => void;
 }
 
 function errorMessage(cause: unknown): string {
@@ -15,6 +16,7 @@ function errorMessage(cause: unknown): string {
 export function useProviderEnabledToggle({
   setProviders,
   onError,
+  onUpdated,
 }: UseProviderEnabledToggleOptions) {
   const saveTimer = useRef<number | null>(null);
   const requestSequence = useRef(0);
@@ -44,6 +46,7 @@ export function useProviderEnabledToggle({
           setProviders((items) =>
             items.map((item) => (item.id === updated.id ? updated : item)),
           );
+          onUpdated?.(updated);
         } catch (cause) {
           if (sequence !== requestSequence.current) return;
           setProviders((items) =>
@@ -55,7 +58,7 @@ export function useProviderEnabledToggle({
         }
       }, 300);
     },
-    [onError, setProviders],
+    [onError, onUpdated, setProviders],
   );
 
   return { setEnabledOptimistically, syncProviders };

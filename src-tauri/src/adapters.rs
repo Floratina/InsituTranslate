@@ -86,6 +86,34 @@ impl ProviderChatError {
         }
         matches!(self.kind, ProviderChatErrorKind::Transport)
     }
+
+    pub fn is_model_unavailable(&self) -> bool {
+        if !matches!(self.status, Some(400 | 404)) {
+            return false;
+        }
+        let message = self.message.to_ascii_lowercase();
+        let mentions_model = message.contains("model") || message.contains("deployment");
+        mentions_model
+            && [
+                "not found",
+                "does not exist",
+                "doesn't exist",
+                "no longer available",
+                "not available",
+                "deprecated",
+                "decommissioned",
+                "retired",
+                "unsupported model",
+                "unknown model",
+                "model_not_found",
+                "modelnotfound",
+                "deploymentnotfound",
+                "model_not_available",
+                "model_deprecated",
+            ]
+            .iter()
+            .any(|marker| message.contains(marker))
+    }
 }
 
 impl fmt::Display for ProviderChatError {
@@ -790,6 +818,7 @@ fn apply_request_overrides(
     config: &ProviderRuntimeConfig,
     request: &UnifiedChatRequest,
 ) {
+    apply_structured_runtime_overrides(body, config, request);
     if !request.logprobs {
         disable_logprobs_request_params(body, config.protocol);
         return;
@@ -802,6 +831,239 @@ fn apply_request_overrides(
         LogprobsRequestSpec::OpenaiResponses => enable_openai_response_logprobs(body),
         LogprobsRequestSpec::Gemini => enable_gemini_logprobs(body),
         LogprobsRequestSpec::None => disable_logprobs_request_params(body, config.protocol),
+    }
+}
+
+fn apply_structured_runtime_overrides(
+    body: &mut Value,
+    config: &ProviderRuntimeConfig,
+    request: &UnifiedChatRequest,
+) {
+    match config.protocol {
+        ProviderProtocol::OpenaiChat => {
+            remove_object_keys(
+                body,
+                &[
+                    "temperature",
+                    "top_p",
+                    "reasoning",
+                    "thinking",
+                    "reasoning_effort",
+                    "disable_reasoning",
+                    "enable_thinking",
+                    "thinking_budget",
+                    "thinking_strategy",
+                    "clear_thinking",
+                    "reasoning_split",
+                    "web_search_options",
+                ],
+            );
+            set_optional_field(body, "temperature", request.temperature.map(Value::from));
+            set_optional_field(body, "top_p", request.top_p.map(Value::from));
+            if let Some(thinking) = &request.thinking {
+                merge_object(
+                    body,
+                    build_openai_reasoning_params(
+                        &config.base_url,
+                        &request.model,
+                        thinking,
+                        request.max_output_tokens,
+                    ),
+                );
+            }
+            if is_feature_supported(
+                FeatureId::OpenAiClearThinking,
+                &config.base_url,
+                &request.model,
+            ) {
+                body["clear_thinking"] = json!(false);
+            }
+            if is_feature_supported(
+                FeatureId::OpenAiReasoningSplit,
+                &config.base_url,
+                &request.model,
+            ) {
+                body["reasoning_split"] = json!(true);
+            }
+            if request.web_search {
+                body["web_search_options"] = json!({});
+            }
+        }
+        ProviderProtocol::OpenaiResponses => {
+            remove_object_keys(
+                body,
+                &["temperature", "top_p", "reasoning", "thinking", "tools"],
+            );
+            set_optional_field(body, "temperature", request.temperature.map(Value::from));
+            set_optional_field(body, "top_p", request.top_p.map(Value::from));
+            if let Some(thinking) = &request.thinking {
+                let disabled = thinking.mode == ThinkingMode::Disabled
+                    || thinking.effort == Some(ThinkingEffort::None);
+                body["reasoning"] = json!({
+                    "effort": if disabled { "none" } else { thinking.effort.map(openai_effort).unwrap_or("medium") },
+                    "summary": thinking.summary.map(|summary| match summary {
+                        ThinkingSummary::None => "none",
+                        ThinkingSummary::Auto => "auto",
+                        ThinkingSummary::Concise => "concise",
+                        ThinkingSummary::Detailed => "detailed",
+                    }).unwrap_or("auto")
+                });
+                if is_feature_supported(
+                    FeatureId::OpenAiThinkingObject,
+                    &config.base_url,
+                    &request.model,
+                ) {
+                    body["thinking"] =
+                        json!({"type": if disabled { "disabled" } else { "enabled" }});
+                }
+            }
+            if request.web_search {
+                body["tools"] = json!([{"type": "web_search"}]);
+            }
+        }
+        ProviderProtocol::Anthropic => {
+            remove_object_keys(body, &["temperature", "top_p", "thinking", "tools"]);
+            set_optional_field(body, "temperature", request.temperature.map(Value::from));
+            set_optional_field(body, "top_p", request.top_p.map(Value::from));
+            if let Some(thinking) = &request.thinking {
+                let enabled = thinking.mode != ThinkingMode::Disabled
+                    && thinking.effort != Some(ThinkingEffort::None);
+                body["thinking"] = if enabled {
+                    let max = request.max_output_tokens.unwrap_or(4096);
+                    let budget = thinking
+                        .budget_tokens
+                        .unwrap_or(1024)
+                        .max(1024)
+                        .min(max.saturating_sub(1));
+                    json!({"type": "enabled", "budget_tokens": budget})
+                } else {
+                    json!({"type": "disabled"})
+                };
+            }
+            if request.web_search {
+                body["tools"] = json!([{"type": "web_search_20250305", "name": "web_search"}]);
+            }
+        }
+        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
+            remove_object_keys(
+                body,
+                &[
+                    "temperature",
+                    "top_p",
+                    "topP",
+                    "thinking",
+                    "reasoning",
+                    "web_search_options",
+                ],
+            );
+            if !body.get("generationConfig").is_some_and(Value::is_object) {
+                body["generationConfig"] = json!({});
+            }
+            if let Some(generation) = body
+                .get_mut("generationConfig")
+                .and_then(Value::as_object_mut)
+            {
+                generation.remove("temperature");
+                generation.remove("topP");
+                generation.remove("thinkingConfig");
+                if let Some(temperature) = request.temperature {
+                    generation.insert("temperature".into(), json!(temperature));
+                }
+                if let Some(top_p) = request.top_p {
+                    generation.insert("topP".into(), json!(top_p));
+                }
+                if let Some(thinking) = &request.thinking {
+                    let enabled = thinking.mode != ThinkingMode::Disabled
+                        && thinking.effort != Some(ThinkingEffort::None);
+                    generation.insert(
+                        "thinkingConfig".into(),
+                        if is_feature_supported(
+                            FeatureId::GeminiThinkingLevel,
+                            &config.base_url,
+                            &request.model,
+                        ) {
+                            json!({
+                                "includeThoughts": false,
+                                "thinkingLevel": if enabled { gemini_thinking_level(thinking.effort) } else { "minimal" }
+                            })
+                        } else {
+                            json!({
+                                "includeThoughts": false,
+                                "thinkingBudget": if enabled {
+                                    thinking.budget_tokens.map(Value::from).unwrap_or(json!(-1))
+                                } else {
+                                    json!(0)
+                                }
+                            })
+                        },
+                    );
+                }
+            }
+            remove_object_keys(body, &["tools", "toolConfig"]);
+            if request.web_search {
+                body["tools"] = json!([{"googleSearch": {}}]);
+            }
+        }
+        ProviderProtocol::Ollama => {
+            remove_object_keys(
+                body,
+                &[
+                    "think",
+                    "thinking",
+                    "reasoning",
+                    "temperature",
+                    "top_p",
+                    "topP",
+                    "web_search_options",
+                    "tools",
+                ],
+            );
+            if let Some(thinking) = &request.thinking {
+                body["think"] = match thinking.effort {
+                    Some(ThinkingEffort::None) => json!(false),
+                    Some(ThinkingEffort::Minimal | ThinkingEffort::Low) => json!("low"),
+                    Some(ThinkingEffort::Medium) => json!("medium"),
+                    Some(ThinkingEffort::High | ThinkingEffort::Xhigh | ThinkingEffort::Max) => {
+                        json!("high")
+                    }
+                    None => json!(thinking.mode != ThinkingMode::Disabled),
+                };
+            }
+            if !body.get("options").is_some_and(Value::is_object) {
+                body["options"] = json!({});
+            }
+            if let Some(options) = body.get_mut("options").and_then(Value::as_object_mut) {
+                options.remove("temperature");
+                options.remove("top_p");
+                if let Some(temperature) = request.temperature {
+                    options.insert("temperature".into(), json!(temperature));
+                }
+                if let Some(top_p) = request.top_p {
+                    options.insert("top_p".into(), json!(top_p));
+                }
+            }
+            if body
+                .get("options")
+                .and_then(Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                remove_object_keys(body, &["options"]);
+            }
+        }
+    }
+}
+
+fn remove_object_keys(value: &mut Value, keys: &[&str]) {
+    if let Some(object) = value.as_object_mut() {
+        for key in keys {
+            object.remove(*key);
+        }
+    }
+}
+
+fn set_optional_field(body: &mut Value, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        body[key] = value;
     }
 }
 
@@ -1075,6 +1337,12 @@ pub fn build_openai_chat_body(base_url: &str, request: &UnifiedChatRequest) -> V
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
     }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if request.web_search {
+        body["web_search_options"] = json!({});
+    }
     if request.logprobs && openai_chat_logprobs_supported(base_url) {
         body["logprobs"] = json!(true);
     }
@@ -1262,6 +1530,12 @@ pub fn build_openai_responses_body(base_url: &str, request: &UnifiedChatRequest)
     if let Some(tokens) = request.max_output_tokens {
         body["max_output_tokens"] = json!(tokens);
     }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
     if let Some(thinking) = &request.thinking {
         let disabled = thinking.mode == ThinkingMode::Disabled
             || thinking.effort == Some(ThinkingEffort::None);
@@ -1375,6 +1649,12 @@ pub fn build_anthropic_body(request: &UnifiedChatRequest) -> Value {
     if !system.is_empty() {
         body["system"] = Value::Array(system);
     }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
     if let Some(thinking) = &request.thinking {
         body["thinking"] = if thinking_enabled {
             let max = request.max_output_tokens.unwrap_or(4096);
@@ -1431,6 +1711,9 @@ pub fn build_gemini_body(request: &UnifiedChatRequest) -> Value {
     }
     if let Some(temperature) = request.temperature {
         generation["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        generation["topP"] = json!(top_p);
     }
     if let Some(thinking) = &request.thinking {
         let enabled = thinking.mode != ThinkingMode::Disabled
@@ -1516,6 +1799,9 @@ pub fn build_ollama_body(request: &UnifiedChatRequest) -> Value {
     }
     if let Some(temperature) = request.temperature {
         options["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        options["top_p"] = json!(top_p);
     }
     if options.as_object().is_some_and(|object| !object.is_empty()) {
         body["options"] = options;
@@ -2179,6 +2465,7 @@ mod tests {
             }),
             max_output_tokens: Some(4096),
             temperature: None,
+            top_p: None,
             stream: true,
             logprobs: false,
             custom_parameters: json!({}),
@@ -2206,10 +2493,40 @@ mod tests {
             thinking: None,
             max_output_tokens: None,
             temperature: Some(0.0),
+            top_p: None,
             stream: false,
             logprobs: false,
             custom_parameters: json!({}),
         }
+    }
+
+    #[test]
+    fn detects_only_explicit_model_unavailability_errors() {
+        for (status, message) in [
+            (404, "The requested model does not exist"),
+            (400, "Model gpt-old is deprecated and no longer available"),
+            (404, "Unknown model deployment"),
+            (404, r#"{"code":"model_not_found"}"#),
+            (404, r#"{"code":"DeploymentNotFound"}"#),
+        ] {
+            let mut error = chat_error(Some(status), ProviderChatErrorKind::HttpStatus);
+            error.message = message.into();
+            assert!(error.is_model_unavailable(), "{message}");
+        }
+
+        for (status, message) in [
+            (401, "Model access is unauthorized"),
+            (429, "Model quota exceeded"),
+            (404, "Resource not found"),
+            (400, "Invalid request payload"),
+        ] {
+            let mut error = chat_error(Some(status), ProviderChatErrorKind::HttpStatus);
+            error.message = message.into();
+            assert!(!error.is_model_unavailable(), "{message}");
+        }
+        let mut transport = chat_error(None, ProviderChatErrorKind::Transport);
+        transport.message = "model not found because DNS lookup failed".into();
+        assert!(!transport.is_model_unavailable());
     }
 
     fn adapter_for(protocol: ProviderProtocol, base_url: &str) -> RuntimeAdapter {
@@ -2514,7 +2831,7 @@ mod tests {
         let mut request = prompt_request();
         request.custom_parameters = json!({
             "response_format": {"type": "json_object"},
-            "top_p": 0.9,
+            "frequency_penalty": 0.4,
             "generationConfig": {
                 "candidateCount": 1,
                 "responseMimeType": "application/json"
@@ -2532,7 +2849,7 @@ mod tests {
             openai.pointer("/response_format/type"),
             Some(&json!("json_object"))
         );
-        assert_eq!(openai.get("top_p"), Some(&json!(0.9)));
+        assert_eq!(openai.get("frequency_penalty"), Some(&json!(0.4)));
 
         let (_, gemini) = adapter_for(
             ProviderProtocol::Gemini,
@@ -2556,6 +2873,162 @@ mod tests {
             gemini.pointer("/safetySettings/0/category"),
             Some(&json!("HARM_CATEGORY_HARASSMENT"))
         );
+    }
+
+    #[test]
+    fn structured_sampling_thinking_and_web_override_custom_parameters() {
+        let protocols = [
+            ProviderProtocol::OpenaiChat,
+            ProviderProtocol::OpenaiResponses,
+            ProviderProtocol::Anthropic,
+            ProviderProtocol::Gemini,
+            ProviderProtocol::VertexAi,
+            ProviderProtocol::Ollama,
+        ];
+        for protocol in protocols {
+            let base_url = match protocol {
+                ProviderProtocol::OpenaiChat | ProviderProtocol::OpenaiResponses => {
+                    "https://api.openai.com"
+                }
+                ProviderProtocol::Anthropic => "https://api.anthropic.com",
+                ProviderProtocol::Gemini => "https://generativelanguage.googleapis.com",
+                ProviderProtocol::VertexAi => "https://aiplatform.googleapis.com",
+                ProviderProtocol::Ollama => "http://localhost:11434/api",
+            };
+            let mut request = prompt_request();
+            request.model = match protocol {
+                ProviderProtocol::OpenaiChat => "gpt-5-search-api".into(),
+                ProviderProtocol::OpenaiResponses => "gpt-5".into(),
+                ProviderProtocol::Anthropic => "claude-sonnet-4".into(),
+                ProviderProtocol::Gemini | ProviderProtocol::VertexAi => "gemini-2.5-pro".into(),
+                ProviderProtocol::Ollama => "qwen3".into(),
+            };
+            request.temperature = Some(0.25);
+            request.top_p = Some(0.75);
+            request.web_search = protocol != ProviderProtocol::Ollama;
+            request.thinking = Some(ThinkingConfig {
+                mode: ThinkingMode::Enabled,
+                budget_tokens: Some(2048),
+                effort: Some(ThinkingEffort::Low),
+                summary: None,
+            });
+            request.custom_parameters = json!({
+                "temperature": 1.5,
+                "top_p": 0.1,
+                "reasoning": {"effort": "high"},
+                "thinking": {"type": "disabled"},
+                "reasoning_effort": "high",
+                "enable_thinking": false,
+                "web_search_options": {"search_context_size": "high"},
+                "generationConfig": {
+                    "temperature": 1.5,
+                    "topP": 0.1,
+                    "thinkingConfig": {"thinkingBudget": 0}
+                },
+                "options": {"temperature": 1.5, "top_p": 0.1},
+                "think": false
+            });
+
+            let (_, body) = adapter_for(protocol, base_url)
+                .build_chat_request(&request)
+                .expect("request");
+            match protocol {
+                ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
+                    assert_eq!(
+                        body.pointer("/generationConfig/temperature"),
+                        Some(&json!(0.25))
+                    );
+                    assert_eq!(body.pointer("/generationConfig/topP"), Some(&json!(0.75)));
+                    assert!(body.pointer("/generationConfig/thinkingConfig").is_some());
+                    assert_eq!(body.pointer("/tools/0/googleSearch"), Some(&json!({})));
+                }
+                ProviderProtocol::Ollama => {
+                    assert_eq!(body.pointer("/options/temperature"), Some(&json!(0.25)));
+                    assert_eq!(body.pointer("/options/top_p"), Some(&json!(0.75)));
+                    assert_eq!(body.get("think"), Some(&json!("low")));
+                    assert!(body.get("tools").is_none());
+                }
+                ProviderProtocol::Anthropic => {
+                    assert_eq!(body.get("temperature"), Some(&json!(0.25)));
+                    assert_eq!(body.get("top_p"), Some(&json!(0.75)));
+                    assert_eq!(body.pointer("/thinking/type"), Some(&json!("enabled")));
+                    assert_eq!(
+                        body.pointer("/tools/0/type"),
+                        Some(&json!("web_search_20250305"))
+                    );
+                }
+                ProviderProtocol::OpenaiResponses => {
+                    assert_eq!(body.get("temperature"), Some(&json!(0.25)));
+                    assert_eq!(body.get("top_p"), Some(&json!(0.75)));
+                    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("low")));
+                    assert_eq!(body.pointer("/tools/0/type"), Some(&json!("web_search")));
+                }
+                ProviderProtocol::OpenaiChat => {
+                    assert_eq!(body.get("temperature"), Some(&json!(0.25)));
+                    assert_eq!(body.get("top_p"), Some(&json!(0.75)));
+                    assert_eq!(body.get("reasoning_effort"), Some(&json!("low")));
+                    assert_eq!(body.get("web_search_options"), Some(&json!({})));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_structured_options_remove_custom_attempts() {
+        for protocol in [
+            ProviderProtocol::OpenaiChat,
+            ProviderProtocol::OpenaiResponses,
+            ProviderProtocol::Anthropic,
+            ProviderProtocol::Gemini,
+            ProviderProtocol::VertexAi,
+            ProviderProtocol::Ollama,
+        ] {
+            let base_url = match protocol {
+                ProviderProtocol::Anthropic => "https://api.anthropic.com",
+                ProviderProtocol::Gemini => "https://generativelanguage.googleapis.com",
+                ProviderProtocol::VertexAi => "https://aiplatform.googleapis.com",
+                ProviderProtocol::Ollama => "http://localhost:11434/api",
+                _ => "https://api.openai.com",
+            };
+            let mut request = prompt_request();
+            request.temperature = None;
+            request.top_p = None;
+            request.thinking = None;
+            request.web_search = false;
+            request.custom_parameters = json!({
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "thinking": {"type": "enabled"},
+                "reasoning": {"effort": "high"},
+                "web_search_options": {},
+                "generationConfig": {"temperature": 1.0, "topP": 1.0, "thinkingConfig": {}},
+                "options": {"temperature": 1.0, "top_p": 1.0},
+                "think": true
+            });
+            let (_, body) = adapter_for(protocol, base_url)
+                .build_chat_request(&request)
+                .expect("request");
+            match protocol {
+                ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
+                    assert!(body.pointer("/generationConfig/temperature").is_none());
+                    assert!(body.pointer("/generationConfig/topP").is_none());
+                    assert!(body.pointer("/generationConfig/thinkingConfig").is_none());
+                }
+                ProviderProtocol::Ollama => {
+                    assert!(body.pointer("/options/temperature").is_none());
+                    assert!(body.pointer("/options/top_p").is_none());
+                    assert!(body.get("think").is_none());
+                }
+                _ => {
+                    assert!(body.get("temperature").is_none());
+                    assert!(body.get("top_p").is_none());
+                    assert!(body.get("thinking").is_none());
+                    assert!(body.get("reasoning").is_none());
+                    assert!(body.get("web_search_options").is_none());
+                    assert!(body.get("tools").is_none());
+                }
+            }
+        }
     }
 
     #[test]

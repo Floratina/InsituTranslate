@@ -27,7 +27,7 @@ You must identify and extract the following categories of terms:
 - Limit the extraction to a maximum of 15-20 most critical terms per chunk to keep the downstream translation prompt clean and token-efficient.
 
 # Output Format
-You must output ONLY a valid JSON array of objects. Do not wrap the JSON in conversational filler. Do not write any explanations.
+You must output ONLY the valid JSON array itself. Do not wrap it in Markdown code fences or any other code-block markers. Do not add any text, label, explanation, prefix, or suffix before or after the array.
 
 Each object in the array must contain the following keys:
 - `src`: The exact term in the original language.
@@ -272,23 +272,26 @@ pub fn merge_glossary_chunks(
 
 fn parse_json_response(response_text: &str) -> Result<Value, String> {
     let trimmed = response_text.trim();
-    if let Ok(value) = serde_json::from_str(trimmed) {
-        return Ok(value);
-    }
+    let mut candidates = vec![trimmed];
+    candidates.extend(fenced_json_candidates(response_text));
+    candidates.extend(balanced_json_candidates(response_text));
+    candidates.extend(relaxed_json_candidates(response_text));
 
-    for candidate in fenced_json_candidates(response_text) {
+    for candidate in &candidates {
         if let Ok(value) = serde_json::from_str(candidate.trim()) {
             return Ok(value);
         }
     }
 
-    for candidate in balanced_json_candidates(response_text) {
-        if let Ok(value) = serde_json::from_str(candidate) {
-            return Ok(value);
+    for candidate in candidates {
+        if let Ok(repaired) = repair_json_candidate(candidate.trim()) {
+            if let Ok(value) = serde_json::from_str(&repaired) {
+                return Ok(value);
+            }
         }
     }
 
-    Err("Response does not contain a complete valid JSON object or array".into())
+    Err("Glossary response does not contain a complete recoverable JSON object or array".into())
 }
 
 fn fenced_json_candidates(input: &str) -> Vec<&str> {
@@ -362,6 +365,111 @@ fn balanced_json_candidates(input: &str) -> Vec<&str> {
     candidates
 }
 
+fn relaxed_json_candidates(input: &str) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    for (opening, closing) in [('[', ']'), ('{', '}')] {
+        if let (Some(start), Some(end)) = (input.find(opening), input.rfind(closing)) {
+            if start < end {
+                candidates.push(&input[start..end + closing.len_utf8()]);
+            }
+        }
+    }
+    candidates
+}
+
+fn repair_json_candidate(candidate: &str) -> Result<String, String> {
+    let characters = candidate.char_indices().collect::<Vec<_>>();
+    let mut repaired = String::with_capacity(candidate.len());
+    let mut in_string = false;
+    let mut index = 0;
+
+    while index < characters.len() {
+        let (byte_index, character) = characters[index];
+        if !in_string {
+            repaired.push(character);
+            if character == '"' {
+                in_string = true;
+            }
+            index += 1;
+            continue;
+        }
+
+        match character {
+            '\\' => {
+                let Some((_, next)) = characters.get(index + 1).copied() else {
+                    repaired.push_str("\\\\");
+                    index += 1;
+                    continue;
+                };
+                let valid_simple_escape =
+                    matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't');
+                let valid_unicode_escape = next == 'u'
+                    && characters.iter().skip(index + 2).take(4).count() == 4
+                    && characters
+                        .iter()
+                        .skip(index + 2)
+                        .take(4)
+                        .all(|(_, item)| item.is_ascii_hexdigit());
+                if valid_simple_escape {
+                    repaired.push('\\');
+                    repaired.push(next);
+                    index += 2;
+                } else if valid_unicode_escape {
+                    repaired.push_str(
+                        &candidate[byte_index
+                            ..characters[index + 5].0 + characters[index + 5].1.len_utf8()],
+                    );
+                    index += 6;
+                } else {
+                    repaired.push_str("\\\\");
+                    index += 1;
+                }
+            }
+            '"' => {
+                let next_significant = characters
+                    .iter()
+                    .skip(index + 1)
+                    .map(|(_, item)| *item)
+                    .find(|item| !item.is_whitespace());
+                if next_significant.is_none()
+                    || matches!(next_significant, Some(':' | ',' | '}' | ']'))
+                {
+                    repaired.push('"');
+                    in_string = false;
+                } else {
+                    repaired.push_str("\\\"");
+                }
+                index += 1;
+            }
+            '\n' => {
+                repaired.push_str("\\n");
+                index += 1;
+            }
+            '\r' => {
+                repaired.push_str("\\r");
+                index += 1;
+            }
+            '\t' => {
+                repaired.push_str("\\t");
+                index += 1;
+            }
+            item if item.is_control() => {
+                repaired.push_str(&format!("\\u{:04x}", item as u32));
+                index += 1;
+            }
+            _ => {
+                repaired.push(character);
+                index += 1;
+            }
+        }
+    }
+
+    if in_string {
+        return Err("Glossary JSON contains an unterminated string".into());
+    }
+    Ok(repaired)
+}
+
 fn glossary_candidates(value: &Value) -> Result<(Vec<(String, String)>, usize), String> {
     match value {
         Value::Object(object) => {
@@ -411,13 +519,13 @@ fn array_candidates(entries: &[Value]) -> (Vec<(String, String)>, usize) {
 
 fn object_entry_candidate(object: &serde_json::Map<String, Value>) -> Option<(String, String)> {
     let canonical = object
-        .get("source")
-        .and_then(Value::as_str)
-        .zip(object.get("target").and_then(Value::as_str));
-    let legacy = object
         .get("src")
         .and_then(Value::as_str)
         .zip(object.get("dst").and_then(Value::as_str));
+    let legacy = object
+        .get("source")
+        .and_then(Value::as_str)
+        .zip(object.get("target").and_then(Value::as_str));
     canonical
         .or(legacy)
         .map(|(source, target)| (source.to_string(), target.to_string()))
@@ -428,7 +536,9 @@ fn normalize_case(value: &str) -> String {
 }
 
 fn has_control_character(value: &str) -> bool {
-    value.chars().any(char::is_control)
+    value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
 }
 
 #[cfg(test)]
@@ -478,6 +588,7 @@ mod tests {
             thinking: None,
             max_output_tokens: None,
             temperature: None,
+            top_p: None,
             stream: false,
             logprobs: false,
             custom_parameters: json!({}),
@@ -499,7 +610,9 @@ mod tests {
         assert!(!system.contains(INJECTION_TEXT));
         assert!(system.contains("translation in Chinese (Simplified)"));
         assert!(!system.contains(TARGET_LANGUAGE_PLACEHOLDER));
-        assert!(system.contains("valid JSON array of objects"));
+        assert!(system.contains("valid JSON array itself"));
+        assert!(system.contains("Do not wrap it in Markdown code fences"));
+        assert!(system.contains("prefix, or suffix"));
         assert!(system.contains("`src`: The exact term in the original language."));
         assert!(system.contains("`dst`: Your high-quality translation"));
         assert!(!system.contains("unless specifically requested by the parser"));
@@ -655,6 +768,41 @@ mod tests {
                 dst: "value with } and \"quotes\"".into()
             }]
         );
+    }
+
+    #[test]
+    fn repairs_deterministic_llm_json_escaping_mistakes() {
+        let cases = [
+            (
+                "[{\"src\":\"Jobs\",\"dst\":\"Steve \"Jobs\"\"}]",
+                "Steve \"Jobs\"",
+            ),
+            (
+                "[{\"src\":\"Jobs\",\"dst\":\"line one\nline two\"}]",
+                "line one\nline two",
+            ),
+            (
+                r#"[{"src":"Jobs","dst":"C:\models\qwen"}]"#,
+                r#"C:\models\qwen"#,
+            ),
+            (
+                "Result: [{\"src\":\"Jobs\",\"dst\":\"tab\tvalue\"}] End.",
+                "tab\tvalue",
+            ),
+        ];
+
+        for (response, expected) in cases {
+            let parsed = parse_glossary_response(response, "Jobs founded Apple.")
+                .expect("repaired glossary response");
+            assert_eq!(parsed.entries[0].dst, expected);
+        }
+    }
+
+    #[test]
+    fn refuses_ambiguous_or_incomplete_json_repair() {
+        let error = parse_glossary_response("[{\"src\":\"Jobs\",\"dst\":\"unterminated}]", "Jobs")
+            .expect_err("unterminated response");
+        assert!(error.contains("recoverable JSON"));
     }
 
     #[test]

@@ -59,9 +59,9 @@ impl HeaderQuotaPolicy {
         }
     }
 
-    pub(super) async fn before_request(&self, estimated_tokens: u64) {
+    pub(super) async fn wait_duration(&self, estimated_tokens: u64) -> Option<Duration> {
         if !self.enabled {
-            return;
+            return None;
         }
         let sleep_ms = {
             let state = self.state.lock().await;
@@ -82,8 +82,26 @@ impl HeaderQuotaPolicy {
                 delay
             })
         };
-        if let Some(delay) = sleep_ms.filter(|value| *value > 0) {
-            tokio::time::sleep(Duration::from_millis(delay.min(60_000))).await;
+        sleep_ms
+            .filter(|value| *value > 0)
+            .map(|delay| Duration::from_millis(delay.min(60_000)))
+    }
+
+    pub(super) async fn before_request(
+        &self,
+        estimated_tokens: u64,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        if let Some(delay) = self.wait_duration(estimated_tokens).await {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => true,
+                _ = cancellation.cancelled() => false,
+            }
+        } else {
+            true
         }
     }
 
@@ -122,29 +140,48 @@ impl ManualRateLimiter {
         }
     }
 
-    pub(super) async fn before_request(&self, estimated_tokens: u64) {
+    pub(super) async fn reserve_or_delay(&self, estimated_tokens: u64) -> Option<Duration> {
         let estimated_tokens = estimated_tokens.min(self.max_tokens);
+        let mut state = self.state.lock().await;
+        if state.window_started.elapsed() >= Duration::from_secs(60) {
+            state.window_started = Instant::now();
+            state.requests = 0;
+            state.tokens = 0;
+        }
+        if state.requests < self.max_requests && state.tokens + estimated_tokens <= self.max_tokens
+        {
+            state.requests += 1;
+            state.tokens += estimated_tokens;
+            None
+        } else {
+            Some(
+                Duration::from_secs(60)
+                    .saturating_sub(state.window_started.elapsed())
+                    .max(Duration::from_millis(25)),
+            )
+        }
+    }
+
+    pub(super) async fn before_request(
+        &self,
+        estimated_tokens: u64,
+        cancellation: &CancellationToken,
+    ) -> bool {
         loop {
-            let delay = {
-                let mut state = self.state.lock().await;
-                if state.window_started.elapsed() >= Duration::from_secs(60) {
-                    state.window_started = Instant::now();
-                    state.requests = 0;
-                    state.tokens = 0;
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            match self.reserve_or_delay(estimated_tokens).await {
+                Some(delay) => {
+                    let completed = tokio::select! {
+                        _ = tokio::time::sleep(delay) => true,
+                        _ = cancellation.cancelled() => false,
+                    };
+                    if !completed {
+                        return false;
+                    }
                 }
-                if state.requests < self.max_requests
-                    && state.tokens + estimated_tokens <= self.max_tokens
-                {
-                    state.requests += 1;
-                    state.tokens += estimated_tokens;
-                    None
-                } else {
-                    Some(Duration::from_secs(60).saturating_sub(state.window_started.elapsed()))
-                }
-            };
-            match delay {
-                Some(delay) => tokio::time::sleep(delay.max(Duration::from_millis(25))).await,
-                None => return,
+                None => return true,
             }
         }
     }
@@ -250,5 +287,97 @@ impl AdaptiveLimiter {
 
     pub(super) fn notify_waiters(&self) {
         self.notify.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn manual_limiter_exposes_wait_before_sleeping() {
+        let limiter = ManualRateLimiter::new(1, 1_000);
+        assert!(limiter.reserve_or_delay(100).await.is_none());
+        let delay = limiter
+            .reserve_or_delay(100)
+            .await
+            .expect("second request should wait for the current window");
+        assert!(delay > Duration::from_millis(0));
+        assert!(delay <= Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn header_quota_exposes_capped_wait_duration() {
+        let policy = HeaderQuotaPolicy::new(true);
+        policy
+            .update(&RateLimitTelemetry {
+                request_remaining: Some(0),
+                request_reset_ms: Some(90_000),
+                ..RateLimitTelemetry::default()
+            })
+            .await;
+        assert_eq!(
+            policy.wait_duration(100).await,
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_limiter_wait_is_cancelled_promptly() {
+        let limiter = Arc::new(ManualRateLimiter::new(1, 1_000));
+        let cancellation = CancellationToken::new();
+        assert!(limiter.before_request(100, &cancellation).await);
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+        let completed = tokio::time::timeout(
+            Duration::from_millis(250),
+            limiter.before_request(100, &cancellation),
+        )
+        .await
+        .expect("manual limiter cancellation should not wait for the minute window");
+        assert!(!completed);
+    }
+
+    #[tokio::test]
+    async fn manual_limiter_rejects_pre_cancelled_request() {
+        let limiter = ManualRateLimiter::new(60, 60_000);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(!limiter.before_request(100, &cancellation).await);
+    }
+
+    #[tokio::test]
+    async fn header_quota_wait_is_cancelled_promptly() {
+        let policy = HeaderQuotaPolicy::new(true);
+        policy
+            .update(&RateLimitTelemetry {
+                retry_after_ms: Some(60_000),
+                ..RateLimitTelemetry::default()
+            })
+            .await;
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+        let completed = tokio::time::timeout(
+            Duration::from_millis(250),
+            policy.before_request(100, &cancellation),
+        )
+        .await
+        .expect("header quota cancellation should not wait for retry-after");
+        assert!(!completed);
+    }
+
+    #[tokio::test]
+    async fn header_quota_rejects_pre_cancelled_request() {
+        let policy = HeaderQuotaPolicy::new(false);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(!policy.before_request(100, &cancellation).await);
     }
 }

@@ -4,23 +4,16 @@ import type {
 } from "./types";
 
 const GLOSSARY_JSON_SCHEMA = {
-  type: "object",
-  properties: {
-    glossary: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          source: { type: "string" },
-          target: { type: "string" },
-        },
-        required: ["source", "target"],
-        additionalProperties: false,
-      },
+  type: "array",
+  items: {
+    type: "object",
+    properties: {
+      src: { type: "string" },
+      dst: { type: "string" },
     },
+    required: ["src", "dst"],
+    additionalProperties: false,
   },
-  required: ["glossary"],
-  additionalProperties: false,
 };
 
 const JSON_MODE_DESCRIPTION = "强制返回合法 JSON，但不保证字段结构";

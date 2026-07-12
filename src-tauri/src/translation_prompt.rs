@@ -294,6 +294,7 @@ mod tests {
             thinking: None,
             max_output_tokens: None,
             temperature: None,
+            top_p: None,
             stream: false,
             logprobs: false,
             custom_parameters: json!({}),

@@ -146,6 +146,7 @@ pub fn run() {
             commands::open_translation_task_folder,
             commands::export_translation_task,
             commands::dispatch_scheduler_action,
+            commands::replace_task_runtime_snapshot,
             commands::delete_translation_task,
             commands::delete_translation_tasks,
             commands::get_translation_task_detail,

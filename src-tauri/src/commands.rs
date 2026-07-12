@@ -35,8 +35,8 @@ use crate::settings::{
 use crate::task_scheduler::{SchedulerAck, SchedulerAction, TaskScheduler};
 use crate::translation_tasks::{
     self, CreateTranslationTaskInput, ExportTranslationTaskInput, ImportTranslationTaskInput,
-    ProgressStep, StartTranslationTaskCreationResult, TranslationConfigView,
-    TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
+    ProgressStep, ReplaceTaskRuntimeSnapshotInput, StartTranslationTaskCreationResult,
+    TranslationConfigView, TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
     TranslationTaskCreationStatus, TranslationTaskDetail, TranslationTaskFilters,
     TranslationTaskIdsInput, TranslationTaskView, UpdateTranslationConfigInput,
     UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
@@ -349,6 +349,7 @@ pub async fn test_model_connectivity(
         thinking: None,
         max_output_tokens: Some(8),
         temperature: Some(0.0),
+        top_p: None,
         stream: false,
         logprobs: false,
         custom_parameters: json!({}),
@@ -477,24 +478,19 @@ pub async fn start_translation_task_creation(
                     inp_path,
                 },
             );
-            let glossary_step = task
-                .progress_detail
-                .as_ref()
-                .map(|detail| detail.glossary.clone())
-                .unwrap_or_else(|| ProgressStep {
-                    state: "success".to_string(),
-                    current: 1,
-                    total: 1,
-                    percent: 1.0,
-                    label: "预处理已完成".to_string(),
-                });
             let _ = app.emit(
                 "translation-task-creation-progress",
                 TranslationTaskCreationProgressPayload {
                     client_task_id: client_task_id_for_job.clone(),
                     file_path: source_file_path.clone(),
-                    stage: TranslationTaskCreationStage::Glossary,
-                    step: glossary_step,
+                    stage: TranslationTaskCreationStage::Chunking,
+                    step: ProgressStep {
+                        state: "success".to_string(),
+                        current: task.total_chunks.max(0) as u64,
+                        total: task.total_chunks.max(0) as u64,
+                        percent: 1.0,
+                        label: "预处理已完成".to_string(),
+                    },
                     status: TranslationTaskCreationStatus::Success,
                     task: Some(task.clone()),
                     error: None,
@@ -704,6 +700,20 @@ pub async fn dispatch_scheduler_action(
 }
 
 #[tauri::command]
+pub async fn replace_task_runtime_snapshot(
+    state: State<'_, AppState>,
+    input: ReplaceTaskRuntimeSnapshotInput,
+) -> Result<TranslationTaskView, String> {
+    translation_tasks::replace_task_runtime_snapshot(
+        &state.pool,
+        &state.translation_config_pool,
+        &state.translation_workspace_root,
+        input,
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn get_translation_config(
     state: State<'_, AppState>,
 ) -> Result<TranslationConfigView, String> {
@@ -715,7 +725,12 @@ pub async fn update_translation_config(
     state: State<'_, AppState>,
     input: UpdateTranslationConfigInput,
 ) -> Result<TranslationConfigView, String> {
-    translation_tasks::update_translation_config(&state.translation_config_pool, input).await
+    translation_tasks::update_translation_config_validated(
+        &state.pool,
+        &state.translation_config_pool,
+        input,
+    )
+    .await
 }
 
 #[tauri::command]

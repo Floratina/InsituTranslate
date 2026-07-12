@@ -177,6 +177,22 @@ export function taskStatusMessage(task: TranslationTaskView): TaskStatusMessage 
     };
   }
 
+  if (
+    task.status === "running"
+    && task.progressDetail
+    && (
+      task.progressDetail.glossary.state === "running"
+      || (
+        task.progressDetail.glossary.state === "pending"
+        && task.progressDetail.translating.state === "pending"
+      )
+    )
+  ) {
+    return {
+      text: task.progressDetail.glossary.label,
+      severity: "muted",
+    };
+  }
   if (task.status === "running" && task.progressDetail?.translating) {
     return {
       text: task.progressDetail.translating.label,
@@ -208,7 +224,8 @@ export function taskStatusMessage(task: TranslationTaskView): TaskStatusMessage 
 }
 
 export function unixTimeLabel(value: string): string {
-  const seconds = Number(value);
-  if (!Number.isFinite(seconds) || seconds <= 0) return "-";
-  return new Date(seconds * 1000).toLocaleString();
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "-";
+  const milliseconds = timestamp >= 1_000_000_000_000 ? timestamp : timestamp * 1000;
+  return new Date(milliseconds).toLocaleString();
 }

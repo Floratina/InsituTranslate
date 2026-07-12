@@ -71,8 +71,11 @@ import {
   deleteTranslationTask,
   deleteTranslationTasks,
   exportTranslationTask,
+  getTranslationConfig,
   listTranslationTasks,
   openTranslationTaskFolder,
+  replaceTaskRuntimeSnapshot,
+  updateTranslationConfig,
   updateTranslationTaskInfo,
 } from "@/features/translation/api";
 import {
@@ -93,6 +96,7 @@ import type {
   TranslationTaskExportFormat,
   TranslationTaskStatus,
   TranslationTaskView,
+  TaskRuntimeActionRequired,
 } from "@/features/translation/types";
 import { LanguageCombobox } from "@/features/languages/LanguageCombobox";
 import {
@@ -102,10 +106,15 @@ import {
   sameLanguage,
 } from "@/features/languages/languageOptions";
 import { cn } from "@/lib/utils";
+import { appSessionCache } from "@/lib/session-cache";
 
 type TaskTab = "running" | "completed" | "unfinished";
 type SortMode = "created-desc" | "created-asc" | "az";
 type TaskSortField = "name" | "stats" | "tags" | "language";
+
+interface RuntimeActionDialogState {
+  requirement: TaskRuntimeActionRequired;
+}
 
 const compactAccentButtonClass = cn(
   "!border-[var(--button-accent-border)] !bg-[var(--button-accent-bg)] !text-primary-foreground",
@@ -211,7 +220,29 @@ function sameTaskSignature(left: TranslationTaskView, right: TranslationTaskView
     && left.rateLimitStatus === right.rateLimitStatus
     && left.activeRetry?.current === right.activeRetry?.current
     && left.activeRetry?.message === right.activeRetry?.message
+    && sameProgressDetail(left.progressDetail, right.progressDetail)
     && left.tags.join("\u0000") === right.tags.join("\u0000");
+}
+
+function sameProgressStep(left: ProgressStep, right: ProgressStep): boolean {
+  return left.state === right.state
+    && left.current === right.current
+    && left.total === right.total
+    && left.percent === right.percent
+    && left.label === right.label;
+}
+
+function sameProgressDetail(
+  left: TranslationTaskView["progressDetail"],
+  right: TranslationTaskView["progressDetail"],
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return sameProgressStep(left.ast, right.ast)
+    && sameProgressStep(left.chunking, right.chunking)
+    && sameProgressStep(left.glossary, right.glossary)
+    && sameProgressStep(left.translating, right.translating)
+    && sameProgressStep(left.restore, right.restore);
 }
 
 function mergeTaskList(
@@ -448,21 +479,32 @@ function sortKey(task: TranslationTaskView, field: TaskSortField): string {
   return displayLanguagePair(task.sourceLanguage, task.targetLanguage);
 }
 
+function timestampMillis(value: string): number {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
+  return timestamp >= 1_000_000_000_000 ? timestamp : timestamp * 1000;
+}
+
+function compareTaskTimestamps(
+  left: TranslationTaskView,
+  right: TranslationTaskView,
+): number {
+  return timestampMillis(left.createdAt) - timestampMillis(right.createdAt)
+    || timestampMillis(left.updatedAt) - timestampMillis(right.updatedAt)
+    || left.id.localeCompare(right.id);
+}
+
 function sortTasks(tasks: TranslationTaskView[], sort: TaskSortState): TranslationTaskView[] {
   const next = [...tasks];
   if (sort.mode === "created-desc") {
-    return next.sort((left, right) =>
-      right.createdAt.localeCompare(left.createdAt) || right.updatedAt.localeCompare(left.updatedAt),
-    );
+    return next.sort((left, right) => compareTaskTimestamps(right, left));
   }
   if (sort.mode === "created-asc") {
-    return next.sort((left, right) =>
-      left.createdAt.localeCompare(right.createdAt) || left.updatedAt.localeCompare(right.updatedAt),
-    );
+    return next.sort(compareTaskTimestamps);
   }
   return next.sort((left, right) =>
     collator.compare(sortKey(left, sort.field), sortKey(right, sort.field)) ||
-    right.createdAt.localeCompare(left.createdAt),
+    compareTaskTimestamps(right, left),
   );
 }
 
@@ -497,6 +539,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   const [exportState, setExportState] = useState<ExportState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<TranslationTaskView | null>(null);
   const [clearTargets, setClearTargets] = useState<TranslationTaskView[] | null>(null);
+  const [runtimeActionState, setRuntimeActionState] = useState<RuntimeActionDialogState | null>(null);
 
   const filteredTasks = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
@@ -583,6 +626,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
 
   useEffect(() => {
     if (!isTauriRuntime()) return undefined;
+    let disposed = false;
     let disposeProgress: (() => void) | undefined;
     let disposeStatus: (() => void) | undefined;
     const pending = new Map<string, TranslationTaskView>();
@@ -599,14 +643,17 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         flushTimer = window.setTimeout(flush, 250);
       }
     }).then((unlisten) => {
-      disposeProgress = unlisten;
+      if (disposed) unlisten();
+      else disposeProgress = unlisten;
     });
     void listen<TranslationProgressPayload>("task-status-changed", (event) => {
       setTasks((current) => mergeTaskList(current, [event.payload.task]));
     }).then((unlisten) => {
-      disposeStatus = unlisten;
+      if (disposed) unlisten();
+      else disposeStatus = unlisten;
     });
     return () => {
+      disposed = true;
       disposeProgress?.();
       disposeStatus?.();
       if (flushTimer !== null) window.clearTimeout(flushTimer);
@@ -645,9 +692,43 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     setBusyId(task.id);
     try {
       const ack = await dispatchSchedulerAction(action);
+      if (ack.actionRequired) {
+        setRuntimeActionState({ requirement: ack.actionRequired });
+        return;
+      }
       if (!ack.success) {
         pushToast(ack.message ?? "调度指令未被接受", "error");
       }
+    } catch (error) {
+      pushToast(getErrorMessage(error), "error");
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function replaceRuntimeAndRetranslate(): Promise<void> {
+    if (!runtimeActionState) return;
+    const taskId = runtimeActionState.requirement.taskId;
+    setBusyId(taskId);
+    try {
+      const draft = appSessionCache.startDraft.read();
+      const currentConfig = draft
+        ? {
+            ...draft.config,
+            sourceLanguage: draft.sourceLanguage,
+            targetLanguage: draft.targetLanguage,
+          }
+        : await getTranslationConfig();
+      const config = await updateTranslationConfig(currentConfig);
+      appSessionCache.translationConfig.set(config);
+      await replaceTaskRuntimeSnapshot({ taskId, config });
+      const ack = await dispatchSchedulerAction({ type: "retranslate", taskId });
+      if (!ack.success) {
+        pushToast(ack.message ?? "重新翻译指令未被接受", "error");
+        return;
+      }
+      setRuntimeActionState(null);
+      pushToast("任务已使用当前开始页配置重新开始", "success");
     } catch (error) {
       pushToast(getErrorMessage(error), "error");
     } finally {
@@ -746,6 +827,10 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     setBatchBusy(true);
     try {
       const ack = await dispatchSchedulerAction({ type: "enqueueBatch", taskIds: ids });
+      if (ack.actionRequired) {
+        setRuntimeActionState({ requirement: ack.actionRequired });
+        return;
+      }
       if (!ack.success) {
         pushToast(ack.message ?? "批量开始指令未被接受", "error");
         return;
@@ -767,6 +852,10 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     setBatchBusy(true);
     try {
       const ack = await dispatchSchedulerAction({ type: "retranslateBatch", taskIds: ids });
+      if (ack.actionRequired) {
+        setRuntimeActionState({ requirement: ack.actionRequired });
+        return;
+      }
       if (!ack.success) {
         pushToast(ack.message ?? "批量重新翻译指令未被接受", "error");
         return;
@@ -991,6 +1080,17 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         }}
         onChange={setExportState}
         onSubmit={() => void runExport()}
+      />
+      <ConfirmDialog
+        open={runtimeActionState !== null}
+        title="请采取行动"
+        description="执行该任务的模型或助手被删除，任务将以当前“开始”页面的配置重新开始。"
+        confirmText="确定"
+        destructive={false}
+        onOpenChange={(open) => {
+          if (!open) setRuntimeActionState(null);
+        }}
+        onConfirm={() => void replaceRuntimeAndRetranslate()}
       />
       <ConfirmDialog
         open={deleteTarget !== null}
@@ -1774,6 +1874,7 @@ function ConfirmDialog({
   title,
   description,
   confirmText,
+  destructive = true,
   onOpenChange,
   onConfirm,
 }: {
@@ -1781,6 +1882,7 @@ function ConfirmDialog({
   title: string;
   description: string;
   confirmText: string;
+  destructive?: boolean;
   onOpenChange: (open: boolean) => void;
   onConfirm: () => void;
 }) {
@@ -1795,7 +1897,7 @@ function ConfirmDialog({
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
             取消
           </Button>
-          <Button type="button" variant="destructive" onClick={onConfirm}>
+          <Button type="button" variant={destructive ? "destructive" : "default"} onClick={onConfirm}>
             {confirmText}
           </Button>
         </DialogFooter>

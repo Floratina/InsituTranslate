@@ -4,6 +4,7 @@ import type {
   CreateTranslationTaskInput,
   ExportTranslationTaskInput,
   ImportTranslationTaskInput,
+  ReplaceTaskRuntimeSnapshotInput,
   StartTranslationTaskCreationResult,
   TranslationConfigView,
   TranslationTaskFilters,
@@ -106,4 +107,10 @@ export function updateTranslationConfig(
   input: UpdateTranslationConfigInput,
 ): Promise<TranslationConfigView> {
   return invoke<TranslationConfigView>("update_translation_config", { input });
+}
+
+export function replaceTaskRuntimeSnapshot(
+  input: ReplaceTaskRuntimeSnapshotInput,
+): Promise<TranslationTaskView> {
+  return invoke<TranslationTaskView>("replace_task_runtime_snapshot", { input });
 }

@@ -15,6 +15,7 @@ use tauri_plugin_dialog::DialogExt;
 use crate::db as app_db;
 use crate::document_parsing;
 use crate::document_parsing::types::{ParserProgress, ParserProgressStage, RenderedChunk};
+use crate::domain::{AssistantView, ModelView, ProviderPurpose, ProviderView};
 use crate::languages::{
     normalize_source_language, normalize_target_language, DEFAULT_SOURCE_LANGUAGE,
     DEFAULT_TARGET_LANGUAGE,
@@ -24,16 +25,19 @@ use crate::task_prompt::{ContentFormat, DocumentFormat};
 
 use super::context::{
     display_name_from_path, estimate_tokens, global_background_from_texts, next_inp_path,
-    sanitize_file_stem, unix_timestamp,
+    sanitize_file_stem, unix_timestamp, unix_timestamp_millis,
 };
+use super::request_options::{resolve_model_request_options, ModelRequestSettings};
 use super::types::{
-    ChunkOutcome, ChunkRecord, ProgressDetail, ProgressStep, TaskGlossaryConfig,
-    TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
-    TranslationTaskCreationStatus,
+    ChunkOutcome, ChunkRecord, GlossaryGenerationSnapshot, ProgressDetail, ProgressStep,
+    TaskGlossaryConfig, TaskRuntimeActionRequired, TranslationTaskCreationProgressPayload,
+    TranslationTaskCreationStage, TranslationTaskCreationStatus,
+    GLOSSARY_GENERATION_SNAPSHOT_VERSION,
 };
 use super::{
     ContextHandlingMode, CreateTranslationTaskInput, ExportTranslationTaskInput, GlossaryMode,
-    ImportTranslationTaskInput, RateLimitStrategy, TextTokenStats, TokenStats,
+    ImportTranslationTaskInput, RateLimitStrategy, ReplaceTaskRuntimeSnapshotInput,
+    TaskRuntimeActionReason, TaskRuntimeConfigDomain, TextTokenStats, TokenStats,
     TranslationChunkStatus, TranslationChunkView, TranslationConfigView,
     TranslationProgressPayload, TranslationTaskActiveRetry, TranslationTaskDetail,
     TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskStatus,
@@ -476,7 +480,6 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
             "error_rate",
             "last_error",
             "rate_limit_status",
-            "global_background",
             "created_at",
             "updated_at",
         ],
@@ -488,12 +491,8 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
         &[
             "id",
             "sequence",
-            "map_json",
-            "preprocessed_text",
             "source_text",
-            "after_translate_text",
             "translated_text",
-            "confidence",
             "status",
             "retry_count",
             "error_message",
@@ -530,6 +529,9 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
             &["map_json", "preprocessed_text", "after_translate_text"],
         )
         .await?;
+    }
+    if schema_version >= 3 {
+        require_columns(pool, "chunks", &["confidence"]).await?;
     }
     if schema_version >= 4 {
         require_columns(
@@ -600,6 +602,29 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
         )
         .await?;
         require_columns(pool, "chunks", &["source_tokens", "target_tokens"]).await?;
+    }
+    if schema_version >= 11 {
+        require_columns(
+            pool,
+            "metadata",
+            &[
+                "assistant_temperature",
+                "assistant_top_p",
+                "glossary_generation_snapshot_json",
+                "runtime_action_required_json",
+            ],
+        )
+        .await?;
+        let snapshot_json = row
+            .try_get::<Option<String>, _>("glossary_generation_snapshot_json")
+            .unwrap_or(None);
+        parse_glossary_generation_snapshot_json(snapshot_json)
+            .map_err(|_| INP_FILE_DAMAGED.to_string())?;
+        let action_json = row
+            .try_get::<Option<String>, _>("runtime_action_required_json")
+            .unwrap_or(None);
+        parse_runtime_action_required_json(action_json)
+            .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     }
     TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -742,6 +767,8 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             assistant_id TEXT,
             assistant_system_prompt TEXT,
             assistant_custom_parameters_json TEXT NOT NULL DEFAULT '{}',
+            assistant_temperature REAL,
+            assistant_top_p REAL,
             use_glossary INTEGER NOT NULL DEFAULT 0,
             glossary_mode TEXT NOT NULL DEFAULT 'auto',
             glossary_id TEXT,
@@ -750,6 +777,8 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
             max_concurrency INTEGER NOT NULL,
             max_retries INTEGER NOT NULL,
             config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            glossary_generation_snapshot_json TEXT,
+            runtime_action_required_json TEXT,
             global_background TEXT,
             total_chunks INTEGER NOT NULL DEFAULT 0,
             completed_chunks INTEGER NOT NULL DEFAULT 0,
@@ -826,6 +855,14 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
     add_column_if_missing(
         pool,
         "metadata",
+        "assistant_temperature",
+        "REAL DEFAULT 0.0",
+    )
+    .await?;
+    add_column_if_missing(pool, "metadata", "assistant_top_p", "REAL").await?;
+    add_column_if_missing(
+        pool,
+        "metadata",
         "use_glossary",
         "INTEGER NOT NULL DEFAULT 0",
     )
@@ -863,6 +900,14 @@ async fn migrate_inp_db(pool: &SqlitePool) -> Result<(), String> {
     )
     .await?;
     add_column_if_missing(pool, "metadata", "queued_from_status", "TEXT").await?;
+    add_column_if_missing(
+        pool,
+        "metadata",
+        "glossary_generation_snapshot_json",
+        "TEXT",
+    )
+    .await?;
+    add_column_if_missing(pool, "metadata", "runtime_action_required_json", "TEXT").await?;
     add_column_if_missing(pool, "chunks", "map_json", "TEXT NOT NULL DEFAULT '{}'").await?;
     add_column_if_missing(
         pool,
@@ -1191,7 +1236,105 @@ fn validate_translation_config(config: &TranslationConfigView) -> Result<(), Str
     {
         return Err("Glossary selection is required when using an existing glossary".into());
     }
+    if config.use_glossary && matches!(config.glossary_mode, GlossaryMode::Auto) {
+        validate_saved_selection(
+            "Glossary provider",
+            &config.glossary_generation_config.provider_id,
+        )?;
+        validate_saved_selection(
+            "Glossary model",
+            &config.glossary_generation_config.model_id,
+        )?;
+        if let Some(assistant_id) = config.glossary_generation_config.assistant_id.as_deref() {
+            validate_saved_selection("Glossary assistant", assistant_id)?;
+        }
+    }
     Ok(())
+}
+
+pub async fn validate_translation_config_runtime(
+    provider_pool: &SqlitePool,
+    config: &TranslationConfigView,
+) -> Result<(), String> {
+    validate_translation_config(config)?;
+    let selection = resolve_translation_runtime_selection(
+        provider_pool,
+        &config.provider_id,
+        &config.model_id,
+        Some(&config.assistant_id),
+    )
+    .await?;
+    let runtime = app_db::runtime_config(provider_pool, &selection.provider.id).await?;
+    resolve_model_request_options(
+        &ModelRequestSettings {
+            thinking_effort: config.thinking_effort,
+            use_web_search: config.use_web_search,
+            use_custom_parameters: config.use_custom_parameters,
+        },
+        &runtime,
+        &selection.model,
+        selection
+            .assistant
+            .as_ref()
+            .map(|value| value.custom_parameters.clone())
+            .unwrap_or_else(|| json!({})),
+    )?;
+    if config.use_glossary && config.glossary_mode == GlossaryMode::Auto {
+        build_glossary_generation_snapshot(provider_pool, &config.glossary_generation_config)
+            .await?;
+    }
+    Ok(())
+}
+
+struct TranslationRuntimeSelection {
+    provider: ProviderView,
+    model: ModelView,
+    assistant: Option<AssistantView>,
+}
+
+async fn resolve_translation_runtime_selection(
+    provider_pool: &SqlitePool,
+    provider_id: &str,
+    model_id: &str,
+    assistant_id: Option<&str>,
+) -> Result<TranslationRuntimeSelection, String> {
+    let provider = app_db::list_providers(provider_pool, Some(ProviderPurpose::Translation))
+        .await?
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            "Selected translation provider does not exist or is not assigned to translation use"
+                .to_string()
+        })?;
+    if !provider.enabled {
+        return Err("Selected translation provider is disabled".into());
+    }
+    let model = provider
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .cloned()
+        .ok_or_else(|| {
+            "Selected translation model does not belong to the selected translation provider"
+                .to_string()
+        })?;
+    let assistant = match assistant_id.map(str::trim) {
+        None | Some("") | Some("__none__") => None,
+        Some(id) => {
+            let assistant = app_db::get_assistant(provider_pool, id).await?;
+            if assistant.purpose != ProviderPurpose::Translation {
+                return Err(
+                    "Selected translation assistant is not assigned to translation use".into(),
+                );
+            }
+            Some(assistant)
+        }
+    };
+    Ok(TranslationRuntimeSelection {
+        provider,
+        model,
+        assistant,
+    })
 }
 
 fn validate_saved_selection(label: &str, value: &str) -> Result<(), String> {
@@ -1209,8 +1352,26 @@ pub(super) fn effective_translation_concurrency(config: &TranslationConfigView) 
     }
 }
 
+#[cfg(test)]
 pub async fn update_translation_config(
     config_pool: &SqlitePool,
+    input: UpdateTranslationConfigInput,
+) -> Result<TranslationConfigView, String> {
+    let config = translation_config_from_update_input(input)?;
+    persist_translation_config(config_pool, config).await
+}
+
+pub async fn update_translation_config_validated(
+    provider_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    input: UpdateTranslationConfigInput,
+) -> Result<TranslationConfigView, String> {
+    let config = translation_config_from_update_input(input)?;
+    validate_translation_config_runtime(provider_pool, &config).await?;
+    persist_translation_config(config_pool, config).await
+}
+
+fn translation_config_from_update_input(
     input: UpdateTranslationConfigInput,
 ) -> Result<TranslationConfigView, String> {
     let config = TranslationConfigView {
@@ -1241,6 +1402,7 @@ pub async fn update_translation_config(
             .glossary_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        glossary_generation_config: input.glossary_generation_config,
         thinking_effort: input.thinking_effort,
         use_web_search: input.use_web_search,
         use_custom_parameters: input.use_custom_parameters,
@@ -1248,6 +1410,13 @@ pub async fn update_translation_config(
         pdf_parsing_mode: input.pdf_parsing_mode,
     };
     validate_translation_config(&config)?;
+    Ok(config)
+}
+
+async fn persist_translation_config(
+    config_pool: &SqlitePool,
+    config: TranslationConfigView,
+) -> Result<TranslationConfigView, String> {
     let config_json = serde_json::to_string(&config).map_err(|error| error.to_string())?;
     sqlx::query(
         "UPDATE translation_config
@@ -1382,7 +1551,7 @@ pub async fn create_translation_task(
 ) -> Result<TranslationTaskView, String> {
     let source_language = normalize_source_language(&input.source_language)?;
     let target_language = normalize_target_language(&input.target_language)?;
-    let tags = normalize_tags(input.tags)?;
+    let tags = normalize_tags(input.tags.clone())?;
     let tags_json = serialize_tags(&tags)?;
     let source_path = PathBuf::from(input.file_path.trim());
     validate_supported_source_file(&source_path)?;
@@ -1392,27 +1561,38 @@ pub async fn create_translation_task(
     let source_file_name = source_file_name_from_path(&source_path);
     let materialized_source =
         materialize_source_bytes(&source_file_name, &source_bytes, &source_path).await?;
-    let model = app_db::get_model(provider_pool, &input.model_id).await?;
-    if model.provider_id != input.provider_id {
-        return Err("Selected model does not belong to the selected provider".into());
-    }
+    let selection = resolve_translation_runtime_selection(
+        provider_pool,
+        &input.provider_id,
+        &input.model_id,
+        input.assistant_id.as_deref(),
+    )
+    .await?;
+    let model = selection.model;
     let config = get_translation_config(config_pool).await?;
-    let (assistant_prompt, assistant_custom_parameters) = match input
-        .assistant_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        Some(id) => {
-            let assistant = app_db::get_assistant(provider_pool, id).await?;
-            let custom_parameters = if config.use_custom_parameters {
-                assistant.custom_parameters
-            } else {
-                json!({})
-            };
-            (Some(assistant.system_prompt), custom_parameters)
-        }
-        None => (None, json!({})),
-    };
+    let (task_glossary_config, glossary_generation_snapshot) =
+        snapshot_task_glossary_input(provider_pool, &input).await?;
+    let glossary_generation_snapshot_json =
+        serialize_glossary_generation_snapshot(glossary_generation_snapshot.as_ref())?;
+    let (assistant_prompt, assistant_custom_parameters, assistant_temperature, assistant_top_p) =
+        match selection.assistant {
+            Some(assistant) => {
+                let custom_parameters = if config.use_custom_parameters {
+                    assistant.custom_parameters.clone()
+                } else {
+                    json!({})
+                };
+                (
+                    Some(assistant.system_prompt),
+                    custom_parameters,
+                    assistant
+                        .temperature_enabled
+                        .then_some(assistant.temperature),
+                    assistant.top_p_enabled.then_some(assistant.top_p),
+                )
+            }
+            None => (None, json!({}), None, None),
+        };
     let task_id = app_db::new_id("task");
     let display_name = display_name_from_path(&source_path);
     let inp_path = next_inp_path(workspace_root, &display_name).await?;
@@ -1439,26 +1619,21 @@ pub async fn create_translation_task(
     let created_at = unix_timestamp();
     let inp_pool = connect_inp(&inp_path).await?;
     let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
-    let progress_detail = progress_detail_for_config(
-        parsed_source.chunks.len() as u64,
-        0,
-        &TaskGlossaryConfig {
-            use_glossary: config.use_glossary,
-            glossary_mode: config.glossary_mode,
-            glossary_id: config.glossary_id.clone(),
-        },
-    );
+    let progress_detail =
+        progress_detail_for_config(parsed_source.chunks.len() as u64, 0, &task_glossary_config);
     let progress_detail_json = serialize_progress_detail(Some(&progress_detail))?;
     let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query(
         "INSERT INTO metadata (
             task_id, schema_version, name, source_path, source_language, target_language, status,
             progress, provider_id, model_id, model_request_name, assistant_id, assistant_system_prompt,
-            assistant_custom_parameters_json, use_glossary, glossary_mode, glossary_id, tags_json,
-            token_limit, max_concurrency, max_retries, config_snapshot_json, global_background,
+            assistant_custom_parameters_json, assistant_temperature, assistant_top_p,
+            use_glossary, glossary_mode, glossary_id, tags_json,
+            token_limit, max_concurrency, max_retries, config_snapshot_json,
+            glossary_generation_snapshot_json, global_background,
             total_chunks, progress_detail_json,
             created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&task_id)
     .bind(INP_SCHEMA_VERSION)
@@ -1473,14 +1648,17 @@ pub async fn create_translation_task(
     .bind(input.assistant_id.as_deref().filter(|value| !value.is_empty()))
     .bind(assistant_prompt.as_deref())
     .bind(assistant_custom_parameters.to_string())
-    .bind(config.use_glossary)
-    .bind(config.glossary_mode.as_str())
-    .bind(config.glossary_id.as_deref())
+    .bind(assistant_temperature)
+    .bind(assistant_top_p)
+    .bind(task_glossary_config.use_glossary)
+    .bind(task_glossary_config.glossary_mode.as_str())
+    .bind(task_glossary_config.glossary_id.as_deref())
     .bind(tags_json)
     .bind(config.chunk_token_limit)
     .bind(config.max_concurrency)
     .bind(config.max_retries)
     .bind(config_snapshot)
+    .bind(glossary_generation_snapshot_json)
     .bind(global_background.as_deref())
     .bind(parsed_source.chunks.len() as i64)
     .bind(progress_detail_json)
@@ -1662,7 +1840,7 @@ pub async fn create_translation_task_with_progress(
 
     let source_language = try_creation!(normalize_source_language(&input.source_language));
     let target_language = try_creation!(normalize_target_language(&input.target_language));
-    let tags = try_creation!(normalize_tags(input.tags));
+    let tags = try_creation!(normalize_tags(input.tags.clone()));
     let tags_json = try_creation!(serialize_tags(&tags));
     let source_path = PathBuf::from(input.file_path.trim());
     try_creation!(validate_supported_source_file(&source_path));
@@ -1677,27 +1855,41 @@ pub async fn create_translation_task_with_progress(
     );
     cancel_creation!();
 
-    let model = try_creation!(app_db::get_model(&provider_pool, &input.model_id).await);
-    if model.provider_id != input.provider_id {
-        fail_creation!("Selected model does not belong to the selected provider".to_string());
-    }
+    let selection = try_creation!(
+        resolve_translation_runtime_selection(
+            &provider_pool,
+            &input.provider_id,
+            &input.model_id,
+            input.assistant_id.as_deref(),
+        )
+        .await
+    );
+    let model = selection.model;
     let config = try_creation!(get_translation_config(&config_pool).await);
-    let (assistant_prompt, assistant_custom_parameters) = match input
-        .assistant_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        Some(id) => {
-            let assistant = try_creation!(app_db::get_assistant(&provider_pool, id).await);
-            let custom_parameters = if config.use_custom_parameters {
-                assistant.custom_parameters
-            } else {
-                json!({})
-            };
-            (Some(assistant.system_prompt), custom_parameters)
-        }
-        None => (None, json!({})),
-    };
+    let (task_glossary_config, glossary_generation_snapshot) =
+        try_creation!(snapshot_task_glossary_input(&provider_pool, &input).await);
+    let glossary_generation_snapshot_json = try_creation!(serialize_glossary_generation_snapshot(
+        glossary_generation_snapshot.as_ref()
+    ));
+    let (assistant_prompt, assistant_custom_parameters, assistant_temperature, assistant_top_p) =
+        match selection.assistant {
+            Some(assistant) => {
+                let custom_parameters = if config.use_custom_parameters {
+                    assistant.custom_parameters.clone()
+                } else {
+                    json!({})
+                };
+                (
+                    Some(assistant.system_prompt),
+                    custom_parameters,
+                    assistant
+                        .temperature_enabled
+                        .then_some(assistant.temperature),
+                    assistant.top_p_enabled.then_some(assistant.top_p),
+                )
+            }
+            None => (None, json!({}), None, None),
+        };
     let task_id = app_db::new_id("task");
     task_id_for_cleanup = Some(task_id.clone());
     let display_name = display_name_from_path(&source_path);
@@ -1803,15 +1995,7 @@ pub async fn create_translation_task_with_progress(
     let created_at = unix_timestamp();
     let inp_pool = try_creation!(connect_inp(&inp_path).await);
     let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
-    let progress_detail = progress_detail_for_config(
-        total_chunks,
-        0,
-        &TaskGlossaryConfig {
-            use_glossary: config.use_glossary,
-            glossary_mode: config.glossary_mode,
-            glossary_id: config.glossary_id.clone(),
-        },
-    );
+    let progress_detail = progress_detail_for_config(total_chunks, 0, &task_glossary_config);
     let progress_detail_json = try_creation!(serialize_progress_detail(Some(&progress_detail)));
     let mut transaction = try_creation!(inp_pool.begin().await.map_err(|error| error.to_string()));
     try_creation!(
@@ -1819,11 +2003,13 @@ pub async fn create_translation_task_with_progress(
             "INSERT INTO metadata (
                 task_id, schema_version, name, source_path, source_language, target_language, status,
                 progress, provider_id, model_id, model_request_name, assistant_id, assistant_system_prompt,
-                assistant_custom_parameters_json, use_glossary, glossary_mode, glossary_id, tags_json,
-                token_limit, max_concurrency, max_retries, config_snapshot_json, global_background,
+                assistant_custom_parameters_json, assistant_temperature, assistant_top_p,
+                use_glossary, glossary_mode, glossary_id, tags_json,
+                token_limit, max_concurrency, max_retries, config_snapshot_json,
+                glossary_generation_snapshot_json, global_background,
                 total_chunks, progress_detail_json,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&task_id)
         .bind(INP_SCHEMA_VERSION)
@@ -1838,14 +2024,17 @@ pub async fn create_translation_task_with_progress(
         .bind(input.assistant_id.as_deref().filter(|value| !value.is_empty()))
         .bind(assistant_prompt.as_deref())
         .bind(assistant_custom_parameters.to_string())
-        .bind(config.use_glossary)
-        .bind(config.glossary_mode.as_str())
-        .bind(config.glossary_id.as_deref())
+        .bind(assistant_temperature)
+        .bind(assistant_top_p)
+        .bind(task_glossary_config.use_glossary)
+        .bind(task_glossary_config.glossary_mode.as_str())
+        .bind(task_glossary_config.glossary_id.as_deref())
         .bind(tags_json)
         .bind(config.chunk_token_limit)
         .bind(config.max_concurrency)
         .bind(config.max_retries)
         .bind(config_snapshot)
+        .bind(glossary_generation_snapshot_json)
         .bind(global_background.as_deref())
         .bind(total_chunks as i64)
         .bind(progress_detail_json)
@@ -2272,6 +2461,323 @@ pub async fn get_translation_task_summary(
     id: &str,
 ) -> Result<TranslationTaskView, String> {
     get_task_from_index(config_pool, id).await
+}
+
+async fn runtime_selection_is_missing(
+    provider_pool: &SqlitePool,
+    purpose: ProviderPurpose,
+    provider_id: &str,
+    model_id: &str,
+    assistant_id: Option<&str>,
+) -> Result<bool, String> {
+    let provider = app_db::list_providers(provider_pool, Some(purpose))
+        .await?
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            format!(
+                "Selected {} provider no longer exists or is not assigned to this purpose",
+                purpose.as_str()
+            )
+        })?;
+    if !provider.enabled {
+        return Err(format!(
+            "Selected {} provider is disabled",
+            purpose.as_str()
+        ));
+    }
+    if !provider.models.iter().any(|model| model.id == model_id) {
+        return Ok(true);
+    }
+    let Some(assistant_id) = assistant_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "__none__")
+    else {
+        return Ok(false);
+    };
+    Ok(!app_db::list_assistants(provider_pool, purpose)
+        .await?
+        .iter()
+        .any(|assistant| assistant.id == assistant_id))
+}
+
+pub async fn get_task_runtime_action_required(
+    provider_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    task_id: &str,
+) -> Result<Option<TaskRuntimeActionRequired>, String> {
+    let indexed = get_task_from_index(config_pool, task_id).await?;
+    let inp_path = PathBuf::from(&indexed.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
+    let inp_pool = connect_inp(&inp_path).await?;
+    let stored = task_runtime_action_required(&inp_pool).await?;
+    let row =
+        sqlx::query("SELECT provider_id, model_id, assistant_id, last_error FROM metadata LIMIT 1")
+            .fetch_one(&inp_pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    let mut missing_domains = Vec::new();
+    let translation_provider_id: String = row.get("provider_id");
+    let translation_model_id: String = row.get("model_id");
+    let translation_assistant_id: Option<String> = row.get("assistant_id");
+    if runtime_selection_is_missing(
+        provider_pool,
+        ProviderPurpose::Translation,
+        &translation_provider_id,
+        &translation_model_id,
+        translation_assistant_id.as_deref(),
+    )
+    .await?
+    {
+        missing_domains.push(TaskRuntimeConfigDomain::Translation);
+    }
+    let glossary_config = task_glossary_config(&inp_pool).await?;
+    if glossary_config.use_glossary && glossary_config.glossary_mode == GlossaryMode::Auto {
+        let glossary_snapshot = match task_glossary_generation_snapshot(&inp_pool).await? {
+            Some(snapshot) => Some(snapshot),
+            None => {
+                let fallback_config = get_translation_config(config_pool).await?;
+                let fallback_generation = &fallback_config.glossary_generation_config;
+                if runtime_selection_is_missing(
+                    provider_pool,
+                    ProviderPurpose::Glossary,
+                    &fallback_generation.provider_id,
+                    &fallback_generation.model_id,
+                    fallback_generation.assistant_id.as_deref(),
+                )
+                .await?
+                {
+                    missing_domains.push(TaskRuntimeConfigDomain::Glossary);
+                    None
+                } else {
+                    ensure_task_glossary_generation_snapshot(
+                        &inp_pool,
+                        provider_pool,
+                        &fallback_config,
+                    )
+                    .await?
+                }
+            }
+        };
+        match glossary_snapshot {
+            Some(snapshot)
+                if !runtime_selection_is_missing(
+                    provider_pool,
+                    ProviderPurpose::Glossary,
+                    &snapshot.provider_id,
+                    &snapshot.model_id,
+                    snapshot.assistant_id.as_deref(),
+                )
+                .await? => {}
+            None => {}
+            _ => missing_domains.push(TaskRuntimeConfigDomain::Glossary),
+        }
+    }
+    if !missing_domains.is_empty() {
+        let action = TaskRuntimeActionRequired {
+            task_id: task_id.to_string(),
+            domains: missing_domains,
+            reason: TaskRuntimeActionReason::LocalConfigMissing,
+        };
+        set_task_runtime_action_required(&inp_pool, &action).await?;
+        inp_pool.close().await;
+        return Ok(Some(action));
+    }
+    let last_error = row.get::<Option<String>, _>("last_error");
+    let chunk_model_unavailable: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chunks WHERE error_message LIKE 'MODEL_UNAVAILABLE:TRANSLATION:%'",
+    )
+    .fetch_one(&inp_pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut unavailable_domains = Vec::new();
+    if chunk_model_unavailable > 0
+        || last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("MODEL_UNAVAILABLE:TRANSLATION:"))
+    {
+        unavailable_domains.push(TaskRuntimeConfigDomain::Translation);
+    }
+    if last_error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("MODEL_UNAVAILABLE:GLOSSARY:"))
+    {
+        unavailable_domains.push(TaskRuntimeConfigDomain::Glossary);
+    }
+    if !unavailable_domains.is_empty() {
+        let action = TaskRuntimeActionRequired {
+            task_id: task_id.to_string(),
+            domains: unavailable_domains,
+            reason: TaskRuntimeActionReason::RemoteModelUnavailable,
+        };
+        set_task_runtime_action_required(&inp_pool, &action).await?;
+        inp_pool.close().await;
+        return Ok(Some(action));
+    }
+    inp_pool.close().await;
+    Ok(stored)
+}
+
+pub async fn replace_task_runtime_snapshot(
+    provider_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    input: ReplaceTaskRuntimeSnapshotInput,
+) -> Result<TranslationTaskView, String> {
+    let config = normalize_translation_config(input.config);
+    validate_translation_config_runtime(provider_pool, &config).await?;
+    let indexed = get_task_from_index(config_pool, &input.task_id).await?;
+    let inp_path = PathBuf::from(&indexed.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
+    let provider = app_db::list_providers(provider_pool, Some(ProviderPurpose::Translation))
+        .await?
+        .into_iter()
+        .find(|provider| provider.id == config.provider_id)
+        .ok_or_else(|| {
+            "Selected translation provider does not exist or is not assigned to translation use"
+                .to_string()
+        })?;
+    if !provider.enabled {
+        return Err("Selected translation provider is disabled".into());
+    }
+    let model = provider
+        .models
+        .iter()
+        .find(|model| model.id == config.model_id)
+        .ok_or_else(|| {
+            "Selected translation model does not belong to the selected translation provider"
+                .to_string()
+        })?;
+    let assistant_id_value = config.assistant_id.trim().to_string();
+    let assistant_id = (!assistant_id_value.is_empty() && assistant_id_value != "__none__")
+        .then_some(assistant_id_value);
+    let assistant = match assistant_id.as_deref() {
+        Some(id) => {
+            let assistant = app_db::get_assistant(provider_pool, id).await?;
+            if assistant.purpose != ProviderPurpose::Translation {
+                return Err(
+                    "Selected translation assistant is not assigned to translation use".into(),
+                );
+            }
+            Some(assistant)
+        }
+        None => None,
+    };
+    let translation_custom_parameters = assistant
+        .as_ref()
+        .filter(|_| config.use_custom_parameters)
+        .map(|value| value.custom_parameters.clone())
+        .unwrap_or_else(|| json!({}));
+    let glossary_config = TaskGlossaryConfig {
+        use_glossary: config.use_glossary,
+        glossary_mode: config.glossary_mode,
+        glossary_id: config
+            .glossary_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    };
+    if glossary_config.use_glossary
+        && glossary_config.glossary_mode == GlossaryMode::Existing
+        && glossary_config.glossary_id.is_none()
+    {
+        return Err("Glossary selection is required when using an existing glossary".into());
+    }
+    let glossary_snapshot = if glossary_config.use_glossary
+        && glossary_config.glossary_mode == GlossaryMode::Auto
+    {
+        Some(
+            build_glossary_generation_snapshot(provider_pool, &config.glossary_generation_config)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let glossary_snapshot_json =
+        serialize_glossary_generation_snapshot(glossary_snapshot.as_ref())?;
+    let config_snapshot = config_snapshot_json(&config, &provider.id, &model.id);
+    let inp_pool = connect_inp(&inp_path).await?;
+    let total_chunks = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chunks")
+        .fetch_one(&inp_pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .max(0) as u64;
+    let progress_detail = progress_detail_for_config(total_chunks, 0, &glossary_config);
+    let progress_detail_json = serialize_progress_detail(Some(&progress_detail))?;
+    let now = unix_timestamp();
+    let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
+    sqlx::query(
+        "UPDATE chunks SET status = ?, after_translate_text = '', translated_text = '',
+            retry_count = 0, error_message = NULL, confidence = NULL, input_tokens = 0,
+            output_tokens = 0, cached_tokens = 0, thinking_tokens = 0, total_tokens = 0,
+            target_tokens = 0, updated_at = ?",
+    )
+    .bind(TranslationChunkStatus::Pending.as_str())
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    sqlx::query(
+        "UPDATE metadata SET status = ?, progress = 0, provider_id = ?, model_id = ?,
+            model_request_name = ?, assistant_id = ?, assistant_system_prompt = ?,
+            assistant_custom_parameters_json = ?, assistant_temperature = ?, assistant_top_p = ?,
+            use_glossary = ?, glossary_mode = ?, glossary_id = ?,
+            glossary_generation_snapshot_json = ?, config_snapshot_json = ?,
+            runtime_action_required_json = NULL, global_background = NULL,
+            completed_chunks = 0, failed_chunks = 0, interrupted_chunks = 0,
+            input_tokens = 0, output_tokens = 0, cached_tokens = 0, thinking_tokens = 0,
+            total_tokens = 0, source_text_tokens = 0, target_text_tokens = 0,
+            total_text_tokens = 0, error_rate = 0, last_error = NULL,
+            rate_limit_status = NULL, active_retry_json = NULL, queued_from_status = NULL,
+            progress_detail_json = ?, updated_at = ? WHERE task_id = ?",
+    )
+    .bind(TranslationTaskStatus::Failed.as_str())
+    .bind(&provider.id)
+    .bind(&model.id)
+    .bind(&model.request_name)
+    .bind(assistant_id.as_deref())
+    .bind(assistant.as_ref().map(|value| value.system_prompt.as_str()))
+    .bind(translation_custom_parameters.to_string())
+    .bind(
+        assistant
+            .as_ref()
+            .filter(|value| value.temperature_enabled)
+            .map(|value| value.temperature),
+    )
+    .bind(
+        assistant
+            .as_ref()
+            .filter(|value| value.top_p_enabled)
+            .map(|value| value.top_p),
+    )
+    .bind(glossary_config.use_glossary)
+    .bind(glossary_config.glossary_mode.as_str())
+    .bind(if glossary_config.glossary_mode == GlossaryMode::Auto {
+        None
+    } else {
+        glossary_config.glossary_id.as_deref()
+    })
+    .bind(glossary_snapshot_json)
+    .bind(config_snapshot)
+    .bind(progress_detail_json)
+    .bind(&now)
+    .bind(&input.task_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    let local = metadata_task(&inp_pool, &inp_path).await?;
+    inp_pool.close().await;
+    publish_task_index_snapshot(config_pool, &local).await
 }
 
 pub async fn reset_task_for_retranslation(
@@ -2797,7 +3303,7 @@ async fn refresh_task_stats_internal(
     let stats = aggregate_chunk_stats(inp_pool).await?;
     let metadata = metadata_task(inp_pool, inp_path).await?;
     let status = forced_status.unwrap_or(metadata.status);
-    let now = unix_timestamp();
+    let now = unix_timestamp_millis();
     sqlx::query(
         "UPDATE metadata
          SET status = ?, progress = ?, total_chunks = ?, completed_chunks = ?,
@@ -2863,7 +3369,7 @@ pub(super) async fn commit_prepared_run_state(
     let stats = aggregate_chunk_stats(inp_pool).await?;
     let metadata = metadata_task(inp_pool, inp_path).await?;
     let progress_detail_json = serialize_progress_detail(Some(detail))?;
-    let now = unix_timestamp();
+    let now = unix_timestamp_millis();
     let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query(
         "UPDATE metadata SET
@@ -3363,6 +3869,16 @@ pub(super) async fn task_assistant_prompt(pool: &SqlitePool) -> Result<Option<St
     Ok(prompt)
 }
 
+pub(super) async fn task_assistant_sampling(
+    pool: &SqlitePool,
+) -> Result<(Option<f64>, Option<f64>), String> {
+    let row = sqlx::query("SELECT assistant_temperature, assistant_top_p FROM metadata LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((row.get("assistant_temperature"), row.get("assistant_top_p")))
+}
+
 pub(super) async fn task_glossary_config(pool: &SqlitePool) -> Result<TaskGlossaryConfig, String> {
     let row = sqlx::query("SELECT use_glossary, glossary_mode, glossary_id FROM metadata LIMIT 1")
         .fetch_one(pool)
@@ -3373,6 +3889,246 @@ pub(super) async fn task_glossary_config(pool: &SqlitePool) -> Result<TaskGlossa
         glossary_mode: GlossaryMode::parse(row.get::<String, _>("glossary_mode").as_str())?,
         glossary_id: row.get("glossary_id"),
     })
+}
+
+async fn build_glossary_generation_snapshot(
+    provider_pool: &SqlitePool,
+    generation_config: &super::GlossaryGenerationConfig,
+) -> Result<GlossaryGenerationSnapshot, String> {
+    let provider_id = generation_config.provider_id.trim();
+    if provider_id.is_empty() {
+        return Err(
+            "Glossary provider selection is required for automatic glossary generation".into(),
+        );
+    }
+    let model_id = generation_config.model_id.trim();
+    if model_id.is_empty() {
+        return Err(
+            "Glossary model selection is required for automatic glossary generation".into(),
+        );
+    }
+    let provider = app_db::list_providers(provider_pool, Some(ProviderPurpose::Glossary))
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.id == provider_id)
+        .ok_or_else(|| {
+            "Selected glossary provider does not exist or is not assigned to glossary use"
+                .to_string()
+        })?;
+    if !provider.enabled {
+        return Err("Selected glossary provider is disabled".into());
+    }
+    let model = provider
+        .models
+        .iter()
+        .find(|candidate| candidate.id == model_id)
+        .ok_or_else(|| {
+            "Selected glossary model does not belong to the selected glossary provider".to_string()
+        })?;
+    let assistant_id = generation_config
+        .assistant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let assistant = match assistant_id.as_deref() {
+        Some(id) => {
+            let assistant = app_db::get_assistant(provider_pool, id).await?;
+            if assistant.purpose != ProviderPurpose::Glossary {
+                return Err("Selected glossary assistant is not assigned to glossary use".into());
+            }
+            Some(assistant)
+        }
+        None => None,
+    };
+    let runtime = app_db::runtime_config(provider_pool, provider_id).await?;
+    let options = resolve_model_request_options(
+        &ModelRequestSettings {
+            thinking_effort: generation_config.thinking_effort,
+            use_web_search: generation_config.use_web_search,
+            use_custom_parameters: generation_config.use_custom_parameters,
+        },
+        &runtime,
+        model,
+        assistant
+            .as_ref()
+            .map(|value| value.custom_parameters.clone())
+            .unwrap_or_else(|| json!({})),
+    )?;
+    Ok(GlossaryGenerationSnapshot {
+        version: GLOSSARY_GENERATION_SNAPSHOT_VERSION,
+        provider_id: provider.id.clone(),
+        model_id: model.id.clone(),
+        model_request_name: model.request_name.clone(),
+        assistant_id,
+        assistant_system_prompt: assistant.as_ref().map(|value| value.system_prompt.clone()),
+        assistant_custom_parameters: options.custom_parameters,
+        temperature: assistant
+            .as_ref()
+            .filter(|value| value.temperature_enabled)
+            .map(|value| value.temperature),
+        top_p: assistant
+            .as_ref()
+            .filter(|value| value.top_p_enabled)
+            .map(|value| value.top_p),
+        web_search: options.web_search,
+        thinking: options.thinking,
+    })
+}
+
+async fn snapshot_task_glossary_input(
+    provider_pool: &SqlitePool,
+    input: &CreateTranslationTaskInput,
+) -> Result<(TaskGlossaryConfig, Option<GlossaryGenerationSnapshot>), String> {
+    let glossary_id = input
+        .glossary_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let task_config = TaskGlossaryConfig {
+        use_glossary: input.use_glossary,
+        glossary_mode: input.glossary_mode,
+        glossary_id,
+    };
+    if !task_config.use_glossary {
+        return Ok((task_config, None));
+    }
+    match task_config.glossary_mode {
+        GlossaryMode::Existing => {
+            if task_config.glossary_id.is_none() {
+                return Err(
+                    "Glossary selection is required when using an existing glossary".into(),
+                );
+            }
+            Ok((task_config, None))
+        }
+        GlossaryMode::Auto => Ok((
+            task_config,
+            Some(
+                build_glossary_generation_snapshot(
+                    provider_pool,
+                    &input.glossary_generation_config,
+                )
+                .await?,
+            ),
+        )),
+    }
+}
+
+fn serialize_glossary_generation_snapshot(
+    snapshot: Option<&GlossaryGenerationSnapshot>,
+) -> Result<Option<String>, String> {
+    snapshot
+        .map(|value| serde_json::to_string(value).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn parse_glossary_generation_snapshot_json(
+    value: Option<String>,
+) -> Result<Option<GlossaryGenerationSnapshot>, String> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let snapshot = serde_json::from_str::<GlossaryGenerationSnapshot>(&value)
+        .map_err(|error| format!("Task glossary generation snapshot JSON is invalid: {error}"))?;
+    if snapshot.version != GLOSSARY_GENERATION_SNAPSHOT_VERSION {
+        return Err(format!(
+            "Unsupported task glossary generation snapshot version: {}",
+            snapshot.version
+        ));
+    }
+    if !snapshot.assistant_custom_parameters.is_object() {
+        return Err("Task glossary assistant custom parameters must be a JSON object".into());
+    }
+    Ok(Some(snapshot))
+}
+
+pub(super) async fn task_glossary_generation_snapshot(
+    pool: &SqlitePool,
+) -> Result<Option<GlossaryGenerationSnapshot>, String> {
+    let value =
+        sqlx::query_scalar("SELECT glossary_generation_snapshot_json FROM metadata LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| error.to_string())?
+            .flatten();
+    parse_glossary_generation_snapshot_json(value)
+}
+
+async fn write_task_glossary_generation_snapshot(
+    pool: &SqlitePool,
+    snapshot: &GlossaryGenerationSnapshot,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE metadata SET glossary_generation_snapshot_json = ?, updated_at = ?
+         WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
+    )
+    .bind(serde_json::to_string(snapshot).map_err(|error| error.to_string())?)
+    .bind(unix_timestamp())
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(super) async fn ensure_task_glossary_generation_snapshot(
+    pool: &SqlitePool,
+    provider_pool: &SqlitePool,
+    fallback_config: &TranslationConfigView,
+) -> Result<Option<GlossaryGenerationSnapshot>, String> {
+    let task_config = task_glossary_config(pool).await?;
+    if !task_config.use_glossary || task_config.glossary_mode != GlossaryMode::Auto {
+        return Ok(None);
+    }
+    if let Some(snapshot) = task_glossary_generation_snapshot(pool).await? {
+        return Ok(Some(snapshot));
+    }
+    let snapshot = build_glossary_generation_snapshot(
+        provider_pool,
+        &fallback_config.glossary_generation_config,
+    )
+    .await?;
+    write_task_glossary_generation_snapshot(pool, &snapshot).await?;
+    Ok(Some(snapshot))
+}
+
+fn parse_runtime_action_required_json(
+    value: Option<String>,
+) -> Result<Option<TaskRuntimeActionRequired>, String> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_str::<TaskRuntimeActionRequired>(&value)
+        .map(Some)
+        .map_err(|error| format!("Task runtime action JSON is invalid: {error}"))
+}
+
+pub(super) async fn task_runtime_action_required(
+    pool: &SqlitePool,
+) -> Result<Option<TaskRuntimeActionRequired>, String> {
+    let value = sqlx::query_scalar("SELECT runtime_action_required_json FROM metadata LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .flatten();
+    parse_runtime_action_required_json(value)
+}
+
+pub(super) async fn set_task_runtime_action_required(
+    pool: &SqlitePool,
+    action: &TaskRuntimeActionRequired,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE metadata SET runtime_action_required_json = ?, updated_at = ?
+         WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
+    )
+    .bind(serde_json::to_string(action).map_err(|error| error.to_string())?)
+    .bind(unix_timestamp())
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub(super) async fn set_task_glossary_id(
@@ -3411,24 +4167,6 @@ pub(super) async fn task_assistant_custom_parameters(pool: &SqlitePool) -> Resul
         }
         _ => Ok(json!({})),
     }
-}
-
-pub(super) async fn task_use_custom_parameters(pool: &SqlitePool) -> Result<bool, String> {
-    let json: Option<String> =
-        sqlx::query_scalar("SELECT config_snapshot_json FROM metadata LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .map_err(|error| error.to_string())?
-            .flatten();
-    let Some(value) = json.filter(|value| !value.trim().is_empty()) else {
-        return Ok(false);
-    };
-    let parsed = serde_json::from_str::<Value>(&value)
-        .map_err(|error| format!("Task config snapshot JSON is invalid: {error}"))?;
-    Ok(parsed
-        .get("useCustomParameters")
-        .and_then(Value::as_bool)
-        .unwrap_or(false))
 }
 
 pub(super) fn config_snapshot_json(
@@ -3703,23 +4441,92 @@ pub(super) async fn set_progress_detail(
          WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
     )
     .bind(progress_detail_json)
-    .bind(unix_timestamp())
+    .bind(unix_timestamp_millis())
     .execute(pool)
     .await
     .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-pub(super) async fn set_progress_detail_and_emit(
+#[derive(Debug, Clone)]
+pub(super) struct GlossaryProgressSnapshot {
+    pub(super) current: u64,
+    pub(super) total: u64,
+    pub(super) state: String,
+    pub(super) label: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GlossaryRetrySnapshot {
+    pub(super) chunk_id: String,
+    pub(super) current: u32,
+    pub(super) max: u32,
+    pub(super) message: String,
+}
+
+pub(super) async fn apply_glossary_report_and_emit(
     app: &AppHandle,
     inp_pool: &SqlitePool,
     config_pool: &SqlitePool,
     inp_path: &Path,
-    detail: &ProgressDetail,
-    forced_status: Option<TranslationTaskStatus>,
+    progress: &GlossaryProgressSnapshot,
+    retry: Option<&GlossaryRetrySnapshot>,
 ) -> Result<TranslationTaskView, String> {
-    set_progress_detail(inp_pool, detail).await?;
-    let task = refresh_task_stats(inp_pool, config_pool, inp_path, forced_status).await?;
+    let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
+    let row = sqlx::query(
+        "SELECT progress_detail_json, total_chunks, completed_chunks,
+                use_glossary, glossary_mode, glossary_id
+         FROM metadata LIMIT 1",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    let glossary_config = TaskGlossaryConfig {
+        use_glossary: row.get::<i64, _>("use_glossary") != 0,
+        glossary_mode: GlossaryMode::parse(row.get::<String, _>("glossary_mode").as_str())?,
+        glossary_id: row.get("glossary_id"),
+    };
+    let total_chunks = row.get::<i64, _>("total_chunks").max(0) as u64;
+    let completed_chunks = row.get::<i64, _>("completed_chunks").max(0) as u64;
+    let mut detail = parse_progress_detail_json(
+        row.try_get::<Option<String>, _>("progress_detail_json")
+            .unwrap_or(None),
+    )?
+    .unwrap_or_else(|| {
+        progress_detail_for_config(total_chunks, completed_chunks, &glossary_config)
+    });
+    detail.glossary = ProgressStep::new(
+        &progress.state,
+        progress.current,
+        progress.total,
+        &progress.label,
+    );
+    let progress_detail_json = serialize_progress_detail(Some(&detail))?;
+    let retry_record = retry.map(|retry| DbActiveRetry {
+        chunk_id: retry.chunk_id.clone(),
+        current: retry.current,
+        max: retry.max,
+        message: retry.message.clone(),
+    });
+    let retry_json = serialize_active_retry(retry_record.as_ref())?;
+    sqlx::query(
+        "UPDATE metadata
+         SET progress_detail_json = ?, active_retry_json = ?, updated_at = ?
+         WHERE task_id = (SELECT task_id FROM metadata LIMIT 1)",
+    )
+    .bind(progress_detail_json)
+    .bind(retry_json)
+    .bind(unix_timestamp_millis())
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let local = metadata_task(inp_pool, inp_path).await?;
+    let task = publish_task_index_snapshot(config_pool, &local).await?;
     let _ = app.emit(
         TRANSLATION_PROGRESS_EVENT,
         TranslationProgressPayload { task: task.clone() },

@@ -261,3 +261,11 @@ pub(super) fn unix_timestamp() -> String {
         .as_secs()
         .to_string()
 }
+
+pub(super) fn unix_timestamp_millis() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}

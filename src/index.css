@@ -82,7 +82,7 @@
   --latency-good: oklch(50.902% 0.11227 161.646);
   --latency-warning: oklch(76.841% 0.15268 80.036);
   --latency-danger: oklch(60.527% 0.1991 27.653);
-  --task-status-warning: oklch(62% 0.14 75);
+  --task-status-warning: oklch(71.616% 0.16128 64.49);
   --task-status-danger: oklch(56% 0.20 27);
   --scrollbar-size: 6px;
   --scrollbar-min-thumb-size: 20px;
@@ -282,52 +282,6 @@ body {
 .app-fade-up-enter {
   animation: app-fade-up-enter var(--app-fade-up-duration, 300ms) var(--app-fade-up-ease, cubic-bezier(0.03, 0.59, 0.19, 1)) both;
   will-change: transform, opacity;
-}
-
-@keyframes task-stats-line-fade {
-  from {
-    opacity: 0;
-  }
-
-  to {
-    opacity: 1;
-  }
-}
-
-@keyframes task-stats-line-float-up {
-  from {
-    opacity: 0;
-    transform: translate3d(0, 15px, 0);
-  }
-
-  to {
-    opacity: 1;
-    transform: translate3d(0, 0, 0);
-  }
-}
-
-@keyframes task-stats-line-float-down {
-  from {
-    opacity: 0;
-    transform: translate3d(0, -15px, 0);
-  }
-
-  to {
-    opacity: 1;
-    transform: translate3d(0, 0, 0);
-  }
-}
-
-.task-stats-line-fade {
-  animation: task-stats-line-fade 200ms cubic-bezier(0.03, 0.59, 0.19, 1) both;
-}
-
-.task-stats-line-float-up {
-  animation-name: task-stats-line-float-up;
-}
-
-.task-stats-line-float-down {
-  animation-name: task-stats-line-float-down;
 }
 
 @media (prefers-reduced-motion: reduce) {

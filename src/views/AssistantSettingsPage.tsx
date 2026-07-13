@@ -531,7 +531,7 @@ export default function AssistantSettingsPage({
         </header>
 
         <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(13.5rem,16.25rem)_minmax(0,1fr)] gap-3 max-[760px]:grid-cols-1">
-          <Card className="min-h-0 min-w-0 gap-0 rounded-[6px] py-0">
+          <Card className="min-h-0 min-w-0 gap-0 rounded-[12px] py-0">
             <div className="border-b p-2">
               <Select
                 value={purpose}
@@ -608,7 +608,7 @@ export default function AssistantSettingsPage({
             </div>
           </Card>
 
-          <Card className="min-h-0 min-w-0 gap-0 rounded-[6px] py-0">
+          <Card className="min-h-0 min-w-0 gap-0 rounded-[12px] py-0">
             {loading ? (
               <AssistantDetailsSkeleton />
             ) : (

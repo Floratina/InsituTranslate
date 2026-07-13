@@ -141,6 +141,8 @@ interface TaskSortState {
   mode: SortMode;
 }
 
+type TaskRefreshMode = "visible" | "silent";
+
 interface TaskInfoState {
   task: TranslationTaskView;
   name: string;
@@ -540,6 +542,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   const [deleteTarget, setDeleteTarget] = useState<TranslationTaskView | null>(null);
   const [clearTargets, setClearTargets] = useState<TranslationTaskView[] | null>(null);
   const [runtimeActionState, setRuntimeActionState] = useState<RuntimeActionDialogState | null>(null);
+  const silentRefreshPromiseRef = useRef<Promise<void> | null>(null);
 
   const filteredTasks = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
@@ -602,26 +605,44 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
     [tasks],
   );
 
-  const refresh = useCallback(async (): Promise<void> => {
-    setLoading(true);
-    if (!isTauriRuntime()) {
-      setTasks([]);
-      setLoading(false);
-      return;
+  const refresh = useCallback((mode: TaskRefreshMode = "visible"): Promise<void> => {
+    if (mode === "silent" && silentRefreshPromiseRef.current) {
+      return silentRefreshPromiseRef.current;
     }
-    try {
-      const refreshed = await listTranslationTasks();
-      setTasks((current) => reconcileTaskList(current, refreshed));
-    } catch (error) {
-      pushToast(getErrorMessage(error), "error");
-    } finally {
-      setLoading(false);
-      setSortLoading(null);
+
+    const request = (async (): Promise<void> => {
+      if (mode === "visible") setLoading(true);
+      if (!isTauriRuntime()) {
+        setTasks([]);
+        if (mode === "visible") setLoading(false);
+        return;
+      }
+      try {
+        const refreshed = await listTranslationTasks();
+        setTasks((current) => reconcileTaskList(current, refreshed));
+      } catch (error) {
+        pushToast(getErrorMessage(error), "error");
+      } finally {
+        if (mode === "visible") {
+          setLoading(false);
+          setSortLoading(null);
+        }
+      }
+    })();
+
+    if (mode === "silent") {
+      silentRefreshPromiseRef.current = request;
+      void request.finally(() => {
+        if (silentRefreshPromiseRef.current === request) {
+          silentRefreshPromiseRef.current = null;
+        }
+      });
     }
+    return request;
   }, [pushToast]);
 
   useEffect(() => {
-    void refresh();
+    void refresh("visible");
   }, [refresh]);
 
   useEffect(() => {
@@ -663,7 +684,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   useEffect(() => {
     if (!isTauriRuntime()) return undefined;
     const syncOnFocus = (): void => {
-      if (document.visibilityState === "visible") void refresh();
+      if (document.visibilityState === "visible") void refresh("silent");
     };
     window.addEventListener("focus", syncOnFocus);
     document.addEventListener("visibilitychange", syncOnFocus);
@@ -927,7 +948,13 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
           <Badge variant="secondary" className="ml-1 rounded-[6px]">
             {tasks.length} 个
           </Badge>
-          <Button variant="outline" size="sm" className="ml-auto" onClick={refresh} disabled={loading}>
+          <Button
+            variant="outline"
+            size="sm"
+            className="ml-auto"
+            onClick={() => void refresh("visible")}
+            disabled={loading}
+          >
             <RefreshCw className="size-4" />
             刷新
           </Button>

@@ -176,6 +176,97 @@ function hasValidDraftUrls(draft: ProviderDraft): boolean {
   }
 }
 
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function shouldPreserveLocalTestResult(current: ModelView, refreshed: ModelView): boolean {
+  if (current.testedAt === null) return false;
+  if (refreshed.testedAt === null) return true;
+
+  const currentTestedAt = Number(current.testedAt);
+  const refreshedTestedAt = Number(refreshed.testedAt);
+  if (Number.isFinite(currentTestedAt) && Number.isFinite(refreshedTestedAt)) {
+    return currentTestedAt >= refreshedTestedAt;
+  }
+  return current.testedAt === refreshed.testedAt;
+}
+
+function sameModelView(left: ModelView, right: ModelView): boolean {
+  return left.id === right.id
+    && left.providerId === right.providerId
+    && left.requestName === right.requestName
+    && left.alias === right.alias
+    && left.source === right.source
+    && left.capabilityReasoning === right.capabilityReasoning
+    && sameStringArray(left.supportedThinkingEfforts, right.supportedThinkingEfforts)
+    && left.capabilityWeb === right.capabilityWeb
+    && left.testStatus === right.testStatus
+    && left.latencyMs === right.latencyMs
+    && left.testedAt === right.testedAt
+    && left.testError === right.testError;
+}
+
+function mergeRefreshedModel(current: ModelView, refreshed: ModelView): ModelView {
+  const merged = shouldPreserveLocalTestResult(current, refreshed)
+    ? {
+        ...refreshed,
+        testStatus: current.testStatus,
+        latencyMs: current.latencyMs,
+        testedAt: current.testedAt,
+        testError: current.testError,
+      }
+    : refreshed;
+  return sameModelView(current, merged) ? current : merged;
+}
+
+function reconcileProviderList(
+  current: ProviderView[],
+  refreshed: ProviderView[],
+): ProviderView[] {
+  let changed = current.length !== refreshed.length;
+  const currentById = new Map(current.map((provider) => [provider.id, provider]));
+  const next = refreshed.map((provider, providerIndex) => {
+    if (current[providerIndex]?.id !== provider.id) changed = true;
+    const previous = currentById.get(provider.id);
+    if (!previous) {
+      changed = true;
+      return provider;
+    }
+
+    let modelsChanged = previous.models.length !== provider.models.length;
+    const previousModelsById = new Map(previous.models.map((model) => [model.id, model]));
+    const models = provider.models.map((model, modelIndex) => {
+      if (previous.models[modelIndex]?.id !== model.id) modelsChanged = true;
+      const previousModel = previousModelsById.get(model.id);
+      if (!previousModel) {
+        modelsChanged = true;
+        return model;
+      }
+      const mergedModel = mergeRefreshedModel(previousModel, model);
+      if (mergedModel !== previousModel) modelsChanged = true;
+      return mergedModel;
+    });
+    const mergedProvider = modelsChanged ? { ...provider, models } : { ...provider, models: previous.models };
+    const providerUnchanged = previous.name === mergedProvider.name
+      && previous.protocol === mergedProvider.protocol
+      && previous.baseUrl === mergedProvider.baseUrl
+      && previous.useRawBaseUrl === mergedProvider.useRawBaseUrl
+      && JSON.stringify(previous.config) === JSON.stringify(mergedProvider.config)
+      && previous.avatar === mergedProvider.avatar
+      && previous.isBuiltin === mergedProvider.isBuiltin
+      && previous.enabled === mergedProvider.enabled
+      && previous.credentialMask === mergedProvider.credentialMask
+      && sameStringArray(previous.customHeaderKeys, mergedProvider.customHeaderKeys)
+      && previous.purpose === mergedProvider.purpose
+      && previous.models === mergedProvider.models;
+    if (providerUnchanged) return previous;
+    changed = true;
+    return mergedProvider;
+  });
+  return changed ? next : current;
+}
+
 function CapabilityBadge({
   icon,
   label,
@@ -273,7 +364,7 @@ function ProviderSettingsPage() {
   const cachedSelectedProviderId =
     appSessionCache.providerSelectedIds.get("translation") ?? "";
   const [purpose, setPurpose] = useState<ProviderPurpose>("translation");
-  const [providers, setProviders] = useState<ProviderView[]>(cachedProviders ?? []);
+  const [providers, setProviders] = useState<ProviderView[] | null>(cachedProviders ?? null);
   const [selectedProviderId, setSelectedProviderId] = useState<string>(
     cachedProviders?.some((provider) => provider.id === cachedSelectedProviderId)
       ? cachedSelectedProviderId
@@ -317,18 +408,25 @@ function ProviderSettingsPage() {
   const providerDraftBaseline = useRef<string>("");
   const autoSaveTimer = useRef<number | null>(null);
   const providerOrderRef = useRef<string[]>([]);
+  const providerRequestId = useRef(0);
+  const purposeRef = useRef<ProviderPurpose>(purpose);
+  const providersRef = useRef<ProviderView[] | null>(providers);
+  const visibleProviders = providers ?? [];
   const setProvidersAndCache = useCallback(
     (action: ProviderView[] | ((current: ProviderView[]) => ProviderView[])): void => {
-      setProviders((current) => {
-        const next = typeof action === "function" ? action(current) : action;
-        appSessionCache.providers(purpose).set(next);
-        return next;
-      });
+      const resource = appSessionCache.providers(purpose);
+      const source = purposeRef.current === purpose
+        ? (providersRef.current ?? [])
+        : (resource.read() ?? []);
+      const next = typeof action === "function" ? action(source) : action;
+      resource.set(next);
+      if (purposeRef.current !== purpose) return;
+      providersRef.current = next;
+      setProviders(next);
     },
     [purpose],
   );
   const handleProviderUpdated = useCallback((provider: ProviderView): void => {
-    appSessionCache.invalidateProviders();
     void refreshProviders(provider.id, true);
   }, [purpose]);
   const { setEnabledOptimistically, syncProviders } = useProviderEnabledToggle({
@@ -338,8 +436,8 @@ function ProviderSettingsPage() {
   });
 
   const selectedProvider = useMemo(
-    () => providers.find((provider) => provider.id === selectedProviderId) ?? null,
-    [providers, selectedProviderId],
+    () => visibleProviders.find((provider) => provider.id === selectedProviderId) ?? null,
+    [selectedProviderId, visibleProviders],
   );
   const selectedProviderIsMinerU = useMemo(
     () => isMinerUProvider(selectedProvider),
@@ -416,10 +514,24 @@ function ProviderSettingsPage() {
 
   async function refreshProviders(preferredId?: string, force = false): Promise<void> {
     const resource = appSessionCache.providers(purpose);
+    if (purposeRef.current !== purpose) {
+      if (force && isTauriRuntime()) {
+        try {
+          await resource.refresh(() => invoke<ProviderView[]>("list_providers", { purpose }));
+        } catch (cause) {
+          setError(getErrorMessage(cause));
+        }
+      }
+      return;
+    }
+    const requestId = providerRequestId.current + 1;
+    providerRequestId.current = requestId;
     const cached = force ? undefined : resource.read();
     if (cached) {
+      if (providerRequestId.current !== requestId) return;
       providerOrderRef.current = cached.map((provider) => provider.id);
       syncProviders(cached);
+      providersRef.current = cached;
       setProviders(cached);
       setSelectedProviderId((current) => {
         const preferred =
@@ -437,6 +549,7 @@ function ProviderSettingsPage() {
     try {
       if (!isTauriRuntime()) {
         resource.set([]);
+        providersRef.current = [];
         setProviders([]);
         setSelectedProviderId("");
         setError("");
@@ -445,27 +558,47 @@ function ProviderSettingsPage() {
       const result = await (force
         ? resource.refresh(() => invoke<ProviderView[]>("list_providers", { purpose }))
         : resource.loadOnce(() => invoke<ProviderView[]>("list_providers", { purpose })));
-      providerOrderRef.current = result.map((provider) => provider.id);
-      syncProviders(result);
-      setProviders(result);
+      if (providerRequestId.current !== requestId) return;
+      const reconciled = reconcileProviderList(providersRef.current ?? [], result);
+      providersRef.current = reconciled;
+      resource.set(reconciled);
+      setProviders(reconciled);
+      providerOrderRef.current = reconciled.map((provider) => provider.id);
+      syncProviders(reconciled);
       setSelectedProviderId((current) => {
         const preferred =
           preferredId ?? current ?? appSessionCache.providerSelectedIds.get(purpose);
-        return result.some((item) => item.id === preferred)
+        return reconciled.some((item) => item.id === preferred)
           ? preferred
-          : (result[0]?.id ?? "");
+          : (reconciled[0]?.id ?? "");
       });
       setError("");
     } catch (cause) {
-      setError(getErrorMessage(cause));
+      if (providerRequestId.current === requestId) setError(getErrorMessage(cause));
     } finally {
-      setLoading(false);
+      if (providerRequestId.current === requestId) setLoading(false);
     }
   }
 
   async function refreshProvidersAfterMutation(preferredId?: string): Promise<void> {
-    appSessionCache.invalidateProviders();
     await refreshProviders(preferredId, true);
+  }
+
+  function changePurpose(nextPurpose: ProviderPurpose): void {
+    if (nextPurpose === purpose) return;
+    providerRequestId.current += 1;
+    const cached = appSessionCache.providers(nextPurpose).read();
+    const cachedSelectedId = appSessionCache.providerSelectedIds.get(nextPurpose) ?? "";
+    purposeRef.current = nextPurpose;
+    setPurpose(nextPurpose);
+    providersRef.current = cached ?? null;
+    setProviders(cached ?? null);
+    setSelectedProviderId(
+      cached?.some((provider) => provider.id === cachedSelectedId)
+        ? cachedSelectedId
+        : (cached?.[0]?.id ?? ""),
+    );
+    setLoading(cached === undefined);
   }
 
   function flash(message: string): void {
@@ -840,7 +973,26 @@ function ProviderSettingsPage() {
         "test_model_connectivity",
         { modelId: model.id },
       );
-      await refreshProvidersAfterMutation(selectedProvider.id);
+      setProvidersAndCache((items) =>
+        items.map((provider) =>
+          provider.id === selectedProvider.id
+            ? {
+                ...provider,
+                models: provider.models.map((item) =>
+                  item.id === model.id
+                    ? {
+                        ...item,
+                        testStatus: result.success ? "success" : "failed",
+                        latencyMs: result.latencyMs,
+                        testedAt: result.testedAt,
+                        testError: result.error,
+                      }
+                    : item,
+                ),
+              }
+            : provider,
+        ),
+      );
       flash(
         result.success
           ? `连接正常，${result.latencyMs}ms`
@@ -873,7 +1025,7 @@ function ProviderSettingsPage() {
             <div className="border-b p-2">
               <Select
                 value={purpose}
-                onValueChange={(value) => setPurpose(value as ProviderPurpose)}
+                onValueChange={(value) => changePurpose(value as ProviderPurpose)}
               >
                 <SelectTrigger className="bg-card">
                   <SelectValue />
@@ -890,28 +1042,24 @@ function ProviderSettingsPage() {
                 </SelectContent>
               </Select>
               <div className="mt-2 text-xs text-muted-foreground">
-                共 {providers.length} 个提供商
+                共 {visibleProviders.length} 个提供商
               </div>
             </div>
             <ScrollArea className="min-h-0 flex-1">
               <Reorder.Group
                 axis="y"
-                values={providers.map((provider) => provider.id)}
+                values={visibleProviders.map((provider) => provider.id)}
                 onReorder={reorderProviders}
                 className="grid gap-1 p-2"
               >
-                {loading ? (
+                {providers === null && loading ? (
                   <ProviderListSkeleton />
-                ) : loading ? (
-                  <div className="p-3 text-center text-xs text-muted-foreground">
-                    正在读取配置…
-                  </div>
-                ) : providers.length === 0 ? (
+                ) : visibleProviders.length === 0 ? (
                   <div className="rounded-[6px] border border-dashed p-3 text-center text-xs text-muted-foreground">
                     当前用途还没有提供商
                   </div>
                 ) : (
-                  providers.map((provider) => (
+                  visibleProviders.map((provider) => (
                     <ProviderListItem
                       key={provider.id}
                       provider={provider}
@@ -938,7 +1086,7 @@ function ProviderSettingsPage() {
           </Card>
 
           <Card className="min-h-0 gap-0 rounded-[12px] py-0">
-            {loading ? (
+            {providers === null && loading ? (
               <ProviderDetailsSkeleton />
             ) : (
               <ProviderDetailsPanel

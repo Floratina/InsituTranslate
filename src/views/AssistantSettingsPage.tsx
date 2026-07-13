@@ -135,7 +135,9 @@ export default function AssistantSettingsPage({
   const cachedSelectedAssistantId =
     appSessionCache.assistantSelectedIds.get("translation") ?? "";
   const [purpose, setPurpose] = useState<ProviderPurpose>("translation");
-  const [assistants, setAssistants] = useState<AssistantView[]>(cachedAssistants ?? []);
+  const [assistants, setAssistants] = useState<AssistantView[] | null>(
+    cachedAssistants ?? null,
+  );
   const [selectedAssistantId, setSelectedAssistantId] = useState(
     cachedAssistants?.some((assistant) => assistant.id === cachedSelectedAssistantId)
       ? cachedSelectedAssistantId
@@ -157,12 +159,18 @@ export default function AssistantSettingsPage({
   const autoSaveTimerRef = useRef<number | null>(null);
   const conflictWarningTimerRef = useRef<number | null>(null);
   const customParametersConflictRef = useRef(false);
+  const assistantRequestIdRef = useRef(0);
+  const purposeRef = useRef<ProviderPurpose>(purpose);
+  const visibleAssistants = assistants ?? [];
   const { pushToast } = useToast();
   const setAssistantsAndCache = useCallback(
     (action: AssistantView[] | ((current: AssistantView[]) => AssistantView[])): void => {
       setAssistants((current) => {
-        const next = typeof action === "function" ? action(current) : action;
-        appSessionCache.assistants(purpose).set(next);
+        const resource = appSessionCache.assistants(purpose);
+        const source = purposeRef.current === purpose ? (current ?? []) : (resource.read() ?? []);
+        const next = typeof action === "function" ? action(source) : action;
+        resource.set(next);
+        if (purposeRef.current !== purpose) return current;
         return next;
       });
     },
@@ -170,8 +178,8 @@ export default function AssistantSettingsPage({
   );
 
   const selectedAssistant = useMemo(
-    () => assistants.find((assistant) => assistant.id === selectedAssistantId) ?? null,
-    [assistants, selectedAssistantId],
+    () => visibleAssistants.find((assistant) => assistant.id === selectedAssistantId) ?? null,
+    [selectedAssistantId, visibleAssistants],
   );
   const promptDirty = promptDraft !== promptBaselineRef.current;
   const customParametersDirty =
@@ -223,7 +231,7 @@ export default function AssistantSettingsPage({
       customParametersConflictRef.current = false;
       return;
     }
-    const assistant = assistants.find((item) => item.id === selectedAssistantId);
+    const assistant = visibleAssistants.find((item) => item.id === selectedAssistantId);
     if (!assistant) return;
     const nextSettings = settingsFromAssistant(assistant);
     const nextCustomParameters = formattedCustomParameters(assistant);
@@ -310,8 +318,21 @@ export default function AssistantSettingsPage({
 
   async function refreshAssistants(preferredId?: string, force = false): Promise<void> {
     const resource = appSessionCache.assistants(purpose);
+    if (purposeRef.current !== purpose) {
+      if (force && isTauriRuntime()) {
+        try {
+          await resource.refresh(() => invoke<AssistantView[]>("list_assistants", { purpose }));
+        } catch (cause) {
+          showError(getErrorMessage(cause));
+        }
+      }
+      return;
+    }
+    const requestId = assistantRequestIdRef.current + 1;
+    assistantRequestIdRef.current = requestId;
     const cached = force ? undefined : resource.read();
     if (cached) {
+      if (assistantRequestIdRef.current !== requestId) return;
       assistantOrderRef.current = cached.map((assistant) => assistant.id);
       setAssistants(cached);
       setSelectedAssistantId((current) => {
@@ -336,6 +357,7 @@ export default function AssistantSettingsPage({
       const result = await (force
         ? resource.refresh(() => invoke<AssistantView[]>("list_assistants", { purpose }))
         : resource.loadOnce(() => invoke<AssistantView[]>("list_assistants", { purpose })));
+      if (assistantRequestIdRef.current !== requestId) return;
       assistantOrderRef.current = result.map((assistant) => assistant.id);
       setAssistants(result);
       setSelectedAssistantId((current) => {
@@ -346,10 +368,26 @@ export default function AssistantSettingsPage({
           : (result[0]?.id ?? "");
       });
     } catch (cause) {
-      showError(getErrorMessage(cause));
+      if (assistantRequestIdRef.current === requestId) showError(getErrorMessage(cause));
     } finally {
-      setLoading(false);
+      if (assistantRequestIdRef.current === requestId) setLoading(false);
     }
+  }
+
+  function changePurpose(nextPurpose: ProviderPurpose): void {
+    if (nextPurpose === purpose) return;
+    assistantRequestIdRef.current += 1;
+    const cached = appSessionCache.assistants(nextPurpose).read();
+    const cachedSelectedId = appSessionCache.assistantSelectedIds.get(nextPurpose) ?? "";
+    purposeRef.current = nextPurpose;
+    setPurpose(nextPurpose);
+    setAssistants(cached ?? null);
+    setSelectedAssistantId(
+      cached?.some((assistant) => assistant.id === cachedSelectedId)
+        ? cachedSelectedId
+        : (cached?.[0]?.id ?? ""),
+    );
+    setLoading(cached === undefined);
   }
 
   async function saveSettings(draft: AssistantSettingsDraft): Promise<boolean> {
@@ -536,7 +574,7 @@ export default function AssistantSettingsPage({
               <Select
                 value={purpose}
                 onValueChange={(value) =>
-                  requestTransition(() => setPurpose(value as ProviderPurpose))
+                  requestTransition(() => changePurpose(value as ProviderPurpose))
                 }
               >
                 <SelectTrigger className="bg-card">
@@ -557,28 +595,24 @@ export default function AssistantSettingsPage({
                 </SelectContent>
               </Select>
               <div className="mt-2 text-xs text-muted-foreground">
-                共 {assistants.length} 个助手
+                共 {visibleAssistants.length} 个助手
               </div>
             </div>
             <ScrollArea className="min-h-0 flex-1">
               <Reorder.Group
                 axis="y"
-                values={assistants.map((assistant) => assistant.id)}
+                values={visibleAssistants.map((assistant) => assistant.id)}
                 onReorder={reorderAssistants}
                 className="grid gap-1 p-2"
               >
-                {loading ? (
+                {assistants === null && loading ? (
                   <AssistantListSkeleton />
-                ) : loading ? (
-                  <div className="p-3 text-center text-xs text-muted-foreground">
-                    正在读取助手配置...
-                  </div>
-                ) : assistants.length === 0 ? (
+                ) : visibleAssistants.length === 0 ? (
                   <div className="rounded-[6px] border border-dashed p-3 text-center text-xs text-muted-foreground">
                     当前用途还没有助手
                   </div>
                 ) : (
-                  assistants.map((assistant) => (
+                  visibleAssistants.map((assistant) => (
                     <AssistantListItem
                       key={assistant.id}
                       assistant={assistant}
@@ -609,7 +643,7 @@ export default function AssistantSettingsPage({
           </Card>
 
           <Card className="min-h-0 min-w-0 gap-0 rounded-[12px] py-0">
-            {loading ? (
+            {assistants === null && loading ? (
               <AssistantDetailsSkeleton />
             ) : (
               <AssistantDetailsPanel

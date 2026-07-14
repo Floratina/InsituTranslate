@@ -78,6 +78,7 @@ export interface TranslationConfigView {
   chunkTokenLimit: number;
   maxConcurrency: number;
   maxRetries: number;
+  maxFailurePercentage: number;
   rateLimitStrategy: RateLimitStrategy;
   maxRequestsPerMinute: number;
   maxTokensPerMinute: number;
@@ -117,6 +118,7 @@ export interface GlossaryGenerationConfig {
   thinkingEffort: ThinkingEffort;
   useWebSearch: boolean;
   useCustomParameters: boolean;
+  maxFailurePercentage: number;
 }
 export type ConfidenceMode = "off" | "confidence-index";
 export type PdfParsingMode = "local-first" | "mineru-first" | "local-only" | "mineru-only";

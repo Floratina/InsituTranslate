@@ -30,9 +30,9 @@ use super::context::{
 use super::request_options::{resolve_model_request_options, ModelRequestSettings};
 use super::types::{
     ChunkOutcome, ChunkRecord, GlossaryGenerationSnapshot, ProgressDetail, ProgressStep,
-    TaskGlossaryConfig, TaskRuntimeActionRequired, TranslationTaskCreationProgressPayload,
-    TranslationTaskCreationStage, TranslationTaskCreationStatus,
-    GLOSSARY_GENERATION_SNAPSHOT_VERSION,
+    TaskFailureThresholdSnapshot, TaskGlossaryConfig, TaskRuntimeActionRequired,
+    TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
+    TranslationTaskCreationStatus, GLOSSARY_GENERATION_SNAPSHOT_VERSION,
 };
 use super::{
     ContextHandlingMode, CreateTranslationTaskInput, ExportTranslationTaskInput, GlossaryMode,
@@ -328,8 +328,16 @@ async fn backfill_translation_config_json(pool: &SqlitePool) -> Result<(), Strin
         .map_err(|error| error.to_string())?;
     let config_json: String = row.get("config_json");
     if !config_json.trim().is_empty() {
-        serde_json::from_str::<TranslationConfigView>(&config_json)
+        let config = serde_json::from_str::<TranslationConfigView>(&config_json)
             .map_err(|error| format!("Stored translation config JSON is invalid: {error}"))?;
+        let serialized = serde_json::to_string(&config).map_err(|error| error.to_string())?;
+        if serialized != config_json {
+            sqlx::query("UPDATE translation_config SET config_json = ? WHERE id = 1")
+                .bind(serialized)
+                .execute(pool)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         return Ok(());
     }
     let config = legacy_translation_config(&row)?;
@@ -626,6 +634,9 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
         parse_runtime_action_required_json(action_json)
             .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     }
+    task_failure_thresholds(pool)
+        .await
+        .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     TranslationTaskStatus::parse(row.get::<String, _>("status").as_str())
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     parse_tags_json(row.get("tags_json")).map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -1216,6 +1227,8 @@ fn validate_translation_config(config: &TranslationConfigView) -> Result<(), Str
     if !(0..=10).contains(&config.max_retries) {
         return Err("Maximum retries must be between 0 and 10".into());
     }
+    validate_failure_percentage(config.max_failure_percentage)?;
+    validate_failure_percentage(config.glossary_generation_config.max_failure_percentage)?;
     if !(1..=1_000_000).contains(&config.max_requests_per_minute) {
         return Err("Maximum requests per minute must be between 1 and 1000000".into());
     }
@@ -1385,6 +1398,7 @@ fn translation_config_from_update_input(
         chunk_token_limit: input.chunk_token_limit,
         max_concurrency: input.max_concurrency,
         max_retries: input.max_retries,
+        max_failure_percentage: input.max_failure_percentage,
         rate_limit_strategy: input.rate_limit_strategy,
         max_requests_per_minute: input.max_requests_per_minute,
         max_tokens_per_minute: input.max_tokens_per_minute,
@@ -1411,6 +1425,13 @@ fn translation_config_from_update_input(
     };
     validate_translation_config(&config)?;
     Ok(config)
+}
+
+pub(super) fn validate_failure_percentage(value: i64) -> Result<(), String> {
+    if !(0..=100).contains(&value) {
+        return Err("Maximum failure percentage must be between 0 and 100".into());
+    }
+    Ok(())
 }
 
 async fn persist_translation_config(
@@ -1447,7 +1468,7 @@ pub(super) async fn parse_source_file_for_task(
     token_limit: i64,
     pdf_parsing_mode: PdfParsingMode,
 ) -> Result<ParsedTaskSource, String> {
-    if source_path
+    let parsed = if source_path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.eq_ignore_ascii_case("pdf"))
@@ -1462,16 +1483,17 @@ pub(super) async fn parse_source_file_for_task(
         )
         .await?;
         let chunks = document_parsing::parse_pdf_markdown_text(&parsed_pdf.markdown, token_limit)?;
-        return Ok(ParsedTaskSource {
+        ParsedTaskSource {
             chunks,
             assets: parsed_pdf.assets,
-        });
-    }
-
-    Ok(ParsedTaskSource {
-        chunks: document_parsing::parse_source_file(task_id, source_path, token_limit)?,
-        assets: Vec::new(),
-    })
+        }
+    } else {
+        ParsedTaskSource {
+            chunks: document_parsing::parse_source_file(task_id, source_path, token_limit)?,
+            assets: Vec::new(),
+        }
+    };
+    validate_parsed_task_source(parsed)
 }
 
 pub(super) async fn parse_source_file_for_task_with_progress<'progress>(
@@ -1483,7 +1505,7 @@ pub(super) async fn parse_source_file_for_task_with_progress<'progress>(
     pdf_parsing_mode: PdfParsingMode,
     progress: Option<&'progress mut (dyn FnMut(ParserProgress) + Send + 'progress)>,
 ) -> Result<ParsedTaskSource, String> {
-    if source_path
+    let parsed = if source_path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.eq_ignore_ascii_case("pdf"))
@@ -1502,21 +1524,36 @@ pub(super) async fn parse_source_file_for_task_with_progress<'progress>(
             token_limit,
             progress,
         )?;
-        return Ok(ParsedTaskSource {
+        ParsedTaskSource {
             chunks,
             assets: parsed_pdf.assets,
-        });
-    }
+        }
+    } else {
+        ParsedTaskSource {
+            chunks: document_parsing::parse_source_file_with_progress(
+                task_id,
+                source_path,
+                token_limit,
+                progress,
+            )?,
+            assets: Vec::new(),
+        }
+    };
+    validate_parsed_task_source(parsed)
+}
 
-    Ok(ParsedTaskSource {
-        chunks: document_parsing::parse_source_file_with_progress(
-            task_id,
-            source_path,
-            token_limit,
-            progress,
-        )?,
-        assets: Vec::new(),
-    })
+pub(super) fn validate_parsed_task_source(
+    parsed: ParsedTaskSource,
+) -> Result<ParsedTaskSource, String> {
+    if parsed.chunks.is_empty()
+        || parsed
+            .chunks
+            .iter()
+            .all(|chunk| chunk.source_text.trim().is_empty())
+    {
+        return Err("Source document contains no translatable content".into());
+    }
+    Ok(parsed)
 }
 
 pub(super) async fn insert_assets(
@@ -1618,7 +1655,15 @@ pub async fn create_translation_task(
     };
     let created_at = unix_timestamp();
     let inp_pool = connect_inp(&inp_path).await?;
-    let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
+    let config_snapshot = config_snapshot_json(
+        &config,
+        &input.provider_id,
+        &model.id,
+        task_failure_thresholds_from_config(
+            &config,
+            input.glossary_generation_config.max_failure_percentage,
+        ),
+    );
     let progress_detail =
         progress_detail_for_config(parsed_source.chunks.len() as u64, 0, &task_glossary_config);
     let progress_detail_json = serialize_progress_detail(Some(&progress_detail))?;
@@ -1994,7 +2039,15 @@ pub async fn create_translation_task_with_progress(
 
     let created_at = unix_timestamp();
     let inp_pool = try_creation!(connect_inp(&inp_path).await);
-    let config_snapshot = config_snapshot_json(&config, &input.provider_id, &model.id);
+    let config_snapshot = config_snapshot_json(
+        &config,
+        &input.provider_id,
+        &model.id,
+        task_failure_thresholds_from_config(
+            &config,
+            input.glossary_generation_config.max_failure_percentage,
+        ),
+    );
     let progress_detail = progress_detail_for_config(total_chunks, 0, &task_glossary_config);
     let progress_detail_json = try_creation!(serialize_progress_detail(Some(&progress_detail)));
     let mut transaction = try_creation!(inp_pool.begin().await.map_err(|error| error.to_string()));
@@ -2701,7 +2754,15 @@ pub async fn replace_task_runtime_snapshot(
     };
     let glossary_snapshot_json =
         serialize_glossary_generation_snapshot(glossary_snapshot.as_ref())?;
-    let config_snapshot = config_snapshot_json(&config, &provider.id, &model.id);
+    let config_snapshot = config_snapshot_json(
+        &config,
+        &provider.id,
+        &model.id,
+        task_failure_thresholds_from_config(
+            &config,
+            config.glossary_generation_config.max_failure_percentage,
+        ),
+    );
     let inp_pool = connect_inp(&inp_path).await?;
     let total_chunks = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chunks")
         .fetch_one(&inp_pool)
@@ -3842,6 +3903,17 @@ pub(super) async fn pending_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>
         .collect())
 }
 
+pub(super) async fn ensure_task_has_translatable_chunks(pool: &SqlitePool) -> Result<(), String> {
+    let source_texts = sqlx::query_scalar::<_, String>("SELECT source_text FROM chunks")
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    if source_texts.is_empty() || source_texts.iter().all(|text| text.trim().is_empty()) {
+        return Err("Task contains no translatable chunks".into());
+    }
+    Ok(())
+}
+
 pub(super) async fn glossary_source_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>, String> {
     let rows =
         sqlx::query("SELECT id, sequence, source_text, map_json FROM chunks ORDER BY sequence")
@@ -3895,6 +3967,7 @@ async fn build_glossary_generation_snapshot(
     provider_pool: &SqlitePool,
     generation_config: &super::GlossaryGenerationConfig,
 ) -> Result<GlossaryGenerationSnapshot, String> {
+    validate_failure_percentage(generation_config.max_failure_percentage)?;
     let provider_id = generation_config.provider_id.trim();
     if provider_id.is_empty() {
         return Err(
@@ -3980,6 +4053,7 @@ async fn snapshot_task_glossary_input(
     provider_pool: &SqlitePool,
     input: &CreateTranslationTaskInput,
 ) -> Result<(TaskGlossaryConfig, Option<GlossaryGenerationSnapshot>), String> {
+    validate_failure_percentage(input.glossary_generation_config.max_failure_percentage)?;
     let glossary_id = input
         .glossary_id
         .as_deref()
@@ -4169,15 +4243,43 @@ pub(super) async fn task_assistant_custom_parameters(pool: &SqlitePool) -> Resul
     }
 }
 
+fn task_failure_thresholds_from_config(
+    config: &TranslationConfigView,
+    glossary_max_failure_percentage: i64,
+) -> TaskFailureThresholdSnapshot {
+    TaskFailureThresholdSnapshot {
+        max_failure_percentage: config.max_failure_percentage,
+        glossary_max_failure_percentage,
+    }
+}
+
+pub(super) async fn task_failure_thresholds(
+    pool: &SqlitePool,
+) -> Result<TaskFailureThresholdSnapshot, String> {
+    let config_snapshot_json: String =
+        sqlx::query_scalar("SELECT config_snapshot_json FROM metadata LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    let thresholds = serde_json::from_str::<TaskFailureThresholdSnapshot>(&config_snapshot_json)
+        .map_err(|error| format!("Stored task config snapshot is invalid: {error}"))?;
+    validate_failure_percentage(thresholds.max_failure_percentage)?;
+    validate_failure_percentage(thresholds.glossary_max_failure_percentage)?;
+    Ok(thresholds)
+}
+
 pub(super) fn config_snapshot_json(
     config: &TranslationConfigView,
     provider_id: &str,
     model_id: &str,
+    failure_thresholds: TaskFailureThresholdSnapshot,
 ) -> String {
     json!({
         "chunkTokenLimit": config.chunk_token_limit,
         "maxConcurrency": config.max_concurrency,
         "maxRetries": config.max_retries,
+        "maxFailurePercentage": failure_thresholds.max_failure_percentage,
+        "glossaryMaxFailurePercentage": failure_thresholds.glossary_max_failure_percentage,
         "rateLimitStrategy": config.rate_limit_strategy,
         "maxRequestsPerMinute": config.max_requests_per_minute,
         "maxTokensPerMinute": config.max_tokens_per_minute,

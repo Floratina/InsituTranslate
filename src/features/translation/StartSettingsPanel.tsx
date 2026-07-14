@@ -14,6 +14,7 @@ import {
 } from "react";
 
 import { Input } from "@/components/ui/input";
+import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SelectableOptionButton } from "@/components/ui/selectable-option-button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -40,6 +41,7 @@ export type StartSettingsNumberKey =
   | "chunkTokenLimit"
   | "maxConcurrency"
   | "maxRetries"
+  | "maxFailurePercentage"
   | "maxRequestsPerMinute"
   | "maxTokensPerMinute";
 
@@ -67,6 +69,7 @@ interface FieldBlockProps {
   label: string;
   children: ReactNode;
   className?: string;
+  help?: ReactNode;
 }
 
 interface NavItem {
@@ -179,6 +182,7 @@ const PROOFREADING_OPTIONS: ProofreadingOption[] = [
 
 const TWO_COLUMN_GRID_CLASS = "grid grid-cols-1 gap-3 min-[920px]:grid-cols-2";
 const THREE_COLUMN_GRID_CLASS = "grid grid-cols-1 gap-3 min-[1120px]:grid-cols-3";
+const FAILURE_THRESHOLD_HELP = "失败分块的比例高于此阈值时，则任务失败。设为 0% 表示超出最大重试次数后出错即失败。";
 
 function autoLabel(detectedSourceLanguage: string | null): string {
   return detectedSourceLanguage
@@ -186,10 +190,13 @@ function autoLabel(detectedSourceLanguage: string | null): string {
     : "自动检测";
 }
 
-function FieldBlock({ label, children, className }: FieldBlockProps) {
+function FieldBlock({ label, children, className, help }: FieldBlockProps) {
   return (
     <div className={cn("grid min-w-0 content-start gap-1.5", className)}>
-      <div className="text-sm font-medium text-foreground">{label}</div>
+      <div className="flex items-center gap-1 text-sm font-medium text-foreground">
+        <span>{label}</span>
+        {help && <HelpTooltip>{help}</HelpTooltip>}
+      </div>
       {children}
     </div>
   );
@@ -247,9 +254,15 @@ function NumberControl({
       type="number"
       min={min}
       max={max}
+      step={1}
       value={value}
       disabled={disabled}
-      onChange={(event) => onChange(event.target.value)}
+      onChange={(event) => {
+        const parsed = Number(event.target.value);
+        if (Number.isInteger(parsed) && parsed >= min && parsed <= max) {
+          onChange(event.target.value);
+        }
+      }}
     />
   );
 }
@@ -363,7 +376,21 @@ export function StartSettingsPanel({
   function updateGlossaryRuntime(value: ModelRuntimeSettingsValue): void {
     onConfigChange((current) => ({
       ...current,
-      glossaryGenerationConfig: value,
+      glossaryGenerationConfig: {
+        ...current.glossaryGenerationConfig,
+        ...value,
+      },
+    }));
+  }
+
+  function updateGlossaryFailurePercentage(value: string): void {
+    const maxFailurePercentage = Number(value);
+    onConfigChange((current) => ({
+      ...current,
+      glossaryGenerationConfig: {
+        ...current.glossaryGenerationConfig,
+        maxFailurePercentage,
+      },
     }));
   }
 
@@ -423,23 +450,36 @@ export function StartSettingsPanel({
 
         <div className="min-w-0">
           {activeTab === "translation" && (
-            <ModelRuntimeSettings
-              value={{
-                providerId: config.providerId,
-                modelId: config.modelId,
-                assistantId: config.assistantId === "__none__" ? null : config.assistantId,
-                thinkingEffort: config.thinkingEffort,
-                useWebSearch: config.useWebSearch,
-                useCustomParameters: config.useCustomParameters,
-              }}
-              providers={translationProviders}
-              assistants={translationAssistants}
-              providerLabel="模型提供商"
-              modelLabel="翻译模型"
-              assistantLabel="助手配置"
-              disabled={loading}
-              onChange={updateTranslationRuntime}
-            />
+            <div className="grid gap-3">
+              <ModelRuntimeSettings
+                value={{
+                  providerId: config.providerId,
+                  modelId: config.modelId,
+                  assistantId: config.assistantId === "__none__" ? null : config.assistantId,
+                  thinkingEffort: config.thinkingEffort,
+                  useWebSearch: config.useWebSearch,
+                  useCustomParameters: config.useCustomParameters,
+                }}
+                providers={translationProviders}
+                assistants={translationAssistants}
+                providerLabel="模型提供商"
+                modelLabel="翻译模型"
+                assistantLabel="助手配置"
+                disabled={loading}
+                onChange={updateTranslationRuntime}
+              />
+              <div className={TWO_COLUMN_GRID_CLASS}>
+                <FieldBlock label="最大允许失败率" help={FAILURE_THRESHOLD_HELP}>
+                  <NumberControl
+                    value={config.maxFailurePercentage}
+                    min={0}
+                    max={100}
+                    disabled={loading}
+                    onChange={(value) => onNumberChange("maxFailurePercentage", value)}
+                  />
+                </FieldBlock>
+              </div>
+            </div>
           )}
 
           {activeTab === "glossary" && (
@@ -504,6 +544,17 @@ export function StartSettingsPanel({
                 disabled={loading || !config.useGlossary || config.glossaryMode !== "auto"}
                 onChange={updateGlossaryRuntime}
               />
+              <div className={TWO_COLUMN_GRID_CLASS}>
+                <FieldBlock label="最大允许失败率" help={FAILURE_THRESHOLD_HELP}>
+                  <NumberControl
+                    value={config.glossaryGenerationConfig.maxFailurePercentage}
+                    min={0}
+                    max={100}
+                    disabled={loading || config.glossaryMode !== "auto"}
+                    onChange={updateGlossaryFailurePercentage}
+                  />
+                </FieldBlock>
+              </div>
             </div>
           )}
 

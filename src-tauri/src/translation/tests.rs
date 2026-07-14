@@ -22,8 +22,10 @@ use super::db::{
     apply_chunk_outcome, connect_inp, connect_sqlite, effective_translation_concurrency,
     export_file_name, get_task_from_index, normalize_tags, normalize_task_filters,
     release_assets_for_export, rendered_task_document, serialize_tags, source_extension,
-    task_glossary_config, translated_source_text, validate_inp_file,
+    task_failure_thresholds, task_glossary_config, translated_source_text,
+    validate_failure_percentage, validate_inp_file, validate_parsed_task_source, ParsedTaskSource,
 };
+use super::failure_threshold_exceeded;
 use super::glossary::TaskGlossaryMatcher;
 use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy};
 use super::request_options::TranslationRequestOptions;
@@ -31,7 +33,7 @@ use super::scheduler::{
     logprobs_parameter_rejected, retry_base_delay_ms, retry_delay_with_jitter_ms,
     transient_retry_base_delay_ms, translate_chunk,
 };
-use super::types::{ChunkOutcome, ChunkRecord};
+use super::types::{ChunkOutcome, ChunkRecord, TaskFailureThresholdSnapshot};
 
 #[derive(Debug, Clone)]
 #[cfg(test)]
@@ -74,6 +76,83 @@ fn split_text_into_chunks(
         push_raw_chunk(task_id, &mut chunks, current);
     }
     chunks
+}
+
+#[test]
+fn failure_threshold_uses_integer_cross_multiplication() {
+    assert!(!failure_threshold_exceeded(1, 5, 20).expect("equal threshold"));
+    assert!(failure_threshold_exceeded(2, 5, 20).expect("above threshold"));
+    assert!(!failure_threshold_exceeded(0, 5, 0).expect("zero failures"));
+    assert!(failure_threshold_exceeded(1, 5, 0).expect("zero threshold"));
+    assert!(!failure_threshold_exceeded(i64::MAX, i64::MAX, 100).expect("maximum counts"));
+}
+
+#[test]
+fn failure_threshold_rejects_invalid_counts_and_percentage() {
+    assert!(failure_threshold_exceeded(0, 0, 20).is_err());
+    assert!(failure_threshold_exceeded(-1, 5, 20).is_err());
+    assert!(failure_threshold_exceeded(6, 5, 20).is_err());
+    assert!(failure_threshold_exceeded(1, 5, -1).is_err());
+    assert!(failure_threshold_exceeded(1, 5, 101).is_err());
+}
+
+#[test]
+fn legacy_task_snapshot_defaults_preserve_previous_thresholds() {
+    let thresholds =
+        serde_json::from_str::<TaskFailureThresholdSnapshot>("{}").expect("legacy task thresholds");
+    assert_eq!(thresholds.max_failure_percentage, 30);
+    assert_eq!(thresholds.glossary_max_failure_percentage, 40);
+}
+
+#[test]
+fn translation_config_defaults_use_twenty_percent_thresholds() {
+    let config = TranslationConfigView::default();
+    assert_eq!(config.max_failure_percentage, 20);
+    assert_eq!(config.glossary_generation_config.max_failure_percentage, 20);
+    let decoded =
+        serde_json::from_str::<TranslationConfigView>("{}").expect("defaulted translation config");
+    assert_eq!(decoded.max_failure_percentage, 20);
+    assert_eq!(
+        decoded.glossary_generation_config.max_failure_percentage,
+        20
+    );
+    assert!(validate_failure_percentage(0).is_ok());
+    assert!(validate_failure_percentage(100).is_ok());
+    assert!(validate_failure_percentage(-1).is_err());
+    assert!(validate_failure_percentage(101).is_err());
+}
+
+#[test]
+fn empty_and_non_translatable_sources_are_rejected_before_task_creation() {
+    let root = temp_root("empty-source-validation");
+    let empty_txt = root.join("empty.txt");
+    let empty_html = root.join("empty.html");
+    std::fs::write(&empty_txt, "   \n\t").expect("write empty txt");
+    std::fs::write(
+        &empty_html,
+        "<html><body><img src=\"cover.png\"></body></html>",
+    )
+    .expect("write empty html");
+
+    for path in [&empty_txt, &empty_html] {
+        let chunks = crate::document_parsing::parse_source_file("empty-task", path, 800)
+            .expect("parse empty source");
+        assert!(validate_parsed_task_source(ParsedTaskSource {
+            chunks,
+            assets: Vec::new(),
+        })
+        .is_err());
+    }
+
+    let pdf_chunks = crate::document_parsing::parse_pdf_markdown_text("", 800)
+        .expect("parse empty pdf markdown");
+    assert!(validate_parsed_task_source(ParsedTaskSource {
+        chunks: pdf_chunks,
+        assets: Vec::new(),
+    })
+    .is_err());
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -424,6 +503,7 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
             chunk_token_limit: 800,
             max_concurrency: 3,
             max_retries: 2,
+            max_failure_percentage: 20,
             rate_limit_strategy: RateLimitStrategy::Manual,
             max_requests_per_minute: 120,
             max_tokens_per_minute: 60_000,
@@ -457,8 +537,8 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
             source_language: "en".into(),
             target_language: "zh-CN".into(),
             tags: Vec::new(),
-            provider_id: provider.id,
-            model_id: model.id,
+            provider_id: provider.id.clone(),
+            model_id: model.id.clone(),
             assistant_id: None,
             use_glossary: true,
             glossary_mode: GlossaryMode::Existing,
@@ -487,11 +567,58 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
     );
     assert_eq!(snapshot["useGlossary"], true);
     assert_eq!(snapshot["contextHandlingMode"], "off");
+    assert_eq!(snapshot["maxFailurePercentage"], 20);
+    assert_eq!(snapshot["glossaryMaxFailurePercentage"], 20);
+    assert_eq!(
+        task_failure_thresholds(&inp_pool)
+            .await
+            .expect("failure thresholds"),
+        TaskFailureThresholdSnapshot {
+            max_failure_percentage: 20,
+            glossary_max_failure_percentage: 20,
+        }
+    );
     assert!(snapshot.get("useGlobalBackground").is_none());
     assert_eq!(snapshot["glossaryMode"], "existing");
     assert_eq!(snapshot["glossaryId"], "glossary-freeze-id");
 
     inp_pool.close().await;
+
+    replace_task_runtime_snapshot(
+        &provider_pool,
+        &config_pool,
+        &root,
+        ReplaceTaskRuntimeSnapshotInput {
+            task_id: task.id.clone(),
+            config: TranslationConfigView {
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                provider_id: provider.id,
+                model_id: model.id,
+                max_failure_percentage: 55,
+                glossary_generation_config: GlossaryGenerationConfig {
+                    max_failure_percentage: 65,
+                    ..GlossaryGenerationConfig::default()
+                },
+                ..TranslationConfigView::default()
+            },
+        },
+    )
+    .await
+    .expect("replace task runtime snapshot");
+    let replaced_inp = connect_inp(Path::new(&task.inp_path))
+        .await
+        .expect("replaced inp");
+    assert_eq!(
+        task_failure_thresholds(&replaced_inp)
+            .await
+            .expect("replaced failure thresholds"),
+        TaskFailureThresholdSnapshot {
+            max_failure_percentage: 55,
+            glossary_max_failure_percentage: 65,
+        }
+    );
+    replaced_inp.close().await;
     provider_pool.close().await;
     config_pool.close().await;
     let _ = std::fs::remove_dir_all(root);
@@ -656,6 +783,7 @@ async fn auto_glossary_snapshot_is_frozen_and_legacy_backfill_missing_model_requ
                 thinking_effort: ThinkingEffort::None,
                 use_web_search: false,
                 use_custom_parameters: true,
+                max_failure_percentage: 20,
             },
         },
     )
@@ -690,6 +818,7 @@ async fn auto_glossary_snapshot_is_frozen_and_legacy_backfill_missing_model_requ
             thinking_effort: ThinkingEffort::None,
             use_web_search: false,
             use_custom_parameters: true,
+            max_failure_percentage: 20,
         },
         ..TranslationConfigView::default()
     };
@@ -800,6 +929,7 @@ async fn create_task_injects_custom_parameters_only_when_enabled() {
                 chunk_token_limit: 800,
                 max_concurrency: 3,
                 max_retries: 2,
+                max_failure_percentage: 20,
                 rate_limit_strategy: RateLimitStrategy::Dynamic,
                 max_requests_per_minute: 120,
                 max_tokens_per_minute: 60_000,
@@ -2213,6 +2343,11 @@ async fn migrates_legacy_defaults_only_once() {
     assert_eq!(migrated.chunk_token_limit, DEFAULT_CHUNK_TOKEN_LIMIT);
     assert_eq!(migrated.max_concurrency, DEFAULT_MAX_CONCURRENCY);
     assert_eq!(migrated.max_retries, DEFAULT_MAX_RETRIES);
+    assert_eq!(migrated.max_failure_percentage, 20);
+    assert_eq!(
+        migrated.glossary_generation_config.max_failure_percentage,
+        20
+    );
 
     update_translation_config(
         &migrated_pool,
@@ -2227,6 +2362,7 @@ async fn migrates_legacy_defaults_only_once() {
             chunk_token_limit: 1200,
             max_concurrency: 4,
             max_retries: 2,
+            max_failure_percentage: 20,
             rate_limit_strategy: RateLimitStrategy::Manual,
             max_requests_per_minute: 90,
             max_tokens_per_minute: 90_000,
@@ -2260,6 +2396,11 @@ async fn migrates_legacy_defaults_only_once() {
     assert_eq!(persisted.model_id, "model-test");
     assert_eq!(persisted.assistant_id, "assistant-test");
     assert_eq!(persisted.chunk_token_limit, 1200);
+    assert_eq!(persisted.max_failure_percentage, 20);
+    assert_eq!(
+        persisted.glossary_generation_config.max_failure_percentage,
+        20
+    );
     assert_eq!(persisted.rate_limit_strategy, RateLimitStrategy::Manual);
     assert_eq!(
         persisted.context_handling_mode,

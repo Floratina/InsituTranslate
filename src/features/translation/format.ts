@@ -106,6 +106,13 @@ function failedProgressStep(task: TranslationTaskView): ProgressStep | null {
 }
 
 function localizeTaskError(value: string): TaskStatusMessage {
+  const thresholdMatch = /(?:Translation|Glossary) failure threshold exceeded:\s*(\d+)\/(\d+) chunks failed \(maximum (\d+)%\)/i.exec(value);
+  if (thresholdMatch) {
+    return {
+      text: `失败分块 ${thresholdMatch[1]}/${thresholdMatch[2]}，超过最大允许失败率 ${thresholdMatch[3]}%`,
+      severity: "danger",
+    };
+  }
   const httpMessage = httpStatusMessage(value);
   if (httpMessage) return httpMessage;
 

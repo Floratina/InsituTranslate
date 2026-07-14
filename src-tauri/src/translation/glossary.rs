@@ -30,8 +30,8 @@ use super::db::{
     apply_glossary_report_and_emit, connect_inp, content_format_from_source_path,
     document_format_from_source_path, ensure_task_glossary_generation_snapshot, finalize_task,
     get_task_from_index, get_translation_config, glossary_source_chunks, metadata_task,
-    refresh_task_stats, set_task_glossary_id, task_glossary_config, GlossaryProgressSnapshot,
-    GlossaryRetrySnapshot,
+    refresh_task_stats, set_task_glossary_id, task_failure_thresholds, task_glossary_config,
+    GlossaryProgressSnapshot, GlossaryRetrySnapshot,
 };
 use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter};
 use super::scheduler::{
@@ -39,9 +39,9 @@ use super::scheduler::{
 };
 use super::types::ChunkRecord;
 use super::{
-    GlossaryMode, RateLimitStrategy, TranslationConfigView, TranslationInterrupt,
-    TranslationProgressPayload, TranslationTaskStatus, TranslationTaskView,
-    AUTO_GLOSSARY_FAILURE_THRESHOLD, TRANSLATION_PROGRESS_EVENT,
+    failure_threshold_exceeded, GlossaryMode, RateLimitStrategy, TranslationConfigView,
+    TranslationInterrupt, TranslationProgressPayload, TranslationTaskStatus, TranslationTaskView,
+    TRANSLATION_PROGRESS_EVENT,
 };
 
 #[derive(Clone)]
@@ -587,7 +587,13 @@ async fn generate_auto_glossary(
         .filter(|chunk| !chunk.source_text.trim().is_empty())
         .cloned()
         .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        return Err(
+            "Task contains no translatable chunks for automatic glossary generation".into(),
+        );
+    }
     let total_chunks = chunks.len() as u64;
+    let failure_thresholds = task_failure_thresholds(inp_pool).await?;
     let document_format = document_format_from_source_path(&task.source_path)?;
     let content_format = content_format_from_source_path(&task.source_path)?;
     let (request_reporter, reporter_handle) = start_glossary_reporter(
@@ -601,65 +607,6 @@ async fn generate_auto_glossary(
     request_reporter
         .status(format!("术语表建立 (0/{total_chunks})"))
         .await;
-    if chunks.is_empty() {
-        request_reporter.status("正在保存自动术语表...").await;
-        let result = glossaries::create_auto_glossary(
-            glossary_config_pool,
-            glossary_workspace_root,
-            CreateAutoGlossaryInput {
-                name: format!("{} 自动术语表", task.name),
-                source_language: task.source_language.clone(),
-                target_language: task.target_language.clone(),
-                entries: Vec::new(),
-            },
-        )
-        .await;
-        return match result {
-            Ok(view) => {
-                if let Err(error) = set_task_glossary_id(inp_pool, &view.id).await {
-                    finish_glossary_reporter(
-                        request_reporter,
-                        reporter_handle,
-                        GlossaryReport::Status {
-                            current: 0,
-                            total: 0,
-                            state: "failed".into(),
-                            label: "自动术语表绑定失败".into(),
-                        },
-                    )
-                    .await?;
-                    return Err(error);
-                }
-                finish_glossary_reporter(
-                    request_reporter,
-                    reporter_handle,
-                    GlossaryReport::Status {
-                        current: 0,
-                        total: 0,
-                        state: "success".into(),
-                        label: "术语表建立 (0/0)".into(),
-                    },
-                )
-                .await?;
-                Ok(AutoGlossaryGeneration::Created(view))
-            }
-            Err(error) => {
-                finish_glossary_reporter(
-                    request_reporter,
-                    reporter_handle,
-                    GlossaryReport::Status {
-                        current: 0,
-                        total: 0,
-                        state: "failed".into(),
-                        label: "自动术语表保存失败".into(),
-                    },
-                )
-                .await?;
-                Err(error)
-            }
-        };
-    }
-
     let dynamic_rate_limit = config.rate_limit_strategy == RateLimitStrategy::Dynamic;
     let limiter = Arc::new(AdaptiveLimiter::new(
         config.max_concurrency.max(1) as usize,
@@ -747,9 +694,16 @@ async fn generate_auto_glossary(
             }
             AutoGlossaryChunkOutcome::Failed { error, .. } => {
                 failed_chunks += 1;
-                if failed_chunks as f64 / chunks.len() as f64 > AUTO_GLOSSARY_FAILURE_THRESHOLD {
+                if failure_threshold_exceeded(
+                    failed_chunks as i64,
+                    chunks.len() as i64,
+                    failure_thresholds.glossary_max_failure_percentage,
+                )? {
                     let reason = format!(
-                        "Auto glossary generation failed for more than 40% of chunks: {error}"
+                        "Glossary failure threshold exceeded: {}/{} chunks failed (maximum {}%): {error}",
+                        failed_chunks,
+                        chunks.len(),
+                        failure_thresholds.glossary_max_failure_percentage,
                     );
                     finish_glossary_reporter(
                         request_reporter,

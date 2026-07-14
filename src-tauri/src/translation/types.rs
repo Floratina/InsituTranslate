@@ -9,8 +9,9 @@ use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
 use crate::pdf_parsing::PdfParsingMode;
 
 use super::{
-    DEFAULT_CHUNK_TOKEN_LIMIT, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE,
-    DEFAULT_MAX_RETRIES, DEFAULT_MAX_TOKENS_PER_MINUTE,
+    DEFAULT_CHUNK_TOKEN_LIMIT, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_FAILURE_PERCENTAGE,
+    DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_MAX_RETRIES, DEFAULT_MAX_TOKENS_PER_MINUTE,
+    LEGACY_GLOSSARY_FAILURE_PERCENTAGE, LEGACY_TRANSLATION_FAILURE_PERCENTAGE,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -289,7 +290,7 @@ pub struct TextTokenStats {
     pub total_tokens: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GlossaryGenerationConfig {
     pub provider_id: String,
@@ -298,6 +299,21 @@ pub struct GlossaryGenerationConfig {
     pub thinking_effort: ThinkingEffort,
     pub use_web_search: bool,
     pub use_custom_parameters: bool,
+    pub max_failure_percentage: i64,
+}
+
+impl Default for GlossaryGenerationConfig {
+    fn default() -> Self {
+        Self {
+            provider_id: String::new(),
+            model_id: String::new(),
+            assistant_id: None,
+            thinking_effort: ThinkingEffort::None,
+            use_web_search: false,
+            use_custom_parameters: false,
+            max_failure_percentage: DEFAULT_MAX_FAILURE_PERCENTAGE,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +329,7 @@ pub struct TranslationConfigView {
     pub chunk_token_limit: i64,
     pub max_concurrency: i64,
     pub max_retries: i64,
+    pub max_failure_percentage: i64,
     pub rate_limit_strategy: RateLimitStrategy,
     pub max_requests_per_minute: i64,
     pub max_tokens_per_minute: i64,
@@ -343,6 +360,7 @@ impl Default for TranslationConfigView {
             chunk_token_limit: DEFAULT_CHUNK_TOKEN_LIMIT,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             max_retries: DEFAULT_MAX_RETRIES,
+            max_failure_percentage: DEFAULT_MAX_FAILURE_PERCENTAGE,
             rate_limit_strategy: RateLimitStrategy::Dynamic,
             max_requests_per_minute: DEFAULT_MAX_REQUESTS_PER_MINUTE,
             max_tokens_per_minute: DEFAULT_MAX_TOKENS_PER_MINUTE,
@@ -374,6 +392,8 @@ pub struct UpdateTranslationConfigInput {
     pub chunk_token_limit: i64,
     pub max_concurrency: i64,
     pub max_retries: i64,
+    #[serde(default = "default_max_failure_percentage")]
+    pub max_failure_percentage: i64,
     pub rate_limit_strategy: RateLimitStrategy,
     pub max_requests_per_minute: i64,
     pub max_tokens_per_minute: i64,
@@ -629,6 +649,27 @@ pub(super) struct TaskGlossaryConfig {
     pub(super) use_glossary: bool,
     pub(super) glossary_mode: GlossaryMode,
     pub(super) glossary_id: Option<String>,
+}
+
+fn default_max_failure_percentage() -> i64 {
+    DEFAULT_MAX_FAILURE_PERCENTAGE
+}
+
+fn legacy_translation_failure_percentage() -> i64 {
+    LEGACY_TRANSLATION_FAILURE_PERCENTAGE
+}
+
+fn legacy_glossary_failure_percentage() -> i64 {
+    LEGACY_GLOSSARY_FAILURE_PERCENTAGE
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TaskFailureThresholdSnapshot {
+    #[serde(default = "legacy_translation_failure_percentage")]
+    pub(super) max_failure_percentage: i64,
+    #[serde(default = "legacy_glossary_failure_percentage")]
+    pub(super) glossary_max_failure_percentage: i64,
 }
 
 pub(super) const GLOSSARY_GENERATION_SNAPSHOT_VERSION: u32 = 1;

@@ -3,6 +3,7 @@ const TASKS_DIR: &str = "tasks";
 const DEFAULT_CHUNK_TOKEN_LIMIT: i64 = 800;
 const DEFAULT_MAX_CONCURRENCY: i64 = 5;
 const DEFAULT_MAX_RETRIES: i64 = 5;
+const DEFAULT_MAX_FAILURE_PERCENTAGE: i64 = 20;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: i64 = 60;
 const DEFAULT_MAX_TOKENS_PER_MINUTE: i64 = 60_000;
 const INP_SCHEMA_VERSION: i64 = 11;
@@ -11,12 +12,29 @@ const GLOBAL_BACKGROUND_BATCH_CHUNKS: i64 = 20;
 const MAX_TASK_TAGS: usize = 12;
 const MAX_TASK_TAG_LENGTH: usize = 48;
 const MAX_TASK_NAME_LENGTH: usize = 120;
-const ERROR_RATE_FAILURE_THRESHOLD: f64 = 0.30;
-const AUTO_GLOSSARY_FAILURE_THRESHOLD: f64 = 0.40;
+const LEGACY_TRANSLATION_FAILURE_PERCENTAGE: i64 = 30;
+const LEGACY_GLOSSARY_FAILURE_PERCENTAGE: i64 = 40;
 const TRANSLATION_PROGRESS_EVENT: &str = "translation-progress";
 const TRANSLATION_TASK_CREATION_PROGRESS_EVENT: &str = "translation-task-creation-progress";
 const INP_FILE_DAMAGED: &str = "INP_FILE_DAMAGED";
 const SOURCE_FILE_UNAVAILABLE: &str = "Source file is not embedded in this .inp and the original source path is no longer readable. Recreate the task from the original document to retranslate or export it.";
+
+fn failure_threshold_exceeded(
+    failed_chunks: i64,
+    total_chunks: i64,
+    max_failure_percentage: i64,
+) -> Result<bool, String> {
+    if total_chunks <= 0 {
+        return Err("Task contains no translatable chunks".into());
+    }
+    if failed_chunks < 0 || failed_chunks > total_chunks {
+        return Err("Stored task chunk counts are invalid".into());
+    }
+    if !(0..=100).contains(&max_failure_percentage) {
+        return Err("Maximum failure percentage must be between 0 and 100".into());
+    }
+    Ok((failed_chunks as u128) * 100 > (total_chunks as u128) * (max_failure_percentage as u128))
+}
 
 mod context;
 mod db;

@@ -30,13 +30,14 @@ use super::context::{
 use super::db::{
     aggregate_chunk_stats, apply_chunk_outcome, clear_active_retry_for_chunk,
     commit_prepared_run_state, config_snapshot_json, connect_inp, content_format_from_source_path,
-    document_format_from_source_path, effective_translation_concurrency, finalize_task,
-    get_task_from_index, get_translation_config, glossary_source_chunks, insert_assets,
-    metadata_task, parse_source_file_for_task, pending_chunks, progress_detail_for_config,
+    document_format_from_source_path, effective_translation_concurrency,
+    ensure_task_has_translatable_chunks, finalize_task, get_task_from_index,
+    get_translation_config, glossary_source_chunks, insert_assets, metadata_task,
+    parse_source_file_for_task, pending_chunks, progress_detail_for_config,
     progress_detail_for_translation_stats, publish_task_index_snapshot, refresh_task_stats,
     resolve_source_file, set_active_retry_and_emit, set_progress_detail,
     task_assistant_custom_parameters, task_assistant_prompt, task_assistant_sampling,
-    task_glossary_config,
+    task_failure_thresholds, task_glossary_config,
 };
 use super::glossary::{prepare_task_glossary, TaskGlossaryMatcher, TaskGlossaryPreparation};
 use super::limiter::{
@@ -45,10 +46,10 @@ use super::limiter::{
 use super::request_options::{resolve_translation_request_options, TranslationRequestOptions};
 use super::types::{ChunkOutcome, ChunkRecord};
 use super::{
-    ConfidenceMode, ContextHandlingMode, PreparedRun, ProgressDetail, ProgressStep,
-    RateLimitStrategy, RunMode, TokenStats, TranslationChunkStatus, TranslationInterrupt,
-    TranslationProgressPayload, TranslationTaskStatus, TranslationTaskView,
-    ERROR_RATE_FAILURE_THRESHOLD, TRANSLATION_PROGRESS_EVENT,
+    failure_threshold_exceeded, ConfidenceMode, ContextHandlingMode, PreparedRun, ProgressDetail,
+    ProgressStep, RateLimitStrategy, RunMode, TokenStats, TranslationChunkStatus,
+    TranslationInterrupt, TranslationProgressPayload, TranslationTaskStatus, TranslationTaskView,
+    TRANSLATION_PROGRESS_EVENT,
 };
 
 fn count_label(name: &str, current: u64, total: u64) -> String {
@@ -312,6 +313,8 @@ pub async fn prepare_translation_run(
             set_progress_detail(&inp_pool, &rebuilt_detail).await?;
         }
     }
+    ensure_task_has_translatable_chunks(&inp_pool).await?;
+    let failure_thresholds = task_failure_thresholds(&inp_pool).await?;
     let stats = aggregate_chunk_stats(&inp_pool).await?;
     let current_task = metadata_task(&inp_pool, &inp_path).await?;
     let detail = progress_detail_for_translation_stats(
@@ -327,7 +330,12 @@ pub async fn prepare_translation_run(
         config.chunk_token_limit,
         config.max_concurrency,
         config.max_retries,
-        config_snapshot_json(&config, &indexed.provider_id, &indexed.model_id),
+        config_snapshot_json(
+            &config,
+            &indexed.provider_id,
+            &indexed.model_id,
+            failure_thresholds,
+        ),
         &detail,
     )
     .await?;
@@ -862,6 +870,7 @@ async fn finalize_translation_run(
     backend_log: &Option<BackendLog>,
 ) -> Result<(), String> {
     let stats = aggregate_chunk_stats(inp_pool).await?;
+    let failure_thresholds = task_failure_thresholds(inp_pool).await?;
     let (status, last_error) = if interrupted.is_interrupted() {
         (
             TranslationTaskStatus::Interrupted,
@@ -871,12 +880,16 @@ async fn finalize_translation_run(
                     .unwrap_or_else(|| "Task interrupted".to_string()),
             ),
         )
-    } else if stats.error_rate >= ERROR_RATE_FAILURE_THRESHOLD {
+    } else if failure_threshold_exceeded(
+        stats.failed_chunks,
+        stats.total_chunks,
+        failure_thresholds.max_failure_percentage,
+    )? {
         (
             TranslationTaskStatus::Failed,
             Some(format!(
-                "Error rate reached {:.1}%",
-                stats.error_rate * 100.0
+                "Translation failure threshold exceeded: {}/{} chunks failed (maximum {}%)",
+                stats.failed_chunks, stats.total_chunks, failure_thresholds.max_failure_percentage,
             )),
         )
     } else {

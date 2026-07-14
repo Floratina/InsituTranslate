@@ -76,6 +76,7 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   chunkTokenLimit: 800,
   maxConcurrency: 5,
   maxRetries: 5,
+  maxFailurePercentage: 20,
   rateLimitStrategy: "dynamic",
   maxRequestsPerMinute: 60,
   maxTokensPerMinute: 60_000,
@@ -93,6 +94,7 @@ const DEFAULT_CONFIG: TranslationConfigView = {
     thinkingEffort: "none",
     useWebSearch: false,
     useCustomParameters: false,
+    maxFailurePercentage: 20,
   },
   confidenceMode: "off",
   pdfParsingMode: "local-first",
@@ -386,11 +388,13 @@ function normalizeStartConfig(
   const withDefaults: TranslationConfigView = {
     ...configWithoutLegacyBackground,
     contextHandlingMode,
+    maxFailurePercentage: config.maxFailurePercentage ?? DEFAULT_CONFIG.maxFailurePercentage,
     thinkingEffort: config.thinkingEffort ?? "none",
     useWebSearch: config.useWebSearch ?? false,
     useCustomParameters: config.useCustomParameters ?? false,
-    glossaryGenerationConfig: config.glossaryGenerationConfig ?? {
+    glossaryGenerationConfig: {
       ...DEFAULT_CONFIG.glossaryGenerationConfig,
+      ...config.glossaryGenerationConfig,
     },
     confidenceMode: config.confidenceMode ?? "off",
     pdfParsingMode: config.pdfParsingMode ?? "local-first",

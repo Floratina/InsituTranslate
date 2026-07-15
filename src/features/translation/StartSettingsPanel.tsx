@@ -468,8 +468,8 @@ export function StartSettingsPanel({
                 disabled={loading}
                 onChange={updateTranslationRuntime}
               />
-              <div className={TWO_COLUMN_GRID_CLASS}>
-                <FieldBlock label="最大允许失败率" help={FAILURE_THRESHOLD_HELP}>
+              <div className={THREE_COLUMN_GRID_CLASS}>
+                <FieldBlock label="最大允许失败率 (%)" help={FAILURE_THRESHOLD_HELP}>
                   <NumberControl
                     value={config.maxFailurePercentage}
                     min={0}
@@ -544,8 +544,8 @@ export function StartSettingsPanel({
                 disabled={loading || !config.useGlossary || config.glossaryMode !== "auto"}
                 onChange={updateGlossaryRuntime}
               />
-              <div className={TWO_COLUMN_GRID_CLASS}>
-                <FieldBlock label="最大允许失败率" help={FAILURE_THRESHOLD_HELP}>
+              <div className={THREE_COLUMN_GRID_CLASS}>
+                <FieldBlock label="最大允许失败率 (%)" help={FAILURE_THRESHOLD_HELP}>
                   <NumberControl
                     value={config.glossaryGenerationConfig.maxFailurePercentage}
                     min={0}

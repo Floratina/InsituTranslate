@@ -205,6 +205,7 @@ export const appSessionCache = {
   providerSelectedIds: new Map<ProviderPurpose, string>(),
   assistantSelectedIds: new Map<ProviderPurpose, string>(),
   proofreadingSelectedTaskId: "",
+  glossaryNavigationTargetId: "",
 
   providers(purpose: ProviderPurpose): SessionResource<ProviderView[]> {
     return resourceForPurpose(providerResources, purpose);

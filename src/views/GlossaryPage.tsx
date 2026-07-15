@@ -479,6 +479,18 @@ export default function GlossaryPage() {
       if (listRequestId.current !== requestId) return;
       setGlossaries(filtered);
       setFilterSeed(all);
+      const navigationTargetId = appSessionCache.glossaryNavigationTargetId;
+      if (navigationTargetId) {
+        appSessionCache.glossaryNavigationTargetId = "";
+        const target = all.find((glossary) => glossary.id === navigationTargetId) ?? null;
+        if (target) {
+          setAnimateSecondaryView(true);
+          setSelectedGlossary(target);
+        } else {
+          setSelectedGlossary(null);
+          pushToast("关联术语表不存在", "warning");
+        }
+      }
       setSelectedGlossary((current) => {
         if (!current) return current;
         return all.find((glossary) => glossary.id === current.id) ?? null;

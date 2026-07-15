@@ -268,7 +268,6 @@ function NumberControl({
 }
 
 function glossarySelectedValue(config: TranslationConfigView): string {
-  if (config.glossaryMode === "auto") return "auto";
   return config.glossaryId ?? "__missing__";
 }
 
@@ -345,19 +344,30 @@ export function StartSettingsPanel({
     [config],
   );
 
-  function updateGlossaryEnabled(enabled: boolean): void {
-    onConfigChange((current) => ({ ...current, useGlossary: enabled }));
+  function updateExecutionMode(
+    control: "translation" | "glossary" | "auto-glossary",
+    enabled: boolean,
+  ): void {
+    onConfigChange((current) => {
+      if (control === "translation") {
+        return { ...current, enableTranslation: enabled };
+      }
+      if (control === "auto-glossary") {
+        return {
+          ...current,
+          useGlossary: enabled ? true : current.useGlossary,
+          glossaryMode: enabled ? "auto" : "existing",
+        };
+      }
+      return {
+        ...current,
+        useGlossary: enabled,
+        glossaryMode: "existing",
+      };
+    });
   }
 
   function updateGlossarySelection(value: string): void {
-    if (value === "auto") {
-      onConfigChange((current) => ({
-        ...current,
-        glossaryMode: "auto",
-        glossaryId: null,
-      }));
-      return;
-    }
     onConfigChange((current) => ({
       ...current,
       glossaryMode: "existing",
@@ -451,6 +461,18 @@ export function StartSettingsPanel({
         <div className="min-w-0">
           {activeTab === "translation" && (
             <div className="grid gap-3">
+              <div className={THREE_COLUMN_GRID_CLASS}>
+                <FieldBlock label="启用翻译">
+                  <div className="flex h-8 items-center">
+                    <Switch
+                      size="sm"
+                      checked={config.enableTranslation}
+                      disabled={loading}
+                      onCheckedChange={(enabled) => updateExecutionMode("translation", enabled)}
+                    />
+                  </div>
+                </FieldBlock>
+              </div>
               <ModelRuntimeSettings
                 value={{
                   providerId: config.providerId,
@@ -465,7 +487,7 @@ export function StartSettingsPanel({
                 providerLabel="模型提供商"
                 modelLabel="翻译模型"
                 assistantLabel="助手配置"
-                disabled={loading}
+                disabled={loading || !config.enableTranslation}
                 onChange={updateTranslationRuntime}
               />
               <div className={THREE_COLUMN_GRID_CLASS}>
@@ -474,7 +496,7 @@ export function StartSettingsPanel({
                     value={config.maxFailurePercentage}
                     min={0}
                     max={100}
-                    disabled={loading}
+                    disabled={loading || !config.enableTranslation}
                     onChange={(value) => onNumberChange("maxFailurePercentage", value)}
                   />
                 </FieldBlock>
@@ -484,14 +506,25 @@ export function StartSettingsPanel({
 
           {activeTab === "glossary" && (
             <div className="grid gap-3">
-              <div className={TWO_COLUMN_GRID_CLASS}>
-                <FieldBlock label="使用术语表">
+              <div className={THREE_COLUMN_GRID_CLASS}>
+                <FieldBlock label="启用术语表">
                   <div className="flex h-8 items-center">
                     <Switch
                       size="sm"
                       checked={config.useGlossary}
                       disabled={loading}
-                      onCheckedChange={updateGlossaryEnabled}
+                      onCheckedChange={(enabled) => updateExecutionMode("glossary", enabled)}
+                    />
+                  </div>
+                </FieldBlock>
+
+                <FieldBlock label="自动建立术语表">
+                  <div className="flex h-8 items-center">
+                    <Switch
+                      size="sm"
+                      checked={config.useGlossary && config.glossaryMode === "auto"}
+                      disabled={loading}
+                      onCheckedChange={(enabled) => updateExecutionMode("auto-glossary", enabled)}
                     />
                   </div>
                 </FieldBlock>
@@ -499,15 +532,14 @@ export function StartSettingsPanel({
                 <FieldBlock label="选择术语表">
                   <Select
                     value={selectedGlossaryValue}
-                    disabled={loading || !config.useGlossary}
+                    disabled={loading || !config.useGlossary || config.glossaryMode === "auto"}
                     onValueChange={updateGlossarySelection}
                   >
                     <SelectTrigger>
                       <SelectValue placeholder="选择术语表" />
                     </SelectTrigger>
                     <SelectContent viewportClassName="max-h-72">
-                      <SelectItem value="auto">自动建立术语表</SelectItem>
-                      {config.glossaryMode === "existing" && !config.glossaryId && (
+                      {!config.glossaryId && (
                         <SelectItem value="__missing__" disabled>请选择已有术语表</SelectItem>
                       )}
                       {config.glossaryId
@@ -550,7 +582,7 @@ export function StartSettingsPanel({
                     value={config.glossaryGenerationConfig.maxFailurePercentage}
                     min={0}
                     max={100}
-                    disabled={loading || config.glossaryMode !== "auto"}
+                    disabled={loading || !config.useGlossary || config.glossaryMode !== "auto"}
                     onChange={updateGlossaryFailurePercentage}
                   />
                 </FieldBlock>

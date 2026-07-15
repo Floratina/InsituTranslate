@@ -283,6 +283,8 @@ impl TaskSchedulerWorker {
                 translation_tasks::reset_task_for_retranslation(
                     &self.context.config_pool,
                     &self.context.workspace_root,
+                    &self.context.glossary_config_pool,
+                    &self.context.glossary_workspace_root,
                     &id,
                 )
                 .await

@@ -155,7 +155,7 @@ impl GlossaryMode {
 
 impl Default for GlossaryMode {
     fn default() -> Self {
-        Self::Auto
+        Self::Existing
     }
 }
 
@@ -336,6 +336,7 @@ pub struct TranslationConfigView {
     pub context_handling_mode: ContextHandlingMode,
     #[serde(default, skip_serializing)]
     pub use_global_background: bool,
+    pub enable_translation: bool,
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
@@ -366,8 +367,9 @@ impl Default for TranslationConfigView {
             max_tokens_per_minute: DEFAULT_MAX_TOKENS_PER_MINUTE,
             context_handling_mode: ContextHandlingMode::Off,
             use_global_background: false,
+            enable_translation: true,
             use_glossary: false,
-            glossary_mode: GlossaryMode::Auto,
+            glossary_mode: GlossaryMode::Existing,
             glossary_id: None,
             glossary_generation_config: GlossaryGenerationConfig::default(),
             thinking_effort: ThinkingEffort::None,
@@ -401,6 +403,8 @@ pub struct UpdateTranslationConfigInput {
     pub context_handling_mode: ContextHandlingMode,
     #[serde(default, skip_serializing)]
     pub use_global_background: bool,
+    #[serde(default = "default_enable_translation")]
+    pub enable_translation: bool,
     pub use_glossary: bool,
     pub glossary_mode: GlossaryMode,
     pub glossary_id: Option<String>,
@@ -429,6 +433,8 @@ pub struct CreateTranslationTaskInput {
     pub provider_id: String,
     pub model_id: String,
     pub assistant_id: Option<String>,
+    #[serde(default = "default_enable_translation")]
+    pub enable_translation: bool,
     #[serde(default)]
     pub use_glossary: bool,
     #[serde(default)]
@@ -532,6 +538,8 @@ pub struct TranslationTaskView {
     pub model_id: String,
     pub model_request_name: String,
     pub assistant_id: Option<String>,
+    pub enable_translation: bool,
+    pub glossary_id: Option<String>,
     pub tags: Vec<String>,
     pub total_chunks: i64,
     pub completed_chunks: i64,
@@ -653,6 +661,10 @@ pub(super) struct TaskGlossaryConfig {
 
 fn default_max_failure_percentage() -> i64 {
     DEFAULT_MAX_FAILURE_PERCENTAGE
+}
+
+fn default_enable_translation() -> bool {
+    true
 }
 
 fn legacy_translation_failure_percentage() -> i64 {

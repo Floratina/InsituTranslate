@@ -66,6 +66,15 @@ pub fn run() {
                 &workspace_root,
             ))
             .map_err(|error| format!("Unable to rebase translation task paths: {error}"))?;
+            tauri::async_runtime::block_on(
+                translation_tasks::backfill_task_index_execution_fields(&translation_config_pool),
+            )
+            .map_err(|error| format!("Unable to backfill task execution fields: {error}"))?;
+            tauri::async_runtime::block_on(glossaries::recover_glossary_deletion_journal(
+                &glossary_config_pool,
+                &translation_config_pool,
+            ))
+            .map_err(|error| format!("Unable to recover glossary deletion journal: {error}"))?;
             let client = commands::build_http_client()
                 .map_err(|error| format!("Unable to initialize HTTP client: {error}"))?;
             let scheduler_preferences = tauri::async_runtime::block_on(

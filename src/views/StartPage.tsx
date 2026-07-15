@@ -81,8 +81,9 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   maxRequestsPerMinute: 60,
   maxTokensPerMinute: 60_000,
   contextHandlingMode: "off",
+  enableTranslation: true,
   useGlossary: false,
-  glossaryMode: "auto",
+  glossaryMode: "existing",
   glossaryId: null,
   thinkingEffort: "none",
   useWebSearch: false,
@@ -388,6 +389,8 @@ function normalizeStartConfig(
   const withDefaults: TranslationConfigView = {
     ...configWithoutLegacyBackground,
     contextHandlingMode,
+    enableTranslation: config.enableTranslation ?? true,
+    glossaryMode: config.useGlossary ? config.glossaryMode : "existing",
     maxFailurePercentage: config.maxFailurePercentage ?? DEFAULT_CONFIG.maxFailurePercentage,
     thinkingEffort: config.thinkingEffort ?? "none",
     useWebSearch: config.useWebSearch ?? false,
@@ -400,6 +403,24 @@ function normalizeStartConfig(
     pdfParsingMode: config.pdfParsingMode ?? "local-first",
   };
   return glossaries ? normalizeGlossaryConfig(withDefaults, glossaries) : withDefaults;
+}
+
+function executionModeValidationError(config: TranslationConfigView): string | null {
+  const autoGlossaryEnabled = config.useGlossary && config.glossaryMode === "auto";
+  if (!config.enableTranslation && !autoGlossaryEnabled) {
+    return config.useGlossary
+      ? "在仅术语表模式下，必须启用自动建立术语表才能创建任务。"
+      : "翻译和自动建立术语表必须至少启用一项。";
+  }
+  if (
+    config.enableTranslation
+    && config.useGlossary
+    && config.glossaryMode === "existing"
+    && !config.glossaryId
+  ) {
+    return "启用术语表时，请选择有效的已有术语表。";
+  }
+  return null;
 }
 
 export default function StartPage({ onTaskCreated }: StartPageProps) {
@@ -780,8 +801,24 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
       pushToast("配置仍在加载，请稍后再添加文件", "warning");
       return;
     }
-    if (!config.providerId || !config.modelId) {
+    const executionModeError = executionModeValidationError(config);
+    if (executionModeError) {
+      pushToast(executionModeError, "warning");
+      return;
+    }
+    if (config.enableTranslation && (!config.providerId || !config.modelId)) {
       pushToast("请先选择已启用的翻译提供商和模型，再添加文件", "warning");
+      return;
+    }
+    if (
+      config.useGlossary
+      && config.glossaryMode === "auto"
+      && (
+        !config.glossaryGenerationConfig.providerId
+        || !config.glossaryGenerationConfig.modelId
+      )
+    ) {
+      pushToast("请先选择已启用的术语表提供商和模型，再添加文件", "warning");
       return;
     }
     const resolvedSourceLanguage = normalizeLanguageCode(sourceLanguage);
@@ -806,9 +843,10 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
           providerId: config.providerId,
           modelId: config.modelId,
           assistantId: config.assistantId === "__none__" ? null : config.assistantId,
+          enableTranslation: config.enableTranslation,
           useGlossary: config.useGlossary,
           glossaryMode: config.glossaryMode,
-          glossaryId: config.glossaryId,
+          glossaryId: config.glossaryMode === "auto" ? null : config.glossaryId,
           glossaryGenerationConfig: config.glossaryGenerationConfig,
         });
         if (ignoredCreationPaths.has(path)) {
@@ -835,6 +873,15 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   }
 
   async function createTasks(): Promise<void> {
+    const executionModeError = executionModeValidationError(config);
+    if (executionModeError) {
+      pushToast(executionModeError, "warning");
+      return;
+    }
+    if (fileRowCount === 0) {
+      pushToast("请先添加需要处理的文件", "warning");
+      return;
+    }
     if (!creationReady) {
       pushToast("仍有任务未完成预处理，请等待完成或移除失败条目", "warning");
       return;
@@ -860,7 +907,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
             .filter((job) => !publishedIdSet.has(job.clientTaskId)),
         );
         appSessionCache.invalidateProofreading();
-        pushToast(`已创建 ${publishedIds.length} 个翻译任务`, "success");
+        pushToast(`已创建 ${publishedIds.length} 个任务`, "success");
         onTaskCreated();
       }
       if (failed.length > 0) {
@@ -1025,7 +1072,6 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
           disabled={
             busy
             || activeCreation
-            || !creationReady
             || loading
             || savingConfig
           }

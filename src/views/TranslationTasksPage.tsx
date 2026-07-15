@@ -12,6 +12,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import {
   ArrowUpDown,
+  BookOpen,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -160,6 +161,7 @@ interface ExportState {
 
 interface TranslationTasksPageProps {
   onOpenProofreading?: (taskId: string) => void;
+  onOpenGlossary?: (glossaryId: string) => void;
 }
 
 const ALL_FILTER_VALUE = "__all__";
@@ -210,6 +212,8 @@ function sameTaskSignature(left: TranslationTaskView, right: TranslationTaskView
   return left.id === right.id
     && left.name === right.name
     && left.status === right.status
+    && left.enableTranslation === right.enableTranslation
+    && left.glossaryId === right.glossaryId
     && left.progress === right.progress
     && left.completedChunks === right.completedChunks
     && left.failedChunks === right.failedChunks
@@ -469,7 +473,7 @@ function taskStatsLabel(task: TranslationTaskView): string {
   return [
     statusLabel(task.status),
     `${task.completedChunks}/${task.totalChunks}`,
-    formatPercent(task.progress),
+    formatPercent(task.status === "success" ? 1 : task.progress),
     formatTokenK(task.tokenStats.totalTokens),
   ].join(" ");
 }
@@ -521,7 +525,7 @@ function exportBaseName(task: TranslationTaskView): string {
   return task.name.replace(/\.[^.]+$/, "");
 }
 
-export default function TranslationTasksPage({ onOpenProofreading }: TranslationTasksPageProps) {
+export default function TranslationTasksPage({ onOpenProofreading, onOpenGlossary }: TranslationTasksPageProps) {
   const { pushToast } = useToast();
   const [tasks, setTasks] = useState<TranslationTaskView[]>([]);
   const [tab, setTab] = useState<TaskTab>("running");
@@ -867,7 +871,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
   async function retranslateVisibleTasks(): Promise<void> {
     const ids = visibleRetranslatableTasks.map((task) => task.id);
     if (ids.length === 0) {
-      pushToast("当前列表没有可重新翻译的任务", "warning");
+      pushToast("当前列表没有可重新执行的任务", "warning");
       return;
     }
     setBatchBusy(true);
@@ -878,10 +882,10 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         return;
       }
       if (!ack.success) {
-        pushToast(ack.message ?? "批量重新翻译指令未被接受", "error");
+        pushToast(ack.message ?? "批量重新执行指令未被接受", "error");
         return;
       }
-      pushToast("已加入重新翻译队列", "success");
+      pushToast("已加入重新执行队列", "success");
     } catch (error) {
       pushToast(getErrorMessage(error), "error");
     } finally {
@@ -960,7 +964,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
           </Button>
         </div>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          管理 INP 翻译任务和查看进度
+          管理 INP 文档任务和查看进度
         </p>
       </header>
 
@@ -1025,7 +1029,7 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
               }
             >
               {tab === "completed" ? <RotateCcw className="size-4" /> : <Play className="size-4" />}
-              {tab === "completed" ? "重新翻译" : "全部开始"}
+              {tab === "completed" ? "重新执行" : "全部开始"}
             </Button>
             <Button
               size="sm"
@@ -1079,6 +1083,9 @@ export default function TranslationTasksPage({ onOpenProofreading }: Translation
         onPause={(task) => void runTaskAction(task, { type: "pause", taskId: task.id })}
         onRetranslate={(task) => void runTaskAction(task, { type: "retranslate", taskId: task.id })}
         onProofread={(task) => onOpenProofreading?.(task.id)}
+        onOpenGlossary={(task) => {
+          if (task.glossaryId) onOpenGlossary?.(task.glossaryId);
+        }}
         onEditInfo={(task) => setTaskInfoState({ task, name: task.name, tags: task.tags.join("，") })}
         onOpenFolder={(task) => {
           void openTranslationTaskFolder(task.id).catch((error: unknown) => {
@@ -1168,6 +1175,7 @@ interface TasksTableProps {
   onPause: (task: TranslationTaskView) => void;
   onRetranslate: (task: TranslationTaskView) => void;
   onProofread: (task: TranslationTaskView) => void;
+  onOpenGlossary: (task: TranslationTaskView) => void;
   onEditInfo: (task: TranslationTaskView) => void;
   onOpenFolder: (task: TranslationTaskView) => void;
   onExport: (task: TranslationTaskView) => void;
@@ -1195,6 +1203,7 @@ function TasksTable({
   onPause,
   onRetranslate,
   onProofread,
+  onOpenGlossary,
   onEditInfo,
   onOpenFolder,
   onExport,
@@ -1300,6 +1309,7 @@ function TasksTable({
                       onPause={onPause}
                       onRetranslate={onRetranslate}
                       onProofread={onProofread}
+                      onOpenGlossary={onOpenGlossary}
                       onEditInfo={onEditInfo}
                       onOpenFolder={onOpenFolder}
                       onExport={onExport}
@@ -1318,6 +1328,7 @@ function TasksTable({
                 onPause={onPause}
                 onRetranslate={onRetranslate}
                 onProofread={onProofread}
+                onOpenGlossary={onOpenGlossary}
                 onEditInfo={onEditInfo}
                 onOpenFolder={onOpenFolder}
                 onExport={onExport}
@@ -1352,6 +1363,7 @@ const TaskRow = memo(function TaskRow({
   onPause,
   onRetranslate,
   onProofread,
+  onOpenGlossary,
   onEditInfo,
   onOpenFolder,
   onExport,
@@ -1388,6 +1400,7 @@ const TaskRow = memo(function TaskRow({
           onPause={onPause}
           onRetranslate={onRetranslate}
           onProofread={onProofread}
+          onOpenGlossary={onOpenGlossary}
           onEditInfo={onEditInfo}
           onOpenFolder={onOpenFolder}
           onExport={onExport}
@@ -1443,6 +1456,7 @@ interface TaskMenuProps {
   onPause: (task: TranslationTaskView) => void;
   onRetranslate: (task: TranslationTaskView) => void;
   onProofread: (task: TranslationTaskView) => void;
+  onOpenGlossary: (task: TranslationTaskView) => void;
   onEditInfo: (task: TranslationTaskView) => void;
   onOpenFolder: (task: TranslationTaskView) => void;
   onExport: (task: TranslationTaskView) => void;
@@ -1481,7 +1495,7 @@ function TaskActionDropdown(props: TaskMenuProps) {
   );
 }
 
-function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetranslate, onProofread, onEditInfo, onOpenFolder, onExport, onDelete }: TaskMenuProps & { kind: "context" | "dropdown" }) {
+function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetranslate, onProofread, onOpenGlossary, onEditInfo, onOpenFolder, onExport, onDelete }: TaskMenuProps & { kind: "context" | "dropdown" }) {
   const Item = kind === "context" ? ContextMenuItem : DropdownMenuItem;
   const Separator = kind === "context" ? ContextMenuSeparator : DropdownMenuSeparator;
   return (
@@ -1519,14 +1533,20 @@ function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetrans
       {(task.status === "success" || task.status === "failed") && (
         <Item disabled={busy} onSelect={() => onRetranslate(task)}>
           <RotateCcw className="size-3.5" />
-          重新翻译
+          {task.enableTranslation ? "重新翻译" : "重新建立术语表"}
         </Item>
       )}
       <Separator />
-      <Item onSelect={() => onProofread(task)}>
+      <Item disabled={!task.enableTranslation} onSelect={() => onProofread(task)}>
         <FilePenLine className="size-3.5" />
-        译后编辑和校对
+        {task.enableTranslation ? "译后编辑和校对" : "译后编辑和校对（未启用翻译）"}
       </Item>
+      {task.glossaryId && (
+        <Item onSelect={() => onOpenGlossary(task)}>
+          <BookOpen className="size-3.5" />
+          打开关联术语表
+        </Item>
+      )}
       <Item onSelect={() => onEditInfo(task)}>
         <Pencil className="size-3.5" />
         编辑任务信息
@@ -1536,9 +1556,9 @@ function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetrans
         <FolderOpen className="size-3.5" />
         打开文件夹
       </Item>
-      <Item onSelect={() => onExport(task)}>
+      <Item disabled={!task.enableTranslation} onSelect={() => onExport(task)}>
         <Download className="size-3.5" />
-        导出任务为...
+        {task.enableTranslation ? "导出任务为..." : "导出任务（未启用翻译）"}
       </Item>
       <Separator />
       <Item

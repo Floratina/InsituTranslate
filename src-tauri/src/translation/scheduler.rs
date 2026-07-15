@@ -31,9 +31,9 @@ use super::db::{
     aggregate_chunk_stats, apply_chunk_outcome, clear_active_retry_for_chunk,
     commit_prepared_run_state, config_snapshot_json, connect_inp, content_format_from_source_path,
     document_format_from_source_path, effective_translation_concurrency,
-    ensure_task_has_translatable_chunks, finalize_task, get_task_from_index,
-    get_translation_config, glossary_source_chunks, insert_assets, metadata_task,
-    parse_source_file_for_task, pending_chunks, progress_detail_for_config,
+    ensure_task_has_translatable_chunks, finalize_glossary_only_task, finalize_task,
+    get_task_from_index, get_translation_config, glossary_source_chunks, insert_assets,
+    metadata_task, parse_source_file_for_task, pending_chunks, progress_detail_for_config,
     progress_detail_for_translation_stats, publish_task_index_snapshot, refresh_task_stats,
     resolve_source_file, set_active_retry_and_emit, set_progress_detail,
     task_assistant_custom_parameters, task_assistant_prompt, task_assistant_sampling,
@@ -508,6 +508,17 @@ pub async fn run_translation_task(
             return Ok(());
         }
     };
+
+    if !task.enable_translation {
+        write_translation_log(
+            &backend_log,
+            "INFO",
+            format!("Task id={} completed in glossary-only mode", task.id),
+        );
+        finalize_glossary_only_task(&app, &inp_pool, &config_pool, &prepared.inp_path).await?;
+        inp_pool.close().await;
+        return Ok(());
+    }
 
     let model = app_db::get_model(&provider_pool, &task.model_id).await?;
     let config = app_db::runtime_config(&provider_pool, &task.provider_id).await?;

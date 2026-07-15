@@ -220,7 +220,9 @@ export function taskStatusMessage(task: TranslationTaskView): TaskStatusMessage 
   }
   if (task.status === "success") {
     return {
-      text: `翻译完成 (${task.completedChunks}/${task.totalChunks})`,
+      text: task.enableTranslation
+        ? `翻译完成 (${task.completedChunks}/${task.totalChunks})`
+        : "术语表建立完成",
       severity: "muted",
     };
   }

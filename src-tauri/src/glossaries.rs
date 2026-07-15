@@ -41,6 +41,13 @@ pub struct GlossaryView {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct GlossaryDeletionTicket {
+    pub glossary: GlossaryView,
+    pub original_path: PathBuf,
+    pub staged_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlossaryListQuery {
@@ -254,6 +261,14 @@ async fn migrate_config_db(pool: &SqlitePool) -> Result<(), String> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )"#,
+        r#"CREATE TABLE IF NOT EXISTS glossary_deletion_journal (
+            glossary_id TEXT PRIMARY KEY NOT NULL,
+            task_id TEXT NOT NULL,
+            glossary_json TEXT NOT NULL,
+            original_path TEXT NOT NULL,
+            staged_path TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"#,
         "CREATE INDEX IF NOT EXISTS idx_glossary_index_languages ON glossary_index(source_language, target_language)",
         "CREATE INDEX IF NOT EXISTS idx_glossary_index_updated ON glossary_index(updated_at)",
     ];
@@ -445,24 +460,211 @@ pub async fn update_glossary(
 
 pub async fn delete_glossary(
     pool: &SqlitePool,
+    translation_config_pool: &SqlitePool,
     workspace_root: &Path,
     id: &str,
 ) -> Result<(), String> {
-    let glossary = get_glossary_from_index(pool, id).await?;
-    let ing_path = PathBuf::from(&glossary.ing_path);
-    if !ing_path.starts_with(workspace_root) {
+    let ticket =
+        stage_manual_glossary_deletion(pool, translation_config_pool, workspace_root, id).await?;
+    commit_staged_glossary_deletion(pool, &ticket).await
+}
+
+async fn stage_manual_glossary_deletion(
+    pool: &SqlitePool,
+    translation_config_pool: &SqlitePool,
+    workspace_root: &Path,
+    glossary_id: &str,
+) -> Result<GlossaryDeletionTicket, String> {
+    let references: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_index WHERE glossary_id = ?")
+            .bind(glossary_id)
+            .fetch_one(translation_config_pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    if references > 0 {
+        return Err("术语表仍被任务引用，无法删除".into());
+    }
+    let glossary = get_glossary_from_index(pool, glossary_id).await?;
+    let original_path = PathBuf::from(&glossary.ing_path);
+    if !original_path.starts_with(workspace_root) {
         return Err("Refusing to delete a glossary outside the workspace".into());
     }
-    match tokio::fs::remove_file(&ing_path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }?;
-    sqlx::query("DELETE FROM glossary_index WHERE id = ?")
-        .bind(id)
+    let glossary_json = serde_json::to_string(&glossary).map_err(|error| error.to_string())?;
+    let staged_path = original_path.with_extension(format!("deleting-{}", new_id("cleanup")));
+    tokio::fs::rename(&original_path, &staged_path)
+        .await
+        .map_err(|error| format!("Unable to stage glossary for deletion: {error}"))?;
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+    let result = async {
+        sqlx::query("DELETE FROM glossary_index WHERE id = ?")
+            .bind(glossary_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?;
+        sqlx::query(
+            "INSERT INTO glossary_deletion_journal (
+                glossary_id, task_id, glossary_json, original_path, staged_path, created_at
+             ) VALUES (?, '__manual__', ?, ?, ?, ?)",
+        )
+        .bind(glossary_id)
+        .bind(glossary_json)
+        .bind(original_path.to_string_lossy().to_string())
+        .bind(staged_path.to_string_lossy().to_string())
+        .bind(unix_timestamp())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = tokio::fs::rename(&staged_path, &original_path).await;
+        return Err(error);
+    }
+    Ok(GlossaryDeletionTicket {
+        glossary,
+        original_path,
+        staged_path,
+    })
+}
+
+pub async fn stage_unreferenced_auto_glossary_deletion(
+    pool: &SqlitePool,
+    translation_config_pool: &SqlitePool,
+    workspace_root: &Path,
+    task_id: &str,
+    glossary_id: &str,
+) -> Result<Option<GlossaryDeletionTicket>, String> {
+    let glossary = get_glossary_from_index(pool, glossary_id).await?;
+    if glossary.source_type != "auto" {
+        return Ok(None);
+    }
+    let other_references: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_index WHERE glossary_id = ? AND id <> ?")
+            .bind(glossary_id)
+            .bind(task_id)
+            .fetch_one(translation_config_pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    if other_references > 0 {
+        return Ok(None);
+    }
+    let original_path = PathBuf::from(&glossary.ing_path);
+    if !original_path.starts_with(workspace_root) {
+        return Err("Refusing to stage a glossary outside the workspace".into());
+    }
+    let glossary_json = serde_json::to_string(&glossary).map_err(|error| error.to_string())?;
+    let staged_path = original_path.with_extension(format!("deleting-{}", new_id("cleanup")));
+    tokio::fs::rename(&original_path, &staged_path)
+        .await
+        .map_err(|error| format!("Unable to stage old glossary for deletion: {error}"))?;
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+    let result = async {
+        sqlx::query("DELETE FROM glossary_index WHERE id = ?")
+            .bind(glossary_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?;
+        sqlx::query(
+            "INSERT INTO glossary_deletion_journal (
+                glossary_id, task_id, glossary_json, original_path, staged_path, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(glossary_id)
+        .bind(task_id)
+        .bind(glossary_json)
+        .bind(original_path.to_string_lossy().to_string())
+        .bind(staged_path.to_string_lossy().to_string())
+        .bind(unix_timestamp())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = tokio::fs::rename(&staged_path, &original_path).await;
+        return Err(error);
+    }
+    Ok(Some(GlossaryDeletionTicket {
+        glossary,
+        original_path,
+        staged_path,
+    }))
+}
+
+pub async fn commit_staged_glossary_deletion(
+    pool: &SqlitePool,
+    ticket: &GlossaryDeletionTicket,
+) -> Result<(), String> {
+    match tokio::fs::remove_file(&ticket.staged_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Unable to delete old glossary file: {error}")),
+    }
+    sqlx::query("DELETE FROM glossary_deletion_journal WHERE glossary_id = ?")
+        .bind(&ticket.glossary.id)
         .execute(pool)
         .await
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn rollback_staged_glossary_deletion(
+    pool: &SqlitePool,
+    ticket: &GlossaryDeletionTicket,
+) -> Result<(), String> {
+    if tokio::fs::try_exists(&ticket.staged_path)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        tokio::fs::rename(&ticket.staged_path, &ticket.original_path)
+            .await
+            .map_err(|error| format!("Unable to restore old glossary file: {error}"))?;
+    }
+    upsert_glossary_index(pool, &ticket.glossary).await?;
+    sqlx::query("DELETE FROM glossary_deletion_journal WHERE glossary_id = ?")
+        .bind(&ticket.glossary.id)
+        .execute(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn recover_glossary_deletion_journal(
+    pool: &SqlitePool,
+    translation_config_pool: &SqlitePool,
+) -> Result<(), String> {
+    let rows = sqlx::query("SELECT * FROM glossary_deletion_journal ORDER BY created_at")
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let glossary = serde_json::from_str::<GlossaryView>(row.get("glossary_json"))
+            .map_err(|error| format!("Stored glossary deletion journal is invalid: {error}"))?;
+        let ticket = GlossaryDeletionTicket {
+            original_path: PathBuf::from(row.get::<String, _>("original_path")),
+            staged_path: PathBuf::from(row.get::<String, _>("staged_path")),
+            glossary,
+        };
+        let references: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_index WHERE glossary_id = ?")
+                .bind(&ticket.glossary.id)
+                .fetch_one(translation_config_pool)
+                .await
+                .map_err(|error| error.to_string())?;
+        if references > 0 {
+            rollback_staged_glossary_deletion(pool, &ticket).await?;
+        } else {
+            commit_staged_glossary_deletion(pool, &ticket).await?;
+        }
+    }
     Ok(())
 }
 

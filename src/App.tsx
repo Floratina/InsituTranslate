@@ -45,6 +45,11 @@ function App() {
           appSessionCache.proofreadingSelectedTaskId = taskId;
           navigate("proofreading");
         }}
+        onOpenGlossary={(glossaryId) => {
+          appSessionCache.glossaryNavigationTargetId = glossaryId;
+          appSessionCache.glossaryIndex.invalidate();
+          navigate("glossary");
+        }}
       />
     ) : activePage === "proofreading" ? (
       <ProofreadingPage />

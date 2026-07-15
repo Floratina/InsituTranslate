@@ -19,11 +19,12 @@ use super::context::{
     previous_source_context, previous_translation_context, sanitize_file_stem, unix_timestamp,
 };
 use super::db::{
-    apply_chunk_outcome, connect_inp, connect_sqlite, effective_translation_concurrency,
-    export_file_name, get_task_from_index, normalize_tags, normalize_task_filters,
-    release_assets_for_export, rendered_task_document, serialize_tags, source_extension,
-    task_failure_thresholds, task_glossary_config, translated_source_text,
-    validate_failure_percentage, validate_inp_file, validate_parsed_task_source, ParsedTaskSource,
+    apply_chunk_outcome, connect_inp, connect_sqlite, effective_task_progress,
+    effective_translation_concurrency, export_file_name, get_task_from_index, normalize_tags,
+    normalize_task_filters, release_assets_for_export, rendered_task_document, serialize_tags,
+    source_extension, task_failure_thresholds, task_glossary_config, translated_source_text,
+    validate_execution_mode, validate_failure_percentage, validate_inp_file,
+    validate_parsed_task_source, ParsedTaskSource,
 };
 use super::failure_threshold_exceeded;
 use super::glossary::TaskGlossaryMatcher;
@@ -107,6 +108,8 @@ fn legacy_task_snapshot_defaults_preserve_previous_thresholds() {
 #[test]
 fn translation_config_defaults_use_twenty_percent_thresholds() {
     let config = TranslationConfigView::default();
+    assert!(config.enable_translation);
+    assert_eq!(config.glossary_mode, GlossaryMode::Existing);
     assert_eq!(config.max_failure_percentage, 20);
     assert_eq!(config.glossary_generation_config.max_failure_percentage, 20);
     let decoded =
@@ -120,6 +123,36 @@ fn translation_config_defaults_use_twenty_percent_thresholds() {
     assert!(validate_failure_percentage(100).is_ok());
     assert!(validate_failure_percentage(-1).is_err());
     assert!(validate_failure_percentage(101).is_err());
+}
+
+#[test]
+fn successful_and_completed_glossary_only_tasks_force_full_progress() {
+    assert_eq!(
+        effective_task_progress(TranslationTaskStatus::Success, true, false, 0.2),
+        1.0
+    );
+    assert_eq!(
+        effective_task_progress(TranslationTaskStatus::Running, false, true, 0.0),
+        1.0
+    );
+    assert_eq!(
+        effective_task_progress(TranslationTaskStatus::Running, false, false, 0.25),
+        0.25
+    );
+}
+
+#[test]
+fn execution_mode_validation_covers_translation_and_glossary_only_modes() {
+    assert!(validate_execution_mode(true, false, GlossaryMode::Existing).is_ok());
+    assert!(validate_execution_mode(false, true, GlossaryMode::Auto).is_ok());
+    assert_eq!(
+        validate_execution_mode(false, true, GlossaryMode::Existing).unwrap_err(),
+        "在仅术语表模式下，必须启用自动建立术语表才能创建任务。"
+    );
+    assert_eq!(
+        validate_execution_mode(false, false, GlossaryMode::Existing).unwrap_err(),
+        "翻译和自动建立术语表必须至少启用一项。"
+    );
 }
 
 #[test]
@@ -500,6 +533,7 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
             provider_id: provider.id.clone(),
             model_id: model.id.clone(),
             assistant_id: String::new(),
+            enable_translation: true,
             chunk_token_limit: 800,
             max_concurrency: 3,
             max_retries: 2,
@@ -540,6 +574,7 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
             provider_id: provider.id.clone(),
             model_id: model.id.clone(),
             assistant_id: None,
+            enable_translation: true,
             use_glossary: true,
             glossary_mode: GlossaryMode::Existing,
             glossary_id: Some("glossary-freeze-id".into()),
@@ -681,6 +716,7 @@ async fn create_task_rejects_disabled_translation_provider() {
             provider_id: provider.id,
             model_id: model.id,
             assistant_id: None,
+            enable_translation: true,
             use_glossary: false,
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
@@ -773,6 +809,7 @@ async fn auto_glossary_snapshot_is_frozen_and_legacy_backfill_missing_model_requ
             provider_id: translation_provider.id.clone(),
             model_id: translation_model.id.clone(),
             assistant_id: None,
+            enable_translation: true,
             use_glossary: true,
             glossary_mode: GlossaryMode::Auto,
             glossary_id: None,
@@ -926,6 +963,7 @@ async fn create_task_injects_custom_parameters_only_when_enabled() {
                 provider_id: provider.id.clone(),
                 model_id: model.id.clone(),
                 assistant_id: assistant.id.clone(),
+                enable_translation: true,
                 chunk_token_limit: 800,
                 max_concurrency: 3,
                 max_retries: 2,
@@ -961,6 +999,7 @@ async fn create_task_injects_custom_parameters_only_when_enabled() {
                 provider_id: provider.id.clone(),
                 model_id: model.id.clone(),
                 assistant_id: Some(assistant.id.clone()),
+                enable_translation: true,
                 use_glossary: false,
                 glossary_mode: GlossaryMode::Auto,
                 glossary_id: None,
@@ -1050,6 +1089,7 @@ async fn downgrade_inp_fixture(path: &Path, schema_version: i64) {
         (11, "metadata", "assistant_top_p"),
         (11, "metadata", "glossary_generation_snapshot_json"),
         (11, "metadata", "runtime_action_required_json"),
+        (12, "metadata", "enable_translation"),
     ];
     for (introduced, table, column) in versioned_columns {
         if schema_version < introduced {
@@ -2307,8 +2347,9 @@ async fn default_config_is_seeded() {
     assert_eq!(config.max_tokens_per_minute, DEFAULT_MAX_TOKENS_PER_MINUTE);
     assert_eq!(config.context_handling_mode, ContextHandlingMode::Off);
     assert!(!config.use_global_background);
+    assert!(config.enable_translation);
     assert!(!config.use_glossary);
-    assert_eq!(config.glossary_mode, GlossaryMode::Auto);
+    assert_eq!(config.glossary_mode, GlossaryMode::Existing);
     assert_eq!(config.glossary_id, None);
     assert_eq!(config.confidence_mode, ConfidenceMode::Off);
     assert_eq!(config.pdf_parsing_mode, PdfParsingMode::LocalFirst);
@@ -2359,6 +2400,7 @@ async fn migrates_legacy_defaults_only_once() {
             provider_id: "provider-test".into(),
             model_id: "model-test".into(),
             assistant_id: "assistant-test".into(),
+            enable_translation: true,
             chunk_token_limit: 1200,
             max_concurrency: 4,
             max_retries: 2,
@@ -2618,9 +2660,14 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
         .await
         .expect("publish completed task");
 
-    let reset = reset_task_for_retranslation(&pool, &root, &imported.id)
+    let glossary_root = root.join("glossary-workspace");
+    let glossary_pool = crate::glossaries::connect_config_db(&glossary_root)
         .await
-        .expect("reset retranslation");
+        .expect("glossary config");
+    let reset =
+        reset_task_for_retranslation(&pool, &root, &glossary_pool, &glossary_root, &imported.id)
+            .await
+            .expect("reset retranslation");
 
     assert_eq!(reset.status, TranslationTaskStatus::Pending);
     assert_eq!(reset.progress, 0.0);

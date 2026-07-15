@@ -84,6 +84,7 @@ export interface TranslationConfigView {
   maxTokensPerMinute: number;
   contextHandlingMode: ContextHandlingMode;
   useGlobalBackground?: boolean;
+  enableTranslation: boolean;
   useGlossary: boolean;
   glossaryMode: GlossaryMode;
   glossaryId: string | null;
@@ -133,6 +134,7 @@ export interface CreateTranslationTaskInput {
   providerId: string;
   modelId: string;
   assistantId: string | null;
+  enableTranslation: boolean;
   useGlossary: boolean;
   glossaryMode: GlossaryMode;
   glossaryId: string | null;
@@ -211,6 +213,8 @@ export interface TranslationTaskView {
   modelId: string;
   modelRequestName: string;
   assistantId: string | null;
+  enableTranslation: boolean;
+  glossaryId: string | null;
   tags: string[];
   totalChunks: number;
   completedChunks: number;

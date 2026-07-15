@@ -766,6 +766,7 @@ pub async fn update_glossary(
 pub async fn delete_glossary(state: State<'_, AppState>, id: String) -> Result<(), String> {
     glossaries::delete_glossary(
         &state.glossary_config_pool,
+        &state.translation_config_pool,
         &state.glossary_workspace_root,
         &id,
     )

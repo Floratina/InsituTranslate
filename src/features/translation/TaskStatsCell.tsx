@@ -113,6 +113,24 @@ function taskStatsLine(task: TranslationTaskView): TaskStatsLine {
     };
   }
 
+  if (!task.enableTranslation && task.status === "success") {
+    return {
+      key: "glossary-success",
+      mode: "normal",
+      text: "术语表建立完成",
+      severity: "muted",
+    };
+  }
+
+  if (!task.enableTranslation) {
+    return {
+      key: "glossary-only",
+      mode: "normal",
+      text: "仅建立自动术语表",
+      severity: "muted",
+    };
+  }
+
   return {
     key: "normal",
     mode: "normal",
@@ -134,7 +152,10 @@ function taskStatsRollDirection(
 export function TaskStatsCell({ task }: TaskStatsCellProps) {
   const line = taskStatsLine(task);
   const glossary = glossaryProgressStep(task);
-  const displayedProgress = glossary?.percent ?? task.progress;
+  const displayedProgress = task.status === "success"
+    || (!task.enableTranslation && task.progressDetail?.glossary.state === "success")
+    ? 1
+    : (glossary?.percent ?? task.progress);
   const direction = taskStatsRollDirection(line.mode);
 
   return (

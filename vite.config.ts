@@ -12,6 +12,7 @@ export default defineConfig({
     },
   },
   clearScreen: false,
+  // Keep the Vite development server aligned with Tauri's development URL.
   server: {
     host: "127.0.0.1",
     port: 1420,

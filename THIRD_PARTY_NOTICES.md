@@ -1,5 +1,8 @@
 # Third-Party Notices
 
+This file lists third-party code used by InsituTranslate and its associated
+license notices.
+
 ## vscode-unify-chat-provider
 
 Portions of the provider feature matrix, reasoning parameter mapping, message

@@ -6,7 +6,11 @@
     <title>InsituTranslate</title>
     <script>
       (() => {
-        const defaults = { colorMode: "system", themeId: "sky", fontFamily: "system" };
+        const defaults = {
+          colorMode: "system",
+          themeId: "sky",
+          fontFamily: "system",
+        };
         try {
           const stored = JSON.parse(localStorage.getItem("insitu-appearance-v1") || "null");
           const value = stored && typeof stored === "object" ? { ...defaults, ...stored } : defaults;

@@ -1,41 +1,42 @@
 # InsituTranslate
 
+English | 简体中文
 
-> <mark style="background:rgba(5, 117, 197, 0.2)">此项目仍然在开发中，很多功能尚不完善。</mark>
+> <mark style="background:rgba(5, 117, 197, 0.2)">This project is still under development, and many features are not yet complete.</mark>
 
-InsituTranslate 是一款**正在开发中**的本地桌面文档翻译工具，基于 Tauri 2、React、TypeScript 和 Rust 构建。
+InsituTranslate is a local desktop document translation tool built with Tauri 2, React, TypeScript, and Rust.
 
-项目的核心目标是：在翻译文档内容的同时，尽可能保留原文件的格式、结构、样式和非文本数据，并将翻译结果重新写回对应格式。
+The core objective of the project is to preserve the original file’s formatting, structure, styles, and non-textual data as much as possible while translating its content, and then write the translated text back into the corresponding format.
 
-> 当前版本：0.1.0  
-> 项目状态：开发中  
-> 当前主要开发平台：Windows
+> Current version: 0.1.0  
+> Project status: Under development  
+> Primary development platform: Windows
 
-## 功能简介
+## Features
 
-### 多格式文档翻译
+### Multi-format Document Translation
 
-目前支持导入以下格式：
+The following formats can currently be imported:
 
-| 格式 | 当前处理方式 |
+| Format | Current Processing Method |
 | --- | --- |
-| PDF | 使用 `pdf_oxide` 本地解析或 MinerU 解析为 Markdown；当前导出格式为 Markdown |
-| Markdown | 翻译文本并保留标题、列表、链接、强调等 Markdown 结构 |
-| EPUB | 解析内部 HTML/XHTML 页面，翻译后重新打包 |
-| HTML / HTM | 翻译文档文本内容并保留标签及页面结构 |
-| TXT | 直接进行纯文本翻译 |
-| DOCX | 修改目标 Word XML 文本节点，尽量保留样式、关系、媒体和文档结构 |
-| XLSX | 当前主要翻译 `sharedStrings.xml` 中的共享字符串，不修改工作表公式与布局 |
-| JSON | 翻译 JSON 中的文本内容并保留数据结构 |
-| SRT | 保留字幕序号和时间轴，只翻译字幕文本 |
-| ASS | 保留样式头、时间信息和事件属性 |
-| LRC | 保留歌词时间标签，只翻译歌词内容 |
+| PDF | Parsed locally with `pdf_oxide` or converted to Markdown through MinerU; currently exported as Markdown |
+| Markdown | Translates text while preserving Markdown structures such as headings, lists, links, and emphasis |
+| EPUB | Parses internal HTML/XHTML pages and repackages them after translation |
+| HTML / HTM | Translates document text while preserving tags and page structure |
+| TXT | Performs direct plain-text translation |
+| DOCX | Modifies targeted Word XML text nodes while preserving styles, relationships, media, and document structure as much as possible |
+| XLSX | Currently translates shared strings in `sharedStrings.xml` without modifying worksheet formulas or layout |
+| JSON | Translates textual content while preserving the JSON data structure |
+| SRT | Preserves subtitle indices and timelines while translating only subtitle text |
+| ASS | Preserves style headers, timing information, and event properties |
+| LRC | Preserves lyric timestamps while translating only lyric text |
 
-支持一次批量添加多个文件，每个文件会创建为独立翻译任务。
+Multiple files can be added in a single batch. Each file is created as an independent translation task.
 
-### 翻译提供商
+### Translation Providers
 
-后端目前支持以下协议：
+The backend currently supports the following protocols:
 
 - OpenAI Chat Completions
 - OpenAI Responses
@@ -43,54 +44,54 @@ InsituTranslate 是一款**正在开发中**的本地桌面文档翻译工具，
 - Gemini API
 - Google Vertex AI
 - Ollama Chat
-- OpenAI 兼容接口及自定义 Base URL
-- MinerU PDF 解析服务
+- OpenAI-compatible APIs and custom Base URLs
+- MinerU PDF parsing services
 
-API Key、服务账号和自定义请求头由 Rust 后端处理，不应写入前端源码或提交到 Git 仓库。
+API keys, service accounts, and custom request headers are handled by the Rust backend. They should not be written into frontend source code or committed to the Git repository.
 
-### 翻译任务管理
+### Translation Task Management
 
-- 创建和批量管理翻译任务
-- 任务开始、暂停、继续和重新翻译
-- 实时查看解析、分块、翻译和恢复进度
-- 配置最大并发数、重试次数和失败比例阈值
-- 动态请求速率与 Token 速率限制
-- 按名称、标签、语言或模型检索任务
-- 编辑任务名称和标签
-- 导入、导出 `.inp` 任务文件
-- 将完成的任务导出为对应文档格式
+- Create and manage translation tasks in batches
+- Start, pause, resume, and retranslate tasks
+- View parsing, chunking, translation, and restoration progress in real time
+- Configure maximum concurrency, retry attempts, and failure percentage thresholds
+- Dynamic request-rate and token-rate limiting
+- Search tasks by name, tag, language, or model
+- Edit task names and tags
+- Import and export `.inp` task files
+- Export completed tasks to their corresponding document formats
 
-### 翻译配置
+### Translation Configuration
 
-- 源语言自动检测或手动选择
-- 目标语言选择
-- 自定义单块 Token 数
-- 无上下文、串行滑动窗口、并行滑动窗口和全局背景等上下文模式
-- 模型推理强度配置
-- 模型联网搜索配置
-- 自定义模型请求参数
-- 规则校对与翻译置信度检测配置
+- Automatic source language detection or manual selection
+- Target language selection
+- Custom token count per chunk
+- Context modes including no context, serial sliding window, parallel sliding window, and global background context
+- Model reasoning effort configuration
+- Model web search configuration
+- Custom model request parameters
+- Rule-based proofreading and translation confidence detection configuration
 
-### 术语表
+### Glossaries
 
-- 导入 CSV 或 JSON 术语表
-- 管理、搜索、排序和分页查看术语
-- 新增、编辑和删除术语
-- 导出 CSV 或 JSON
-- 将已有术语表应用到翻译任务
-- 使用模型自动建立任务术语表
-- 为自动术语表配置独立的模型、并发数、重试次数和失败阈值
+- Import CSV or JSON glossaries
+- Manage, search, sort, and browse glossary entries with pagination
+- Create, edit, and delete glossary entries
+- Export as CSV or JSON
+- Apply existing glossaries to translation tasks
+- Automatically generate task glossaries using a model
+- Configure an independent model, concurrency limit, retry count, and failure threshold for automatic glossary generation
 
-CSV 术语表必须只包含以下两列：
+CSV glossaries must contain only the following two columns:
 
 ```csv
 src,dst
 source term,target term
-````
-
-JSON 术语表使用类似结构：
-
 ```
+
+JSON glossaries use a structure similar to the following:
+
+```json
 [
   {
     "src": "source term",
@@ -99,42 +100,42 @@ JSON 术语表使用类似结构：
 ]
 ```
 
-### 其他功能
+### Other Features
 
-- 自定义翻译助手和系统提示词
-- 自定义助手请求参数
-- 浅色、深色和跟随系统模式
-- 内置主题及自定义主题色
-- 系统字体选择
-- 后端日志记录和 PowerShell 实时日志控制台
+- Custom translation assistants and system prompts
+- Custom assistant request parameters
+- Light, dark, and system color modes
+- Built-in themes and custom theme colors
+- System font selection
+- Backend logging and a real-time PowerShell log console
 
-## 当前开发状态
+## Current Development Status
 
-InsituTranslate 仍处于开发阶段，部分功能尚未完成：
+InsituTranslate is still under development, and some features have not yet been completed:
 
-- PDF 可以完成文本提取和翻译，但暂未实现最终 PDF 原格式重建，当前导出为 Markdown。
-- 校对页面目前只按任务分块顺序显示原文和译文，尚未接入可编辑校对器及格式化预览。
-- 安装包生成目前没有启用，Tauri 配置中的 `bundle.active` 为 `false`。
-- 不同文档软件和文件生成器产生的 DOCX、XLSX、EPUB 文件可能存在兼容性差异。
-- XLSX 当前仅处理共享字符串，使用内联字符串或其他存储方式的文本可能不会被翻译。
-- 项目接口和 `.inp` 任务格式仍可能在后续开发中调整。
+- PDF text can be extracted and translated, but reconstruction into the original PDF format has not yet been implemented. PDF tasks are currently exported as Markdown.
+- The proofreading page currently displays source and translated text in task chunk order. An editable proofreading interface and formatted preview have not yet been implemented.
+- Installer generation is currently disabled. `bundle.active` is set to `false` in the Tauri configuration.
+- DOCX, XLSX, and EPUB files generated by different applications or file generators may have compatibility differences.
+- XLSX processing currently supports only shared strings. Text stored as inline strings or through other storage methods may not be translated.
+- Project APIs and the `.inp` task format may continue to change during future development.
 
-不建议当前版本直接用于不可恢复的重要文件。请始终保留原文件备份。
+The current version is not recommended for irreplaceable or unrecoverable files. Always keep a backup of the original file.
 
-## 技术栈
+## Technology Stack
 
-### 前端
+### Frontend
 
 - React
 - TypeScript
 - Vite
 - Tailwind CSS
-- shadcn/ui 风格组件
+- shadcn/ui-style components
 - Radix UI
 - Motion
 - Lucide React
 
-### 后端
+### Backend
 
 - Tauri 2
 - Rust
@@ -147,176 +148,176 @@ InsituTranslate 仍处于开发阶段，部分功能尚未完成：
 - lib-epub
 - quick-xml
 
-## 开发环境要求
+## Development Environment Requirements
 
-当前仓库的启动配置以 Windows 为主。
+The current repository configuration is primarily intended for Windows.
 
-建议安装：
+Recommended software:
 
 - Git
-- Node.js 24 或兼容版本
+- Node.js 24 or a compatible version
 - pnpm 10.12.1
-- Rust stable 工具链
+- Rust stable toolchain
 - Microsoft Visual Studio 2022 Build Tools
 - Windows SDK
 - Microsoft Edge WebView2 Runtime
 - PowerShell 7
 
-安装 Visual Studio Build Tools 时，请选择：
+When installing Visual Studio Build Tools, select:
 
 - Desktop development with C++
 - MSVC C++ Build Tools
-- Windows 10 或 Windows 11 SDK
+- Windows 10 or Windows 11 SDK
 
-Rust 推荐通过 rustup 安装：
+Installing Rust through rustup is recommended:
 
-```
+```powershell
 winget install Rustlang.Rustup
 ```
 
-安装完成后重新打开 PowerShell，并检查：
+After installation, reopen PowerShell and verify the installation:
 
-```
+```powershell
 rustc --version
 cargo --version
 ```
 
-安装 pnpm：
+Install pnpm:
 
-```
+```powershell
 corepack enable
 corepack prepare pnpm@10.12.1 --activate
 ```
 
-如果当前 Node.js 环境不包含 Corepack，也可以使用：
+If the current Node.js environment does not include Corepack, you can use:
 
-```
+```powershell
 npm install --global pnpm@10.12.1
 ```
 
-## 克隆和启动
+## Clone and Run
 
-### 1. 克隆仓库
+### 1. Clone the Repository
 
-```
+```powershell
 git clone https://github.com/Floratina/InsituTranslate.git
 Set-Location InsituTranslate
 ```
 
-### 2. 检查开发环境
+### 2. Check the Development Environment
 
-```
+```powershell
 node --version
 pnpm --version
 rustc --version
 cargo --version
 ```
 
-### 3. 安装前端依赖
+### 3. Install Frontend Dependencies
 
-推荐根据锁文件安装：
+Installing according to the lockfile is recommended:
 
-```
+```powershell
 pnpm install --frozen-lockfile
 ```
 
-如果正在主动更新依赖，可以使用：
+If you are actively updating dependencies, use:
 
-```
+```powershell
 pnpm install
 ```
 
-### 4. 启动桌面开发环境
+### 4. Start the Desktop Development Environment
 
-```
+```powershell
 pnpm tauri dev
 ```
 
-首次启动时，Cargo 需要下载和编译 Rust 依赖，因此耗时会明显长于后续启动。
+During the first launch, Cargo needs to download and compile Rust dependencies, so it will take noticeably longer than subsequent launches.
 
-只启动 Vite 前端可以使用：
+To start only the Vite frontend, use:
 
-```
+```powershell
 pnpm dev
 ```
 
-但浏览器环境无法完整使用文件选择、数据库、翻译任务和其他 Tauri 后端功能。完整开发应使用 `pnpm tauri dev`。
+However, the browser environment cannot fully access file selection, databases, translation tasks, or other Tauri backend features. Full development should use `pnpm tauri dev`.
 
-## 首次启动后的配置
+## Configuration After First Launch
 
-### 1. 添加翻译提供商
+### 1. Add a Translation Provider
 
-进入「提供商」页面：
+Open the “Providers” page:
 
-1. 添加提供商。
-2. 选择对应协议。
-3. 填写 Base URL。
-4. 在应用内设置 API Key。
-5. 获取远程模型或手动添加模型。
-6. 使用连接测试确认模型可用。
-7. 启用需要使用的提供商和模型。
+1. Add a provider.
+2. Select the corresponding protocol.
+3. Enter the Base URL.
+4. Set the API Key within the application.
+5. Fetch remote models or add a model manually.
+6. Use the connectivity test to confirm that the model is available.
+7. Enable the providers and models you want to use.
 
-对于 OpenAI 兼容服务，通常选择 OpenAI Chat Completions 或 OpenAI Responses，并填写服务商提供的 Base URL。
+For OpenAI-compatible services, select OpenAI Chat Completions or OpenAI Responses and enter the Base URL provided by the service provider.
 
-如果使用本地 Ollama，需要先启动 Ollama 服务并下载对应模型。
+When using a local Ollama instance, start the Ollama service and download the required model first.
 
-### 2. 配置 PDF 解析
+### 2. Configure PDF Parsing
 
-普通文本型 PDF 可以使用本地 `pdf_oxide` 解析，不需要 MinerU。
+Standard text-based PDFs can be parsed locally with `pdf_oxide` and do not require MinerU.
 
-扫描件或本地解析效果不理想的 PDF，可以在「提供商」页面配置 MinerU，然后选择：
+For scanned PDFs or PDFs that cannot be parsed well locally, configure MinerU on the “Providers” page and then select one of the following options:
 
-- 优先本地解析
-- 优先 MinerU
-- 仅本地解析
-- 仅 MinerU
+- Prefer local parsing
+- Prefer MinerU
+- Local parsing only
+- MinerU only
 
-没有配置 MinerU 时，请避免选择「仅 MinerU」。
+If MinerU has not been configured, avoid selecting “MinerU only.”
 
-### 3. 创建翻译助手
+### 3. Create a Translation Assistant
 
-进入「助手」页面，可以配置：
+Open the “Assistants” page to configure:
 
-- 助手名称和图标
-- 系统提示词
-- 自定义模型请求参数
-- 助手启用状态
+- Assistant name and icon
+- System prompt
+- Custom model request parameters
+- Assistant enabled status
 
-### 4. 创建翻译任务
+### 4. Create a Translation Task
 
-进入「开始」页面：
+Open the “Start” page:
 
-1. 选择源语言和目标语言。
-2. 选择翻译提供商、模型和助手。
-3. 根据需要选择术语表。
-4. 配置 Token 分块、并发数、重试次数和上下文模式。
-5. 拖入或选择文档。
-6. 创建任务。
-7. 前往「任务」页面开始翻译并查看进度。
+1. Select the source and target languages.
+2. Select the translation provider, model, and assistant.
+3. Select a glossary if required.
+4. Configure token chunking, concurrency, retry attempts, and context mode.
+5. Drag in or select a document.
+6. Create the task.
+7. Open the “Tasks” page to start the translation and view its progress.
 
-## 构建与检查
+## Build and Verification
 
-### 前端类型检查和构建
+### Frontend Type Checking and Build
 
-```
+```powershell
 pnpm build
 ```
 
-### Rust 测试
+### Rust Tests
 
-```
+```powershell
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-### 构建 Tauri Release
+### Build a Tauri Release
 
-```
+```powershell
 pnpm tauri build
 ```
 
-当前 `src-tauri/tauri.conf.json` 中：
+The current `src-tauri/tauri.conf.json` contains:
 
-```
+```json
 {
   "bundle": {
     "active": false
@@ -324,39 +325,39 @@ pnpm tauri build
 }
 ```
 
-因此当前配置主要生成 Release 程序，不生成 MSI、NSIS 等安装包。Release 构建结果位于：
+Therefore, the current configuration primarily generates a release application and does not generate installers such as MSI or NSIS packages. Release build output is located in:
 
-```
+```text
 src-tauri/target/release/
 ```
 
-如需发布安装包，需要先补充签名、图标、安装器和更新策略，并启用 Tauri Bundle。
+To publish an installer, signing, icons, installer configuration, and an update strategy must first be completed, and Tauri Bundle must be enabled.
 
-## 项目结构
+## Project Structure
 
-```
+```text
 InsituTranslate/
-├─ public/                       静态资源和提供商图标
+├─ public/                       Static assets and provider icons
 ├─ src/
 │  ├─ components/
-│  │  ├─ layout/                 应用框架和标题栏
-│  │  └─ ui/                     通用 UI 组件
-│  ├─ features/                  按业务领域划分的前端模块
-│  ├─ lib/                       通用前端工具
-│  ├─ views/                     应用页面
-│  ├─ App.tsx                    页面调度和全局布局入口
-│  └─ main.tsx                   React 入口
+│  │  ├─ layout/                 Application shell and title bar
+│  │  └─ ui/                     Shared UI components
+│  ├─ features/                  Frontend modules organized by domain
+│  ├─ lib/                       Shared frontend utilities
+│  ├─ views/                     Application pages
+│  ├─ App.tsx                    Page orchestration and global layout entry point
+│  └─ main.tsx                   React entry point
 ├─ src-tauri/
-│  ├─ capabilities/              Tauri 权限配置
-│  ├─ icons/                     桌面端图标
+│  ├─ capabilities/              Tauri permission configuration
+│  ├─ icons/                     Desktop application icons
 │  ├─ src/
-│  │  ├─ document_parsing/       文档解析与格式恢复
-│  │  ├─ translation/            翻译任务与调度管线
-│  │  ├─ adapters.rs             模型提供商协议适配
-│  │  ├─ commands.rs             Tauri IPC 命令
-│  │  ├─ db.rs                   提供商数据库
-│  │  ├─ glossaries.rs           术语表管理
-│  │  └─ settings.rs             应用设置
+│  │  ├─ document_parsing/       Document parsing and format restoration
+│  │  ├─ translation/            Translation tasks and scheduling pipeline
+│  │  ├─ adapters.rs             Model provider protocol adapters
+│  │  ├─ commands.rs             Tauri IPC commands
+│  │  ├─ db.rs                   Provider database
+│  │  ├─ glossaries.rs           Glossary management
+│  │  └─ settings.rs             Application settings
 │  ├─ Cargo.toml
 │  └─ tauri.conf.json
 ├─ package.json
@@ -364,17 +365,17 @@ InsituTranslate/
 └─ vite.config.ts
 ```
 
-## 本地数据
+## Local Data
 
-运行后，Tauri 会在应用数据目录中保存本地数据。Windows 下通常位于：
+After the application starts, Tauri stores local data in the application data directory. On Windows, this is usually located at:
 
-```
+```text
 %APPDATA%\com.insitutranslate.desktop\
 ```
 
-主要内容包括：
+The main contents include:
 
-```
+```text
 providers.sqlite3
 settings.sqlite3
 translation-workspace/
@@ -382,36 +383,36 @@ glossary-workspace/
 logs/backend.log
 ```
 
-这些文件属于本地运行数据，不应提交到 Git。
+These files contain local runtime data and should not be committed to Git.
 
-删除应用数据目录会导致本地提供商配置、任务索引、术语表和界面设置丢失。进行数据库或任务格式开发前，请先备份该目录。
+Deleting the application data directory will remove local provider configurations, task indexes, glossaries, and interface settings. Back up this directory before working on the database or task format.
 
-## 开发注意事项
+## Development Notes
 
-- 使用 `pnpm`，不要混用 npm、Yarn 或其他锁文件。
-- 动画组件从 `motion/react` 导入，不要安装旧的 `framer-motion` 包。
-- 外部翻译 API 请求必须由 Rust 后端执行。
-- 不要在 React、TypeScript 或前端环境变量中存放 API Key。
-- 修改文档格式解析器时，必须验证翻译后文件仍可被对应软件正常打开。
-- DOCX 和 XLSX 写回时，应保留原 ZIP/XML 包并只修改目标文本节点。
-- PDF、DOCX、XLSX、EPUB 和字幕格式的修改应同时增加对应测试。
-- `/0_repo_references/` 如果存在，只允许作为参考代码读取，禁止修改或添加路径依赖。
+- Use `pnpm`. Do not mix npm, Yarn, or other lockfiles into the project.
+- Import animation components from `motion/react`. Do not install the legacy `framer-motion` package.
+- Requests to external translation APIs must be performed by the Rust backend.
+- Do not store API keys in React, TypeScript, or frontend environment variables.
+- When modifying a document format parser, verify that the translated file can still be opened normally by the corresponding application.
+- DOCX and XLSX write-back operations should preserve the original ZIP/XML package and modify only targeted text nodes.
+- Changes to PDF, DOCX, XLSX, EPUB, and subtitle processing should include corresponding tests.
+- If `/0_repo_references/` exists, it may only be read as reference code. Do not modify it or add path dependencies pointing to it.
 
-## 非 Windows 平台
+## Non-Windows Platforms
 
-当前 Tauri 配置使用了 Windows 命令：
+The current Tauri configuration uses Windows commands:
 
-```
+```json
 "beforeDevCommand": "pnpm.cmd dev",
 "beforeBuildCommand": "pnpm.cmd build"
 ```
 
-因此 macOS 和 Linux 不能直接使用当前配置启动。跨平台支持需要调整这些命令，并分别配置对应平台的 Tauri 系统依赖、权限、窗口行为和打包流程。
+As a result, macOS and Linux cannot start the project directly with the current configuration. Cross-platform support requires adjusting these commands and configuring the relevant Tauri system dependencies, permissions, window behavior, and packaging process for each platform.
 
-项目中的移动端图标不代表 Android 或 iOS 版本已经完成。
+The presence of mobile platform icons in the project does not mean that Android or iOS versions have been completed.
 
-## 授权说明
+## Licensing
 
-仓库目前未包含 `LICENSE` 文件。
+The repository currently does not include a `LICENSE` file.
 
-在项目作者明确添加开源许可证之前，请不要默认该仓库允许复制、修改、重新发布或商业使用。如需参考或使用代码，请先取得项目作者许可。
+Until the project author explicitly adds an open-source license, do not assume that the repository permits copying, modification, redistribution, or commercial use. Obtain permission from the project author before referencing or using the code.

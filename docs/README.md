@@ -1,6 +1,6 @@
 # InsituTranslate
 
-English | [简体中文](./README.zh-CN.md)
+English | [简体中文](https://github.com/Floratina/InsituTranslate/blob/main/docs/README_zh-CN.md)
 
 > <mark style="background:rgba(5, 117, 197, 0.2)">This project is still under development, and many features are not yet complete.</mark>
 

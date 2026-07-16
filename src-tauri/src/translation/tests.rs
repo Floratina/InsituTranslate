@@ -19,14 +19,16 @@ use super::context::{
     previous_source_context, previous_translation_context, sanitize_file_stem, unix_timestamp,
 };
 use super::db::{
-    apply_chunk_outcome, connect_inp, connect_sqlite, effective_task_progress,
-    effective_translation_concurrency, export_file_name, get_task_from_index, normalize_tags,
-    normalize_task_filters, release_assets_for_export, rendered_task_document, serialize_tags,
-    source_extension, task_failure_thresholds, task_glossary_config, translated_source_text,
-    validate_execution_mode, validate_failure_percentage, validate_inp_file,
-    validate_parsed_task_source, ParsedTaskSource,
+    apply_chunk_outcome, apply_staged_task_execution_snapshot, connect_inp, connect_sqlite,
+    effective_task_progress, effective_translation_concurrency, export_file_name,
+    get_task_from_index, normalize_tags, normalize_task_filters,
+    preprocessing_config_snapshot_json, publish_staged_translation_task, release_assets_for_export,
+    rendered_task_document, serialize_tags, source_extension, task_execution_config,
+    task_failure_thresholds, task_glossary_config, translated_source_text, validate_execution_mode,
+    validate_failure_percentage, validate_inp_file, validate_parsed_task_source, ParsedTaskSource,
 };
 use super::failure_threshold_exceeded;
+use super::glossary::glossary_threshold_failure_reason;
 use super::glossary::TaskGlossaryMatcher;
 use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy};
 use super::request_options::TranslationRequestOptions;
@@ -139,6 +141,18 @@ fn successful_and_completed_glossary_only_tasks_force_full_progress() {
         effective_task_progress(TranslationTaskStatus::Running, false, false, 0.25),
         0.25
     );
+}
+
+#[test]
+fn glossary_failure_threshold_maps_strictly_exceeded_rates_to_failure() {
+    assert!(glossary_threshold_failure_reason(2, 10, 20, "last failure")
+        .expect("equal threshold")
+        .is_none());
+    let reason = glossary_threshold_failure_reason(3, 10, 20, "last failure")
+        .expect("exceeded threshold")
+        .expect("failure reason");
+    assert!(reason.contains("3/10 chunks failed"));
+    assert!(reason.contains("maximum 20%"));
 }
 
 #[test]
@@ -494,6 +508,20 @@ fn translation_task_status_roundtrips_interrupted_pending() {
     );
 }
 
+#[test]
+fn preprocessing_snapshot_contains_only_chunking_inputs() {
+    let snapshot: Value = serde_json::from_str(&preprocessing_config_snapshot_json(
+        800,
+        PdfParsingMode::LocalFirst,
+    ))
+    .expect("preprocessing snapshot");
+    let object = snapshot.as_object().expect("snapshot object");
+
+    assert_eq!(object.len(), 2);
+    assert_eq!(snapshot["chunkTokenLimit"], 800);
+    assert_eq!(snapshot["pdfParsingMode"], "local-first");
+}
+
 #[tokio::test]
 async fn create_task_freezes_glossary_config_in_inp_metadata() {
     let root = temp_root("glossary-freeze");
@@ -523,6 +551,28 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
     )
     .await
     .expect("model");
+    let glossary_provider = app_db::create_provider(
+        &provider_pool,
+        CreateProviderInput {
+            name: "Freeze Glossary Provider".into(),
+            protocol: ProviderProtocol::OpenaiChat,
+            purpose: ProviderPurpose::Glossary,
+            avatar: None,
+        },
+    )
+    .await
+    .expect("glossary provider");
+    let glossary_model = app_db::add_model(
+        &provider_pool,
+        AddModelInput {
+            provider_id: glossary_provider.id.clone(),
+            request_name: "freeze-glossary-model".into(),
+            alias: "Freeze Glossary Model".into(),
+            source: "manual".into(),
+        },
+    )
+    .await
+    .expect("glossary model");
     update_translation_config(
         &config_pool,
         UpdateTranslationConfigInput {
@@ -584,6 +634,18 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
     .await
     .expect("create task");
     let inp_pool = connect_inp(Path::new(&task.inp_path)).await.expect("inp");
+    let chunks_before_publish = sqlx::query_as::<_, (i64, String, String, String)>(
+        "SELECT sequence, map_json, preprocessed_text, source_text FROM chunks ORDER BY sequence",
+    )
+    .fetch_all(&inp_pool)
+    .await
+    .expect("chunks before publish");
+    let metadata_before_failed_publish = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT source_language, target_language, config_snapshot_json FROM metadata LIMIT 1",
+    )
+    .fetch_one(&inp_pool)
+    .await
+    .expect("metadata before failed publish");
     let glossary_config = task_glossary_config(&inp_pool)
         .await
         .expect("glossary config");
@@ -618,6 +680,113 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
     assert_eq!(snapshot["glossaryId"], "glossary-freeze-id");
 
     inp_pool.close().await;
+
+    let publish_error = apply_staged_task_execution_snapshot(
+        &provider_pool,
+        &root,
+        &task.id,
+        Path::new(&task.inp_path),
+        TranslationConfigView {
+            source_language: "ja".into(),
+            target_language: "ko".into(),
+            provider_id: String::new(),
+            model_id: String::new(),
+            enable_translation: true,
+            ..TranslationConfigView::default()
+        },
+    )
+    .await
+    .expect_err("invalid publication config must fail");
+    assert!(publish_error.contains("Provider"));
+    let after_failed_publish = connect_inp(Path::new(&task.inp_path))
+        .await
+        .expect("inp after failed publish");
+    let metadata_after_failed_publish = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT source_language, target_language, config_snapshot_json FROM metadata LIMIT 1",
+    )
+    .fetch_one(&after_failed_publish)
+    .await
+    .expect("metadata after failed publish");
+    assert_eq!(
+        metadata_after_failed_publish,
+        metadata_before_failed_publish
+    );
+    after_failed_publish.close().await;
+
+    let staged = apply_staged_task_execution_snapshot(
+        &provider_pool,
+        &root,
+        &task.id,
+        Path::new(&task.inp_path),
+        TranslationConfigView {
+            source_language: "de".into(),
+            target_language: "pl".into(),
+            chunk_token_limit: 1200,
+            max_concurrency: 7,
+            pdf_parsing_mode: PdfParsingMode::MineruOnly,
+            enable_translation: false,
+            use_glossary: true,
+            glossary_mode: GlossaryMode::Auto,
+            glossary_generation_config: GlossaryGenerationConfig {
+                provider_id: glossary_provider.id,
+                model_id: glossary_model.id,
+                ..GlossaryGenerationConfig::default()
+            },
+            ..TranslationConfigView::default()
+        },
+    )
+    .await
+    .expect("apply staged execution snapshot");
+    assert!(!staged.enable_translation);
+    assert_eq!(staged.source_language, "de");
+    assert_eq!(staged.target_language, "pl");
+    let staged_inp = connect_inp(Path::new(&task.inp_path))
+        .await
+        .expect("staged inp");
+    let staged_glossary = task_glossary_config(&staged_inp)
+        .await
+        .expect("staged glossary config");
+    let staged_snapshot_json: String =
+        sqlx::query_scalar("SELECT config_snapshot_json FROM metadata LIMIT 1")
+            .fetch_one(&staged_inp)
+            .await
+            .expect("staged snapshot");
+    let staged_snapshot: Value =
+        serde_json::from_str(&staged_snapshot_json).expect("staged snapshot json");
+    assert!(staged_glossary.use_glossary);
+    assert_eq!(staged_glossary.glossary_mode, GlossaryMode::Auto);
+    assert!(staged_glossary.glossary_id.is_none());
+    assert_eq!(staged_snapshot["enableTranslation"], false);
+    assert_eq!(staged_snapshot["glossaryMode"], "auto");
+    assert_eq!(staged_snapshot["chunkTokenLimit"], 800);
+    assert_eq!(staged_snapshot["pdfParsingMode"], "local-first");
+    assert_eq!(staged_snapshot["maxConcurrency"], 7);
+    let execution_config = task_execution_config(&staged_inp, &config_pool)
+        .await
+        .expect("task execution config");
+    assert_eq!(execution_config.source_language, "de");
+    assert_eq!(execution_config.target_language, "pl");
+    assert_eq!(execution_config.chunk_token_limit, 800);
+    assert_eq!(
+        execution_config.pdf_parsing_mode,
+        PdfParsingMode::LocalFirst
+    );
+    assert_eq!(execution_config.max_concurrency, 7);
+    let chunks_after_publish = sqlx::query_as::<_, (i64, String, String, String)>(
+        "SELECT sequence, map_json, preprocessed_text, source_text FROM chunks ORDER BY sequence",
+    )
+    .fetch_all(&staged_inp)
+    .await
+    .expect("chunks after publish");
+    assert_eq!(chunks_after_publish, chunks_before_publish);
+    staged_inp.close().await;
+    let published =
+        publish_staged_translation_task(&config_pool, &root, &task.id, Path::new(&task.inp_path))
+            .await
+            .expect("publish staged task");
+    assert_eq!(published.source_language, "de");
+    assert_eq!(published.target_language, "pl");
+    assert!(!published.enable_translation);
 
     replace_task_runtime_snapshot(
         &provider_pool,
@@ -2646,7 +2815,8 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
             input_tokens = 20, output_tokens = 40, total_tokens = 60,
             target_text_tokens = 40, total_text_tokens = 50, last_error = 'old error',
             rate_limit_status = 'limited', active_retry_json = '{}',
-            global_background = 'old background'",
+            global_background = 'old background', use_glossary = 1,
+            glossary_mode = 'auto', glossary_id = 'successful-auto-glossary'",
     )
     .bind(TranslationTaskStatus::Success.as_str())
     .execute(&inp_pool)
@@ -2679,6 +2849,10 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
     assert!(reset.last_error.is_none());
     assert!(reset.rate_limit_status.is_none());
     assert!(reset.active_retry.is_none());
+    assert_eq!(
+        reset.glossary_id.as_deref(),
+        Some("successful-auto-glossary")
+    );
 
     let reset_inp = connect_inp(Path::new(&imported.inp_path))
         .await
@@ -2711,16 +2885,24 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
             && row.get::<i64, _>("total_tokens") == 0
             && row.get::<i64, _>("target_tokens") == 0
     }));
-    let metadata = sqlx::query("SELECT status, global_background FROM metadata LIMIT 1")
-        .fetch_one(&reset_inp)
-        .await
-        .expect("read reset metadata");
+    let metadata =
+        sqlx::query("SELECT status, global_background, glossary_id FROM metadata LIMIT 1")
+            .fetch_one(&reset_inp)
+            .await
+            .expect("read reset metadata");
     assert_eq!(metadata.get::<String, _>("status"), "pending");
     assert_eq!(
         metadata
             .try_get::<Option<String>, _>("global_background")
             .unwrap_or(None),
         None
+    );
+    assert_eq!(
+        metadata
+            .try_get::<Option<String>, _>("glossary_id")
+            .unwrap_or(None)
+            .as_deref(),
+        Some("successful-auto-glossary")
     );
     reset_inp.close().await;
 

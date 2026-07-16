@@ -36,17 +36,18 @@ use super::types::{
 };
 use super::{
     ContextHandlingMode, CreateTranslationTaskInput, ExportTranslationTaskInput, GlossaryMode,
-    ImportTranslationTaskInput, RateLimitStrategy, ReplaceTaskRuntimeSnapshotInput,
-    TaskRuntimeActionReason, TaskRuntimeConfigDomain, TextTokenStats, TokenStats,
-    TranslationChunkStatus, TranslationChunkView, TranslationConfigView,
-    TranslationProgressPayload, TranslationTaskActiveRetry, TranslationTaskDetail,
-    TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskStatus,
-    TranslationTaskView, UpdateTranslationConfigInput, UpdateTranslationTaskInfoInput,
-    UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput, CONFIG_DB_FILE,
-    DEFAULT_CHUNK_TOKEN_LIMIT, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_REQUESTS_PER_MINUTE,
-    DEFAULT_MAX_RETRIES, DEFAULT_MAX_TOKENS_PER_MINUTE, INP_FILE_DAMAGED, INP_SCHEMA_VERSION,
-    MAX_TASK_NAME_LENGTH, MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH, SOURCE_FILE_UNAVAILABLE, TASKS_DIR,
-    TRANSLATION_PROGRESS_EVENT, TRANSLATION_TASK_CREATION_PROGRESS_EVENT,
+    ImportTranslationTaskInput, PreprocessTranslationTaskInput, RateLimitStrategy,
+    ReplaceTaskRuntimeSnapshotInput, TaskRuntimeActionReason, TaskRuntimeConfigDomain,
+    TextTokenStats, TokenStats, TranslationChunkStatus, TranslationChunkView,
+    TranslationConfigView, TranslationProgressPayload, TranslationTaskActiveRetry,
+    TranslationTaskDetail, TranslationTaskExportFormat, TranslationTaskFilters,
+    TranslationTaskStatus, TranslationTaskView, UpdateTranslationConfigInput,
+    UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
+    CONFIG_DB_FILE, DEFAULT_CHUNK_TOKEN_LIMIT, DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_MAX_REQUESTS_PER_MINUTE, DEFAULT_MAX_RETRIES, DEFAULT_MAX_TOKENS_PER_MINUTE,
+    INP_FILE_DAMAGED, INP_SCHEMA_VERSION, MAX_TASK_NAME_LENGTH, MAX_TASK_TAGS, MAX_TASK_TAG_LENGTH,
+    SOURCE_FILE_UNAVAILABLE, TASKS_DIR, TRANSLATION_PROGRESS_EVENT,
+    TRANSLATION_TASK_CREATION_PROGRESS_EVENT,
 };
 
 #[derive(Debug, Clone)]
@@ -1700,6 +1701,10 @@ pub async fn create_translation_task(
     } else {
         None
     };
+    let selected_provider_id = selection
+        .as_ref()
+        .map(|value| value.provider.id.clone())
+        .unwrap_or_else(|| input.provider_id.clone());
     let selected_model_id = selection
         .as_ref()
         .map(|value| value.model.id.clone())
@@ -1757,12 +1762,27 @@ pub async fn create_translation_task(
     };
     let created_at = unix_timestamp();
     let inp_pool = connect_inp(&inp_path).await?;
+    let mut execution_config = config.clone();
+    execution_config.source_language = source_language.clone();
+    execution_config.target_language = target_language.clone();
+    execution_config.provider_id = selected_provider_id.clone();
+    execution_config.model_id = selected_model_id.clone();
+    execution_config.assistant_id = input
+        .assistant_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "__none__".into());
+    execution_config.enable_translation = input.enable_translation;
+    execution_config.use_glossary = task_glossary_config.use_glossary;
+    execution_config.glossary_mode = task_glossary_config.glossary_mode;
+    execution_config.glossary_id = task_glossary_config.glossary_id.clone();
+    execution_config.glossary_generation_config = input.glossary_generation_config.clone();
     let config_snapshot = config_snapshot_json(
-        &config,
-        &input.provider_id,
+        &execution_config,
+        &selected_provider_id,
         &selected_model_id,
         task_failure_thresholds_from_config(
-            &config,
+            &execution_config,
             input.glossary_generation_config.max_failure_percentage,
         ),
     );
@@ -1789,7 +1809,7 @@ pub async fn create_translation_task(
     .bind(&source_language)
     .bind(&target_language)
     .bind(TranslationTaskStatus::Pending.as_str())
-    .bind(&input.provider_id)
+    .bind(&selected_provider_id)
     .bind(&selected_model_id)
     .bind(&selected_model_request_name)
     .bind(
@@ -1913,7 +1933,7 @@ pub async fn create_translation_task_with_progress(
     client: Client,
     config_pool: SqlitePool,
     workspace_root: PathBuf,
-    input: CreateTranslationTaskInput,
+    input: PreprocessTranslationTaskInput,
     client_task_id: String,
     cancel: Arc<AtomicBool>,
 ) -> Result<Option<TranslationTaskView>, String> {
@@ -1992,10 +2012,6 @@ pub async fn create_translation_task_with_progress(
     );
     cancel_creation!();
 
-    let source_language = try_creation!(normalize_source_language(&input.source_language));
-    let target_language = try_creation!(normalize_target_language(&input.target_language));
-    let tags = try_creation!(normalize_tags(input.tags.clone()));
-    let tags_json = try_creation!(serialize_tags(&tags));
     let source_path = PathBuf::from(input.file_path.trim());
     try_creation!(validate_supported_source_file(&source_path));
     cancel_creation!();
@@ -2009,57 +2025,14 @@ pub async fn create_translation_task_with_progress(
     );
     cancel_creation!();
 
-    try_creation!(validate_execution_mode(
-        input.enable_translation,
-        input.use_glossary,
-        input.glossary_mode,
-    ));
-    let selection = if input.enable_translation {
-        Some(try_creation!(
-            resolve_translation_runtime_selection(
-                &provider_pool,
-                &input.provider_id,
-                &input.model_id,
-                input.assistant_id.as_deref(),
-            )
-            .await
-        ))
-    } else {
-        None
+    if !(200..=8000).contains(&input.chunk_token_limit) {
+        fail_creation!("Chunk token limit must be between 200 and 8000".to_string());
+    }
+    let task_glossary_config = TaskGlossaryConfig {
+        use_glossary: false,
+        glossary_mode: GlossaryMode::Existing,
+        glossary_id: None,
     };
-    let selected_model_id = selection
-        .as_ref()
-        .map(|value| value.model.id.clone())
-        .unwrap_or_else(|| input.model_id.clone());
-    let selected_model_request_name = selection
-        .as_ref()
-        .map(|value| value.model.request_name.clone())
-        .unwrap_or_default();
-    let config = try_creation!(get_translation_config(&config_pool).await);
-    let (task_glossary_config, glossary_generation_snapshot) =
-        try_creation!(snapshot_task_glossary_input(&provider_pool, &input).await);
-    let glossary_generation_snapshot_json = try_creation!(serialize_glossary_generation_snapshot(
-        glossary_generation_snapshot.as_ref()
-    ));
-    let (assistant_prompt, assistant_custom_parameters, assistant_temperature, assistant_top_p) =
-        match selection.and_then(|value| value.assistant) {
-            Some(assistant) => {
-                let custom_parameters = if config.use_custom_parameters {
-                    assistant.custom_parameters.clone()
-                } else {
-                    json!({})
-                };
-                (
-                    Some(assistant.system_prompt),
-                    custom_parameters,
-                    assistant
-                        .temperature_enabled
-                        .then_some(assistant.temperature),
-                    assistant.top_p_enabled.then_some(assistant.top_p),
-                )
-            }
-            None => (None, json!({}), None, None),
-        };
     let task_id = app_db::new_id("task");
     task_id_for_cleanup = Some(task_id.clone());
     let display_name = display_name_from_path(&source_path);
@@ -2111,8 +2084,8 @@ pub async fn create_translation_task_with_progress(
             &client,
             &task_id,
             materialized_source.path(),
-            config.chunk_token_limit,
-            config.pdf_parsing_mode,
+            input.chunk_token_limit,
+            input.pdf_parsing_mode,
             Some(&mut emit_parse_progress),
         )
         .await
@@ -2149,30 +2122,12 @@ pub async fn create_translation_task_with_progress(
         None,
     );
 
-    let global_background = if config.context_handling_mode == ContextHandlingMode::GlobalBackground
-    {
-        Some(global_background_from_texts(
-            parsed_source
-                .chunks
-                .iter()
-                .map(|chunk| chunk.source_text.as_str()),
-        ))
-    } else {
-        None
-    };
     cancel_creation!();
 
     let created_at = unix_timestamp();
     let inp_pool = try_creation!(connect_inp(&inp_path).await);
-    let config_snapshot = config_snapshot_json(
-        &config,
-        &input.provider_id,
-        &selected_model_id,
-        task_failure_thresholds_from_config(
-            &config,
-            input.glossary_generation_config.max_failure_percentage,
-        ),
-    );
+    let config_snapshot =
+        preprocessing_config_snapshot_json(input.chunk_token_limit, input.pdf_parsing_mode);
     let progress_detail = progress_detail_for_config(total_chunks, 0, &task_glossary_config);
     let progress_detail_json = try_creation!(serialize_progress_detail(Some(&progress_detail)));
     let mut transaction = try_creation!(inp_pool.begin().await.map_err(|error| error.to_string()));
@@ -2193,34 +2148,28 @@ pub async fn create_translation_task_with_progress(
         .bind(INP_SCHEMA_VERSION)
         .bind(&display_name)
         .bind(source_path.to_string_lossy().to_string())
-        .bind(&source_language)
-        .bind(&target_language)
+        .bind("")
+        .bind("")
         .bind(TranslationTaskStatus::Pending.as_str())
-        .bind(&input.provider_id)
-        .bind(&selected_model_id)
-        .bind(&selected_model_request_name)
-        .bind(
-            input
-                .enable_translation
-                .then_some(input.assistant_id.as_deref())
-                .flatten()
-                .filter(|value| !value.is_empty()),
-        )
-        .bind(assistant_prompt.as_deref())
-        .bind(assistant_custom_parameters.to_string())
-        .bind(assistant_temperature)
-        .bind(assistant_top_p)
-        .bind(input.enable_translation)
+        .bind("")
+        .bind("")
+        .bind("")
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
+        .bind("{}")
+        .bind(Option::<f64>::None)
+        .bind(Option::<f64>::None)
+        .bind(false)
         .bind(task_glossary_config.use_glossary)
         .bind(task_glossary_config.glossary_mode.as_str())
         .bind(task_glossary_config.glossary_id.as_deref())
-        .bind(tags_json)
-        .bind(config.chunk_token_limit)
-        .bind(config.max_concurrency)
-        .bind(config.max_retries)
+        .bind("[]")
+        .bind(input.chunk_token_limit)
+        .bind(0)
+        .bind(0)
         .bind(config_snapshot)
-        .bind(glossary_generation_snapshot_json)
-        .bind(global_background.as_deref())
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
         .bind(total_chunks as i64)
         .bind(progress_detail_json)
         .bind(&created_at)
@@ -2323,6 +2272,114 @@ pub async fn publish_staged_translation_task(
     let task = refresh_task_stats(&inp_pool, config_pool, inp_path, None).await?;
     inp_pool.close().await;
     Ok(task)
+}
+
+pub async fn apply_staged_task_execution_snapshot(
+    provider_pool: &SqlitePool,
+    workspace_root: &Path,
+    task_id: &str,
+    inp_path: &Path,
+    config: TranslationConfigView,
+) -> Result<TranslationTaskView, String> {
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Refusing to update a staged task outside the workspace".into());
+    }
+    let snapshot = resolve_task_runtime_snapshot(provider_pool, config).await?;
+    let inp_pool = connect_inp(inp_path).await?;
+    let stored = metadata_task(&inp_pool, inp_path).await?;
+    if stored.id != task_id {
+        inp_pool.close().await;
+        return Err("Staged task identity does not match its task file".into());
+    }
+    let preprocessing_row =
+        sqlx::query("SELECT token_limit, config_snapshot_json FROM metadata WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(&inp_pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    let mut effective_config = snapshot.config.clone();
+    effective_config.chunk_token_limit = preprocessing_row.get("token_limit");
+    let preprocessing_snapshot: Value = serde_json::from_str(
+        preprocessing_row
+            .get::<String, _>("config_snapshot_json")
+            .as_str(),
+    )
+    .map_err(|error| format!("Stored preprocessing config snapshot is invalid: {error}"))?;
+    effective_config.pdf_parsing_mode = serde_json::from_value(
+        preprocessing_snapshot
+            .get("pdfParsingMode")
+            .cloned()
+            .ok_or_else(|| "Stored preprocessing PDF parsing mode is missing".to_string())?,
+    )
+    .map_err(|error| format!("Stored preprocessing PDF parsing mode is invalid: {error}"))?;
+    let total_chunks = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chunks")
+        .fetch_one(&inp_pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .max(0) as u64;
+    let progress_detail = progress_detail_for_config(total_chunks, 0, &snapshot.glossary_config);
+    let progress_detail_json = serialize_progress_detail(Some(&progress_detail))?;
+    let config_snapshot = config_snapshot_json(
+        &effective_config,
+        &snapshot.provider_id,
+        &snapshot.model_id,
+        task_failure_thresholds_from_config(
+            &effective_config,
+            effective_config
+                .glossary_generation_config
+                .max_failure_percentage,
+        ),
+    );
+    let now = unix_timestamp();
+    let update = sqlx::query(
+        "UPDATE metadata SET
+            source_language = ?, target_language = ?, provider_id = ?, model_id = ?,
+            model_request_name = ?, assistant_id = ?,
+            assistant_system_prompt = ?, assistant_custom_parameters_json = ?,
+            assistant_temperature = ?, assistant_top_p = ?, enable_translation = ?,
+            use_glossary = ?, glossary_mode = ?, glossary_id = ?, max_concurrency = ?,
+            max_retries = ?, glossary_generation_snapshot_json = ?, config_snapshot_json = ?,
+            global_background = NULL, progress_detail_json = ?, updated_at = ?
+         WHERE task_id = ? AND status = ?",
+    )
+    .bind(&snapshot.config.source_language)
+    .bind(&snapshot.config.target_language)
+    .bind(&snapshot.provider_id)
+    .bind(&snapshot.model_id)
+    .bind(&snapshot.model_request_name)
+    .bind(snapshot.assistant_id.as_deref())
+    .bind(snapshot.assistant_system_prompt.as_deref())
+    .bind(&snapshot.assistant_custom_parameters_json)
+    .bind(snapshot.assistant_temperature)
+    .bind(snapshot.assistant_top_p)
+    .bind(snapshot.config.enable_translation)
+    .bind(snapshot.glossary_config.use_glossary)
+    .bind(snapshot.glossary_config.glossary_mode.as_str())
+    .bind(
+        if snapshot.glossary_config.glossary_mode == GlossaryMode::Auto {
+            None
+        } else {
+            snapshot.glossary_config.glossary_id.as_deref()
+        },
+    )
+    .bind(snapshot.config.max_concurrency)
+    .bind(snapshot.config.max_retries)
+    .bind(snapshot.glossary_generation_snapshot_json)
+    .bind(config_snapshot)
+    .bind(progress_detail_json)
+    .bind(&now)
+    .bind(task_id)
+    .bind(TranslationTaskStatus::Pending.as_str())
+    .execute(&inp_pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if update.rows_affected() != 1 {
+        inp_pool.close().await;
+        return Err("Staged task is no longer pending and cannot be published".into());
+    }
+    let updated = metadata_task(&inp_pool, inp_path).await?;
+    inp_pool.close().await;
+    Ok(updated)
 }
 
 pub async fn discard_staged_translation_task(
@@ -2731,8 +2788,8 @@ pub async fn get_task_runtime_action_required(
         let glossary_snapshot = match task_glossary_generation_snapshot(&inp_pool).await? {
             Some(snapshot) => Some(snapshot),
             None => {
-                let fallback_config = get_translation_config(config_pool).await?;
-                let fallback_generation = &fallback_config.glossary_generation_config;
+                let task_config = task_execution_config(&inp_pool, config_pool).await?;
+                let fallback_generation = &task_config.glossary_generation_config;
                 if runtime_selection_is_missing(
                     provider_pool,
                     ProviderPurpose::Glossary,
@@ -2745,12 +2802,8 @@ pub async fn get_task_runtime_action_required(
                     missing_domains.push(TaskRuntimeConfigDomain::Glossary);
                     None
                 } else {
-                    ensure_task_glossary_generation_snapshot(
-                        &inp_pool,
-                        provider_pool,
-                        &fallback_config,
-                    )
-                    .await?
+                    ensure_task_glossary_generation_snapshot(&inp_pool, provider_pool, &task_config)
+                        .await?
                 }
             }
         };
@@ -2814,19 +2867,26 @@ pub async fn get_task_runtime_action_required(
     Ok(stored)
 }
 
-pub async fn replace_task_runtime_snapshot(
+struct ResolvedTaskRuntimeSnapshot {
+    config: TranslationConfigView,
+    provider_id: String,
+    model_id: String,
+    model_request_name: String,
+    assistant_id: Option<String>,
+    assistant_system_prompt: Option<String>,
+    assistant_custom_parameters_json: String,
+    assistant_temperature: Option<f64>,
+    assistant_top_p: Option<f64>,
+    glossary_config: TaskGlossaryConfig,
+    glossary_generation_snapshot_json: Option<String>,
+}
+
+async fn resolve_task_runtime_snapshot(
     provider_pool: &SqlitePool,
-    config_pool: &SqlitePool,
-    workspace_root: &Path,
-    input: ReplaceTaskRuntimeSnapshotInput,
-) -> Result<TranslationTaskView, String> {
-    let config = normalize_translation_config(input.config);
+    config: TranslationConfigView,
+) -> Result<ResolvedTaskRuntimeSnapshot, String> {
+    let mut config = normalize_translation_config(config);
     validate_translation_config_runtime(provider_pool, &config).await?;
-    let indexed = get_task_from_index(config_pool, &input.task_id).await?;
-    let inp_path = PathBuf::from(&indexed.inp_path);
-    if !inp_path.starts_with(workspace_root) {
-        return Err("Task file is outside the configured workspace".into());
-    }
     let translation_selection = if config.enable_translation {
         Some(
             resolve_translation_runtime_selection(
@@ -2889,15 +2949,60 @@ pub async fn replace_task_runtime_snapshot(
     } else {
         None
     };
-    let glossary_snapshot_json =
+    let glossary_generation_snapshot_json =
         serialize_glossary_generation_snapshot(glossary_snapshot.as_ref())?;
+    let assistant_system_prompt = assistant.as_ref().map(|value| value.system_prompt.clone());
+    let assistant_temperature = assistant
+        .as_ref()
+        .filter(|value| value.temperature_enabled)
+        .map(|value| value.temperature);
+    let assistant_top_p = assistant
+        .as_ref()
+        .filter(|value| value.top_p_enabled)
+        .map(|value| value.top_p);
+    config.provider_id = provider_id.clone();
+    config.model_id = model_id.clone();
+    config.assistant_id = assistant_id.clone().unwrap_or_else(|| "__none__".into());
+    config.use_glossary = glossary_config.use_glossary;
+    config.glossary_mode = glossary_config.glossary_mode;
+    config.glossary_id = glossary_config.glossary_id.clone();
+    Ok(ResolvedTaskRuntimeSnapshot {
+        config,
+        provider_id,
+        model_id,
+        model_request_name,
+        assistant_id,
+        assistant_system_prompt,
+        assistant_custom_parameters_json: translation_custom_parameters.to_string(),
+        assistant_temperature,
+        assistant_top_p,
+        glossary_config,
+        glossary_generation_snapshot_json,
+    })
+}
+
+pub async fn replace_task_runtime_snapshot(
+    provider_pool: &SqlitePool,
+    config_pool: &SqlitePool,
+    workspace_root: &Path,
+    input: ReplaceTaskRuntimeSnapshotInput,
+) -> Result<TranslationTaskView, String> {
+    let snapshot = resolve_task_runtime_snapshot(provider_pool, input.config).await?;
+    let indexed = get_task_from_index(config_pool, &input.task_id).await?;
+    let inp_path = PathBuf::from(&indexed.inp_path);
+    if !inp_path.starts_with(workspace_root) {
+        return Err("Task file is outside the configured workspace".into());
+    }
     let config_snapshot = config_snapshot_json(
-        &config,
-        &provider_id,
-        &model_id,
+        &snapshot.config,
+        &snapshot.provider_id,
+        &snapshot.model_id,
         task_failure_thresholds_from_config(
-            &config,
-            config.glossary_generation_config.max_failure_percentage,
+            &snapshot.config,
+            snapshot
+                .config
+                .glossary_generation_config
+                .max_failure_percentage,
         ),
     );
     let inp_pool = connect_inp(&inp_path).await?;
@@ -2906,7 +3011,7 @@ pub async fn replace_task_runtime_snapshot(
         .await
         .map_err(|error| error.to_string())?
         .max(0) as u64;
-    let progress_detail = progress_detail_for_config(total_chunks, 0, &glossary_config);
+    let progress_detail = progress_detail_for_config(total_chunks, 0, &snapshot.glossary_config);
     let progress_detail_json = serialize_progress_detail(Some(&progress_detail))?;
     let now = unix_timestamp();
     let mut transaction = inp_pool.begin().await.map_err(|error| error.to_string())?;
@@ -2936,33 +3041,25 @@ pub async fn replace_task_runtime_snapshot(
             progress_detail_json = ?, updated_at = ? WHERE task_id = ?",
     )
     .bind(TranslationTaskStatus::Failed.as_str())
-    .bind(&provider_id)
-    .bind(&model_id)
-    .bind(&model_request_name)
-    .bind(assistant_id.as_deref())
-    .bind(assistant.as_ref().map(|value| value.system_prompt.as_str()))
-    .bind(translation_custom_parameters.to_string())
+    .bind(&snapshot.provider_id)
+    .bind(&snapshot.model_id)
+    .bind(&snapshot.model_request_name)
+    .bind(snapshot.assistant_id.as_deref())
+    .bind(snapshot.assistant_system_prompt.as_deref())
+    .bind(&snapshot.assistant_custom_parameters_json)
+    .bind(snapshot.assistant_temperature)
+    .bind(snapshot.assistant_top_p)
+    .bind(snapshot.config.enable_translation)
+    .bind(snapshot.glossary_config.use_glossary)
+    .bind(snapshot.glossary_config.glossary_mode.as_str())
     .bind(
-        assistant
-            .as_ref()
-            .filter(|value| value.temperature_enabled)
-            .map(|value| value.temperature),
+        if snapshot.glossary_config.glossary_mode == GlossaryMode::Auto {
+            None
+        } else {
+            snapshot.glossary_config.glossary_id.as_deref()
+        },
     )
-    .bind(
-        assistant
-            .as_ref()
-            .filter(|value| value.top_p_enabled)
-            .map(|value| value.top_p),
-    )
-    .bind(config.enable_translation)
-    .bind(glossary_config.use_glossary)
-    .bind(glossary_config.glossary_mode.as_str())
-    .bind(if glossary_config.glossary_mode == GlossaryMode::Auto {
-        None
-    } else {
-        glossary_config.glossary_id.as_deref()
-    })
-    .bind(glossary_snapshot_json)
+    .bind(snapshot.glossary_generation_snapshot_json)
     .bind(config_snapshot)
     .bind(progress_detail_json)
     .bind(&now)
@@ -4543,29 +4640,67 @@ pub(super) fn config_snapshot_json(
     model_id: &str,
     failure_thresholds: TaskFailureThresholdSnapshot,
 ) -> String {
+    let mut snapshot =
+        serde_json::to_value(config).expect("Translation config serialization must succeed");
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("providerId".into(), json!(provider_id));
+        object.insert("modelId".into(), json!(model_id));
+        object.insert(
+            "maxFailurePercentage".into(),
+            json!(failure_thresholds.max_failure_percentage),
+        );
+        object.insert(
+            "glossaryMaxFailurePercentage".into(),
+            json!(failure_thresholds.glossary_max_failure_percentage),
+        );
+    }
+    snapshot.to_string()
+}
+
+pub(super) fn preprocessing_config_snapshot_json(
+    chunk_token_limit: i64,
+    pdf_parsing_mode: PdfParsingMode,
+) -> String {
     json!({
-        "chunkTokenLimit": config.chunk_token_limit,
-        "maxConcurrency": config.max_concurrency,
-        "maxRetries": config.max_retries,
-        "maxFailurePercentage": failure_thresholds.max_failure_percentage,
-        "glossaryMaxFailurePercentage": failure_thresholds.glossary_max_failure_percentage,
-        "rateLimitStrategy": config.rate_limit_strategy,
-        "maxRequestsPerMinute": config.max_requests_per_minute,
-        "maxTokensPerMinute": config.max_tokens_per_minute,
-        "contextHandlingMode": config.context_handling_mode,
-        "enableTranslation": config.enable_translation,
-        "useGlossary": config.use_glossary,
-        "glossaryMode": config.glossary_mode,
-        "glossaryId": config.glossary_id,
-        "thinkingEffort": config.thinking_effort,
-        "useWebSearch": config.use_web_search,
-        "useCustomParameters": config.use_custom_parameters,
-        "confidenceMode": config.confidence_mode,
-        "pdfParsingMode": config.pdf_parsing_mode,
-        "providerId": provider_id,
-        "modelId": model_id
+        "chunkTokenLimit": chunk_token_limit,
+        "pdfParsingMode": pdf_parsing_mode,
     })
     .to_string()
+}
+
+pub(super) async fn task_execution_config(
+    pool: &SqlitePool,
+    config_pool: &SqlitePool,
+) -> Result<TranslationConfigView, String> {
+    let snapshot_json: String =
+        sqlx::query_scalar("SELECT config_snapshot_json FROM metadata LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    let snapshot: Value = serde_json::from_str(&snapshot_json)
+        .map_err(|error| format!("Stored task config snapshot is invalid: {error}"))?;
+    let is_execution_snapshot = snapshot.as_object().is_some_and(|object| {
+        [
+            "sourceLanguage",
+            "targetLanguage",
+            "providerId",
+            "modelId",
+            "maxConcurrency",
+            "enableTranslation",
+            "glossaryGenerationConfig",
+            "contextHandlingMode",
+            "pdfParsingMode",
+        ]
+        .iter()
+        .all(|key| object.contains_key(*key))
+    });
+    if is_execution_snapshot {
+        let config = serde_json::from_value::<TranslationConfigView>(snapshot)
+            .map_err(|error| format!("Stored task config snapshot is invalid: {error}"))?;
+        Ok(normalize_translation_config(config))
+    } else {
+        get_translation_config(config_pool).await
+    }
 }
 
 pub(super) fn normalize_task_filters(

@@ -29,8 +29,8 @@ use super::context::estimate_tokens;
 use super::db::{
     apply_glossary_report_and_emit, connect_inp, content_format_from_source_path,
     document_format_from_source_path, ensure_task_glossary_generation_snapshot, finalize_task,
-    get_task_from_index, get_translation_config, glossary_source_chunks, metadata_task,
-    refresh_task_stats, set_task_glossary_id, task_failure_thresholds, task_glossary_config,
+    get_task_from_index, glossary_source_chunks, metadata_task, refresh_task_stats,
+    set_task_glossary_id, task_execution_config, task_failure_thresholds, task_glossary_config,
     GlossaryProgressSnapshot, GlossaryRetrySnapshot,
 };
 use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter};
@@ -192,6 +192,7 @@ enum AutoGlossaryChunkOutcome {
 
 pub(super) enum TaskGlossaryPreparation {
     Ready(Vec<GlossaryEntry>),
+    Failed,
     Interrupted,
 }
 
@@ -290,7 +291,22 @@ impl TaskGlossaryMatcher {
 
 enum AutoGlossaryGeneration {
     Created(GlossaryView),
+    Failed(String),
     Interrupted(String),
+}
+
+pub(super) fn glossary_threshold_failure_reason(
+    failed_chunks: i64,
+    total_chunks: i64,
+    max_failure_percentage: i64,
+    last_error: &str,
+) -> Result<Option<String>, String> {
+    if !failure_threshold_exceeded(failed_chunks, total_chunks, max_failure_percentage)? {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "Glossary failure threshold exceeded: {failed_chunks}/{total_chunks} chunks failed (maximum {max_failure_percentage}%): {last_error}",
+    )))
 }
 
 fn start_glossary_reporter(
@@ -426,7 +442,7 @@ pub async fn prepare_auto_glossary_for_task(
         return Ok(None);
     }
     let chunks = glossary_source_chunks(&inp_pool).await?;
-    let config = get_translation_config(config_pool).await?;
+    let config = task_execution_config(&inp_pool, config_pool).await?;
     let interrupt = TranslationInterrupt::new();
     let result = generate_auto_glossary(
         app,
@@ -452,6 +468,20 @@ pub async fn prepare_auto_glossary_for_task(
             );
             inp_pool.close().await;
             Ok(Some(view))
+        }
+        AutoGlossaryGeneration::Failed(reason) => {
+            finalize_task(
+                app,
+                &inp_pool,
+                config_pool,
+                &inp_path,
+                TranslationTaskStatus::Failed,
+                Some(reason),
+                None,
+            )
+            .await?;
+            inp_pool.close().await;
+            Ok(None)
         }
         AutoGlossaryGeneration::Interrupted(reason) => {
             finalize_task(
@@ -520,6 +550,19 @@ pub(super) async fn prepare_task_glossary(
                             TranslationProgressPayload { task: refreshed },
                         );
                         view.id
+                    }
+                    AutoGlossaryGeneration::Failed(reason) => {
+                        finalize_task(
+                            app,
+                            inp_pool,
+                            config_pool,
+                            inp_path,
+                            TranslationTaskStatus::Failed,
+                            Some(reason),
+                            None,
+                        )
+                        .await?;
+                        return Ok(TaskGlossaryPreparation::Failed);
                     }
                     AutoGlossaryGeneration::Interrupted(reason) => {
                         finalize_task(
@@ -694,17 +737,12 @@ async fn generate_auto_glossary(
             }
             AutoGlossaryChunkOutcome::Failed { error, .. } => {
                 failed_chunks += 1;
-                if failure_threshold_exceeded(
+                if let Some(reason) = glossary_threshold_failure_reason(
                     failed_chunks as i64,
                     chunks.len() as i64,
                     failure_thresholds.glossary_max_failure_percentage,
+                    &error,
                 )? {
-                    let reason = format!(
-                        "Glossary failure threshold exceeded: {}/{} chunks failed (maximum {}%): {error}",
-                        failed_chunks,
-                        chunks.len(),
-                        failure_thresholds.glossary_max_failure_percentage,
-                    );
                     finish_glossary_reporter(
                         request_reporter,
                         reporter_handle,
@@ -716,7 +754,7 @@ async fn generate_auto_glossary(
                         },
                     )
                     .await?;
-                    return Ok(AutoGlossaryGeneration::Interrupted(reason));
+                    return Ok(AutoGlossaryGeneration::Failed(reason));
                 }
             }
             AutoGlossaryChunkOutcome::Interrupted { error } => {

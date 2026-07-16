@@ -32,12 +32,12 @@ use super::db::{
     commit_prepared_run_state, config_snapshot_json, connect_inp, content_format_from_source_path,
     document_format_from_source_path, effective_translation_concurrency,
     ensure_task_has_translatable_chunks, finalize_glossary_only_task, finalize_task,
-    get_task_from_index, get_translation_config, glossary_source_chunks, insert_assets,
-    metadata_task, parse_source_file_for_task, pending_chunks, progress_detail_for_config,
+    get_task_from_index, glossary_source_chunks, insert_assets, metadata_task,
+    parse_source_file_for_task, pending_chunks, progress_detail_for_config,
     progress_detail_for_translation_stats, publish_task_index_snapshot, refresh_task_stats,
     resolve_source_file, set_active_retry_and_emit, set_progress_detail,
     task_assistant_custom_parameters, task_assistant_prompt, task_assistant_sampling,
-    task_failure_thresholds, task_glossary_config,
+    task_execution_config, task_failure_thresholds, task_glossary_config,
 };
 use super::glossary::{prepare_task_glossary, TaskGlossaryMatcher, TaskGlossaryPreparation};
 use super::limiter::{
@@ -238,7 +238,7 @@ pub async fn prepare_translation_run(
         return Err("Task file is outside the configured workspace".into());
     }
     let inp_pool = connect_inp(&inp_path).await?;
-    let config = get_translation_config(config_pool).await?;
+    let config = task_execution_config(&inp_pool, config_pool).await?;
     let glossary_config = task_glossary_config(&inp_pool).await?;
     let now = unix_timestamp();
     sqlx::query("UPDATE metadata SET active_retry_json = NULL WHERE task_id = ?")
@@ -495,6 +495,15 @@ pub async fn run_translation_task(
     .await?
     {
         TaskGlossaryPreparation::Ready(entries) => Arc::new(TaskGlossaryMatcher::new(entries)?),
+        TaskGlossaryPreparation::Failed => {
+            write_translation_log(
+                &backend_log,
+                "ERROR",
+                format!("Task id={} failed during glossary preparation", task.id),
+            );
+            inp_pool.close().await;
+            return Ok(());
+        }
         TaskGlossaryPreparation::Interrupted => {
             write_translation_log(
                 &backend_log,

@@ -141,6 +141,17 @@ export interface CreateTranslationTaskInput {
   glossaryGenerationConfig: GlossaryGenerationConfig;
 }
 
+export interface PreprocessTranslationTaskInput {
+  filePath: string;
+  chunkTokenLimit: number;
+  pdfParsingMode: PdfParsingMode;
+}
+
+export interface PublishTranslationTaskCreationInput {
+  clientTaskId: string;
+  executionConfig: TranslationConfigView;
+}
+
 export type TaskRuntimeConfigDomain = "translation" | "glossary";
 export type TaskRuntimeActionReason = "local-config-missing" | "remote-model-unavailable";
 

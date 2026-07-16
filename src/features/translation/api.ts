@@ -4,6 +4,8 @@ import type {
   CreateTranslationTaskInput,
   ExportTranslationTaskInput,
   ImportTranslationTaskInput,
+  PreprocessTranslationTaskInput,
+  PublishTranslationTaskCreationInput,
   ReplaceTaskRuntimeSnapshotInput,
   StartTranslationTaskCreationResult,
   TranslationConfigView,
@@ -30,7 +32,7 @@ export function createTranslationTask(
 }
 
 export function startTranslationTaskCreation(
-  input: CreateTranslationTaskInput,
+  input: PreprocessTranslationTaskInput,
 ): Promise<StartTranslationTaskCreationResult> {
   return invoke<StartTranslationTaskCreationResult>("start_translation_task_creation", { input });
 }
@@ -40,9 +42,9 @@ export function cancelTranslationTaskCreation(clientTaskId: string): Promise<voi
 }
 
 export function publishTranslationTaskCreation(
-  clientTaskId: string,
+  input: PublishTranslationTaskCreationInput,
 ): Promise<TranslationTaskView> {
-  return invoke<TranslationTaskView>("publish_translation_task_creation", { clientTaskId });
+  return invoke<TranslationTaskView>("publish_translation_task_creation", { input });
 }
 
 export function pickTranslationTaskFile(): Promise<string | null> {

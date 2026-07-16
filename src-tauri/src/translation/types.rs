@@ -445,6 +445,21 @@ pub struct CreateTranslationTaskInput {
     pub glossary_generation_config: GlossaryGenerationConfig,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreprocessTranslationTaskInput {
+    pub file_path: String,
+    pub chunk_token_limit: i64,
+    pub pdf_parsing_mode: PdfParsingMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishTranslationTaskCreationInput {
+    pub client_task_id: String,
+    pub execution_config: TranslationConfigView,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranslationTaskFilters {

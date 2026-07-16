@@ -50,16 +50,17 @@ pub use self::scheduler::{
 };
 
 pub use self::db::{
-    backfill_task_index_execution_fields, connect_config_db, create_translation_task,
-    create_translation_task_with_progress, default_workspace_root, delete_translation_task,
-    delete_translation_tasks, discard_staged_translation_task, export_translation_task,
-    get_task_runtime_action_required, get_translation_config, get_translation_task_detail,
-    get_translation_task_summary, import_translation_task, list_translation_tasks,
-    mark_task_index_failed, mark_task_interrupted, mark_task_interrupted_pending,
-    mark_tasks_queued_atomically, migrate_legacy_workspace, open_translation_task_folder,
-    publish_staged_translation_task, rebase_task_index_paths, replace_task_runtime_snapshot,
-    reset_task_for_retranslation, restore_queued_tasks, update_translation_config_validated,
-    update_translation_task_info, update_translation_task_name, update_translation_task_tags,
+    apply_staged_task_execution_snapshot, backfill_task_index_execution_fields, connect_config_db,
+    create_translation_task, create_translation_task_with_progress, default_workspace_root,
+    delete_translation_task, delete_translation_tasks, discard_staged_translation_task,
+    export_translation_task, get_task_runtime_action_required, get_translation_config,
+    get_translation_task_detail, get_translation_task_summary, import_translation_task,
+    list_translation_tasks, mark_task_index_failed, mark_task_interrupted,
+    mark_task_interrupted_pending, mark_tasks_queued_atomically, migrate_legacy_workspace,
+    open_translation_task_folder, publish_staged_translation_task, rebase_task_index_paths,
+    replace_task_runtime_snapshot, reset_task_for_retranslation, restore_queued_tasks,
+    update_translation_config_validated, update_translation_task_info,
+    update_translation_task_name, update_translation_task_tags,
 };
 
 #[cfg(test)]
@@ -69,11 +70,12 @@ pub use self::db::update_translation_config;
 pub use self::types::{
     ConfidenceMode, ContextHandlingMode, CreateTranslationTaskInput, ExportTranslationTaskInput,
     GlossaryGenerationConfig, GlossaryMode, ImportTranslationTaskInput, PreparedRun,
-    ProgressDetail, ProgressStep, RateLimitStrategy, ReplaceTaskRuntimeSnapshotInput, RunMode,
-    StartTranslationTaskCreationResult, TaskRuntimeActionReason, TaskRuntimeActionRequired,
-    TaskRuntimeConfigDomain, TextTokenStats, TokenStats, TranslationChunkStatus,
-    TranslationChunkView, TranslationConfigView, TranslationInterrupt, TranslationProgressPayload,
-    TranslationTaskActiveRetry, TranslationTaskCreationProgressPayload,
+    PreprocessTranslationTaskInput, ProgressDetail, ProgressStep,
+    PublishTranslationTaskCreationInput, RateLimitStrategy, ReplaceTaskRuntimeSnapshotInput,
+    RunMode, StartTranslationTaskCreationResult, TaskRuntimeActionReason,
+    TaskRuntimeActionRequired, TaskRuntimeConfigDomain, TextTokenStats, TokenStats,
+    TranslationChunkStatus, TranslationChunkView, TranslationConfigView, TranslationInterrupt,
+    TranslationProgressPayload, TranslationTaskActiveRetry, TranslationTaskCreationProgressPayload,
     TranslationTaskCreationStage, TranslationTaskCreationStatus, TranslationTaskDetail,
     TranslationTaskExportFormat, TranslationTaskFilters, TranslationTaskIdsInput,
     TranslationTaskPdfOptions, TranslationTaskStatus, TranslationTaskView,

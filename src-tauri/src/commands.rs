@@ -35,8 +35,9 @@ use crate::settings::{
 use crate::task_scheduler::{SchedulerAck, SchedulerAction, TaskScheduler};
 use crate::translation_tasks::{
     self, CreateTranslationTaskInput, ExportTranslationTaskInput, ImportTranslationTaskInput,
-    ProgressStep, ReplaceTaskRuntimeSnapshotInput, StartTranslationTaskCreationResult,
-    TranslationConfigView, TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
+    PreprocessTranslationTaskInput, ProgressStep, PublishTranslationTaskCreationInput,
+    ReplaceTaskRuntimeSnapshotInput, StartTranslationTaskCreationResult, TranslationConfigView,
+    TranslationTaskCreationProgressPayload, TranslationTaskCreationStage,
     TranslationTaskCreationStatus, TranslationTaskDetail, TranslationTaskFilters,
     TranslationTaskIdsInput, TranslationTaskView, UpdateTranslationConfigInput,
     UpdateTranslationTaskInfoInput, UpdateTranslationTaskNameInput, UpdateTranslationTaskTagsInput,
@@ -422,7 +423,7 @@ pub async fn create_translation_task(
 pub async fn start_translation_task_creation(
     app: AppHandle,
     state: State<'_, AppState>,
-    input: CreateTranslationTaskInput,
+    input: PreprocessTranslationTaskInput,
 ) -> Result<StartTranslationTaskCreationResult, String> {
     let client_task_id = db::new_id("creation");
     let cancel = Arc::new(AtomicBool::new(false));
@@ -547,22 +548,34 @@ pub async fn cancel_translation_task_creation(
 #[tauri::command]
 pub async fn publish_translation_task_creation(
     state: State<'_, AppState>,
-    client_task_id: String,
+    input: PublishTranslationTaskCreationInput,
 ) -> Result<TranslationTaskView, String> {
+    let client_task_id = input.client_task_id;
     let staged = state
         .translation_task_staged_creations
         .lock()
         .await
         .remove(&client_task_id)
         .ok_or_else(|| "预处理任务不存在或已发布".to_string())?;
-    match translation_tasks::publish_staged_translation_task(
-        &state.translation_config_pool,
-        &state.translation_workspace_root,
-        &staged.task_id,
-        &staged.inp_path,
-    )
-    .await
-    {
+    let result = async {
+        translation_tasks::apply_staged_task_execution_snapshot(
+            &state.pool,
+            &state.translation_workspace_root,
+            &staged.task_id,
+            &staged.inp_path,
+            input.execution_config,
+        )
+        .await?;
+        translation_tasks::publish_staged_translation_task(
+            &state.translation_config_pool,
+            &state.translation_workspace_root,
+            &staged.task_id,
+            &staged.inp_path,
+        )
+        .await
+    }
+    .await;
+    match result {
         Ok(task) => Ok(task),
         Err(error) => {
             state

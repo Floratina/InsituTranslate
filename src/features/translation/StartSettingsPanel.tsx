@@ -91,6 +91,9 @@ const NAV_ITEMS: NavItem[] = [
   { value: "proofreading", label: "校对配置", icon: FileCheck2 },
 ];
 
+const ENABLE_TRANSLATION_HELP =
+  "若关闭此开关，可以启用“自动建立术语表”开关，以进行仅建立术语表的任务。";
+
 const RATE_LIMIT_OPTIONS: Array<{
   value: RateLimitStrategy;
   label: string;
@@ -462,7 +465,7 @@ export function StartSettingsPanel({
           {activeTab === "translation" && (
             <div className="grid gap-3">
               <div className={THREE_COLUMN_GRID_CLASS}>
-                <FieldBlock label="启用翻译">
+                <FieldBlock label="启用翻译" help={ENABLE_TRANSLATION_HELP}>
                   <div className="flex h-8 items-center">
                     <Switch
                       size="sm"

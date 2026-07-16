@@ -160,7 +160,6 @@ function progressStep(
 function createCreationJob(
   filePath: string,
   clientTaskId: string,
-  _config?: TranslationConfigView,
 ): StartCreationJob {
   return {
     clientTaskId,
@@ -529,8 +528,6 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     filePaths,
     loading,
     pushToast,
-    sourceLanguage,
-    targetLanguage,
   ]);
   const addFilePathsRef = useRef(addFilePaths);
 
@@ -764,7 +761,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
     }));
   }
 
-  async function saveConfig(showSuccess = true): Promise<boolean> {
+  async function saveConfig(showSuccess = true): Promise<TranslationConfigView | null> {
     setSavingConfig(true);
     try {
       const saved = await updateTranslationConfig({
@@ -780,10 +777,10 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
       setTargetLanguage(saved.targetLanguage);
       appSessionCache.translationConfig.set(normalizedSaved);
       if (showSuccess) pushToast("全部设置已保存", "success");
-      return true;
+      return normalizedSaved;
     } catch (error) {
       pushToast(getErrorMessage(error), "error");
-      return false;
+      return null;
     } finally {
       setSavingConfig(false);
     }
@@ -801,53 +798,21 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
       pushToast("配置仍在加载，请稍后再添加文件", "warning");
       return;
     }
-    const executionModeError = executionModeValidationError(config);
-    if (executionModeError) {
-      pushToast(executionModeError, "warning");
-      return;
-    }
-    if (config.enableTranslation && (!config.providerId || !config.modelId)) {
-      pushToast("请先选择已启用的翻译提供商和模型，再添加文件", "warning");
-      return;
-    }
-    if (
-      config.useGlossary
-      && config.glossaryMode === "auto"
-      && (
-        !config.glossaryGenerationConfig.providerId
-        || !config.glossaryGenerationConfig.modelId
-      )
-    ) {
-      pushToast("请先选择已启用的术语表提供商和模型，再添加文件", "warning");
-      return;
-    }
-    const resolvedSourceLanguage = normalizeLanguageCode(sourceLanguage);
-    const resolvedTargetLanguage = normalizeLanguageCode(targetLanguage);
-    if (!resolvedSourceLanguage || !resolvedTargetLanguage) {
-      pushToast("请选择有效的原始语言和目标语言，再添加文件", "warning");
+    if (!Number.isInteger(config.chunkTokenLimit) || config.chunkTokenLimit < 200 || config.chunkTokenLimit > 8000) {
+      pushToast("单块 Token 数必须是 200 到 8000 之间的整数", "warning");
       return;
     }
 
-    if (!(await saveConfig(false))) return;
     setFilePaths((current) => current.filter((path) => !pathsToCreate.includes(path)));
 
     for (const path of pathsToCreate) {
       const localId = temporaryCreationId();
-      appSessionCache.startCreationJobs.upsert(createCreationJob(path, localId, config));
+      appSessionCache.startCreationJobs.upsert(createCreationJob(path, localId));
       try {
         const result = await startTranslationTaskCreation({
           filePath: path,
-          sourceLanguage: resolvedSourceLanguage,
-          targetLanguage: resolvedTargetLanguage,
-          tags: [],
-          providerId: config.providerId,
-          modelId: config.modelId,
-          assistantId: config.assistantId === "__none__" ? null : config.assistantId,
-          enableTranslation: config.enableTranslation,
-          useGlossary: config.useGlossary,
-          glossaryMode: config.glossaryMode,
-          glossaryId: config.glossaryMode === "auto" ? null : config.glossaryId,
-          glossaryGenerationConfig: config.glossaryGenerationConfig,
+          chunkTokenLimit: config.chunkTokenLimit,
+          pdfParsingMode: config.pdfParsingMode,
         });
         if (ignoredCreationPaths.has(path)) {
           ignoredCreationIds.add(result.clientTaskId);
@@ -873,19 +838,49 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   }
 
   async function createTasks(): Promise<void> {
+    if (fileRowCount === 0) {
+      pushToast("请先添加需要处理的文件", "warning");
+      return;
+    }
     const executionModeError = executionModeValidationError(config);
     if (executionModeError) {
       pushToast(executionModeError, "warning");
       return;
     }
-    if (fileRowCount === 0) {
-      pushToast("请先添加需要处理的文件", "warning");
+    if (config.enableTranslation && (!config.providerId || !config.modelId)) {
+      pushToast("请先选择已启用的翻译提供商和模型，再创建任务", "warning");
+      return;
+    }
+    if (
+      config.useGlossary
+      && config.glossaryMode === "auto"
+      && (
+        !config.glossaryGenerationConfig.providerId
+        || !config.glossaryGenerationConfig.modelId
+      )
+    ) {
+      pushToast("请先选择已启用的术语表提供商和模型，再创建任务", "warning");
+      return;
+    }
+    const resolvedSourceLanguage = normalizeLanguageCode(sourceLanguage);
+    const resolvedTargetLanguage = normalizeLanguageCode(targetLanguage);
+    if (!resolvedSourceLanguage || !resolvedTargetLanguage) {
+      pushToast("请选择有效的原始语言和目标语言，再创建任务", "warning");
       return;
     }
     if (!creationReady) {
       pushToast("仍有任务未完成预处理，请等待完成或移除失败条目", "warning");
       return;
     }
+    const savedConfig = await saveConfig(false);
+    if (!savedConfig) return;
+    const executionConfig: TranslationConfigView = {
+      ...savedConfig,
+      sourceLanguage: resolvedSourceLanguage,
+      customSourceLanguage: "",
+      targetLanguage: resolvedTargetLanguage,
+      customTargetLanguage: "",
+    };
 
     setBusy(true);
     try {
@@ -893,7 +888,10 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
       const failed: string[] = [];
       for (const job of completedCreationJobs) {
         try {
-          await publishTranslationTaskCreation(job.clientTaskId);
+          await publishTranslationTaskCreation({
+            clientTaskId: job.clientTaskId,
+            executionConfig,
+          });
           publishedIds.push(job.clientTaskId);
         } catch (error) {
           failed.push(`${fileName(job.filePath)}：${getErrorMessage(error)}`);

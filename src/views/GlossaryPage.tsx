@@ -2196,7 +2196,7 @@ function UploadGlossaryDialog({
         <DialogHeader>
           <DialogTitle>上传术语表</DialogTitle>
           <DialogDescription>
-            仅支持 CSV 和 JSON，内容必须只有 src 和 dst 两个字段。
+            仅支持 CSV 和 JSON。CSV 必须仅包含 src、dst 两列；JSON 兼容旧字段与嵌套格式，导入后会自动规范化为 src、dst。
           </DialogDescription>
         </DialogHeader>
         <DialogField>

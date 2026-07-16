@@ -684,51 +684,181 @@ pub async fn import_glossary(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let content = tokio::fs::read_to_string(&source_path)
+    if !matches!(extension.as_str(), "csv" | "json") {
+        return Err("文件格式不正确：仅支持 csv 和 json".into());
+    }
+    let bytes = tokio::fs::read(&source_path)
         .await
         .map_err(|error| format!("无法读取术语表文件：{error}"))?;
-    let entries = match extension.as_str() {
-        "csv" => parse_csv_entries(&content)?,
-        "json" => parse_json_entries(&content)?,
-        _ => return Err("文件格式不正确：仅支持 csv 和 json".into()),
+    let content = String::from_utf8(bytes)
+        .map_err(|_| "文件编码不正确：术语表必须使用 UTF-8 编码".to_string())?;
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let entries = if extension == "csv" {
+        parse_csv_entries(content)?
+    } else {
+        parse_json_entries(content)?
     };
     let id = new_id("glossary");
     let ing_path = next_ing_path(workspace_root, &name).await?;
     let created_at = unix_timestamp();
-    let ing_pool = connect_ing(&ing_path).await?;
-    let mut transaction = ing_pool.begin().await.map_err(|error| error.to_string())?;
-    sqlx::query(
-        r#"INSERT INTO metadata (
-            glossary_id, schema_version, name, source_language, target_language, tags_json,
-            source_type, entry_count, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'uploaded', 0, ?, ?)"#,
+    create_uploaded_glossary(
+        pool,
+        &ing_path,
+        &id,
+        &name,
+        &source_language,
+        &target_language,
+        &tags,
+        &entries,
+        &created_at,
     )
-    .bind(&id)
-    .bind(ING_SCHEMA_VERSION)
-    .bind(&name)
-    .bind(&source_language)
-    .bind(&target_language)
-    .bind(serialize_tags(&tags)?)
-    .bind(&created_at)
-    .bind(&created_at)
-    .execute(&mut *transaction)
     .await
-    .map_err(|error| error.to_string())?;
-    for entry in entries {
-        insert_entry_ignore_query(&entry.src, &entry.dst, &created_at)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_uploaded_glossary(
+    config_pool: &SqlitePool,
+    ing_path: &Path,
+    glossary_id: &str,
+    name: &str,
+    source_language: &str,
+    target_language: &str,
+    tags: &[String],
+    entries: &[NormalizedEntry],
+    created_at: &str,
+) -> Result<GlossaryView, String> {
+    let temporary_path = uuid_ing_temporary_path(ing_path, "creating")?;
+    let prepared_view = async {
+        let ing_pool = connect_ing(&temporary_path).await?;
+        let write_result = async {
+            let mut transaction = ing_pool.begin().await.map_err(|error| error.to_string())?;
+            sqlx::query(
+                r#"INSERT INTO metadata (
+                    glossary_id, schema_version, name, source_language, target_language,
+                    tags_json, source_type, entry_count, status, has_failures, origin_task_id,
+                    total_chunks, success_chunks, failed_chunks, interrupted_chunks,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'uploaded', ?, 'success', 0, NULL, 0, 0, 0, 0, ?, ?)"#,
+            )
+            .bind(glossary_id)
+            .bind(ING_SCHEMA_VERSION)
+            .bind(name)
+            .bind(source_language)
+            .bind(target_language)
+            .bind(serialize_tags(tags)?)
+            .bind(entries.len() as i64)
+            .bind(created_at)
+            .bind(created_at)
             .execute(&mut *transaction)
             .await
             .map_err(|error| error.to_string())?;
+            for entry in entries {
+                insert_entry_ignore_query(&entry.src, &entry.dst, created_at)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|error| error.to_string())?;
+            metadata_glossary(&ing_pool, ing_path).await
+        }
+        .await;
+        ing_pool.close().await;
+        write_result
     }
-    transaction
-        .commit()
+    .await;
+    let view = match prepared_view {
+        Ok(view) => view,
+        Err(error) => {
+            let cleanup_error = cleanup_failed_uploaded_glossary(
+                config_pool,
+                glossary_id,
+                &temporary_path,
+                ing_path,
+                false,
+            )
+            .await
+            .err();
+            return match cleanup_error {
+                Some(cleanup_error) => Err(format!(
+                    "{error}; unable to clean failed glossary import: {cleanup_error}"
+                )),
+                None => Err(error),
+            };
+        }
+    };
+    if let Err(error) = tokio::fs::rename(&temporary_path, ing_path).await {
+        let error = format!("Unable to publish uploaded glossary: {error}");
+        let cleanup_error = cleanup_failed_uploaded_glossary(
+            config_pool,
+            glossary_id,
+            &temporary_path,
+            ing_path,
+            false,
+        )
         .await
-        .map_err(|error| error.to_string())?;
-    refresh_metadata_count(&ing_pool, &created_at).await?;
-    let view = metadata_glossary(&ing_pool, &ing_path).await?;
-    upsert_glossary_index(pool, &view).await?;
-    ing_pool.close().await;
+        .err();
+        return match cleanup_error {
+            Some(cleanup_error) => Err(format!(
+                "{error}; unable to clean failed glossary import: {cleanup_error}"
+            )),
+            None => Err(error),
+        };
+    }
+    if let Err(error) = upsert_glossary_index(config_pool, &view).await {
+        let cleanup_error = cleanup_failed_uploaded_glossary(
+            config_pool,
+            glossary_id,
+            &temporary_path,
+            ing_path,
+            true,
+        )
+        .await
+        .err();
+        return match cleanup_error {
+            Some(cleanup_error) => Err(format!(
+                "{error}; unable to clean failed glossary import: {cleanup_error}"
+            )),
+            None => Err(error),
+        };
+    }
     Ok(view)
+}
+
+async fn cleanup_failed_uploaded_glossary(
+    config_pool: &SqlitePool,
+    glossary_id: &str,
+    temporary_path: &Path,
+    ing_path: &Path,
+    remove_published_file: bool,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let paths = if remove_published_file {
+        vec![temporary_path, ing_path]
+    } else {
+        vec![temporary_path]
+    };
+    for path in paths {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if let Err(error) = sqlx::query("DELETE FROM glossary_index WHERE id = ?")
+        .bind(glossary_id)
+        .execute(config_pool)
+        .await
+    {
+        errors.push(error.to_string());
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub async fn update_glossary(
@@ -2888,7 +3018,10 @@ mod tests {
         let entries = parse_csv_entries("dst,src\n苹果,Apple\n香蕉,Banana\n").expect("csv");
         assert_eq!(entries[0].src, "Apple");
         assert_eq!(entries[0].dst, "苹果");
+        let quoted = parse_csv_entries("src,dst\n\"Apple, Inc.\",\"苹果\"\n").expect("quoted csv");
+        assert_eq!(quoted[0].src, "Apple, Inc.");
         assert!(parse_csv_entries("src,dst,note\nApple,苹果,x\n").is_err());
+        assert!(parse_csv_entries("src,dst\nApple,\n").is_err());
     }
 
     #[test]
@@ -2977,12 +3110,9 @@ mod tests {
         let root = temp_workspace("csv-import");
         let pool = connect_config_db(&root).await.expect("config db");
         let source = root.join("terms.csv");
-        tokio::fs::write(
-            &source,
-            "src,dst\nApple,Pingguo\n apple ,Ignored\nBanana,Xiangjiao\n",
-        )
-        .await
-        .expect("write input");
+        let mut csv = vec![0xef, 0xbb, 0xbf];
+        csv.extend_from_slice(b"src,dst\nApple,Pingguo\n apple ,Ignored\nBanana,Xiangjiao\n");
+        tokio::fs::write(&source, csv).await.expect("write input");
 
         let view = import_glossary(
             &pool,
@@ -2999,12 +3129,244 @@ mod tests {
         .expect("import glossary");
 
         assert_eq!(view.entry_count, 2);
+        assert_eq!(view.status, GlossaryStatus::Success);
+        assert!(!view.has_failures);
+        assert!(view.origin_task_id.is_none());
+        assert_eq!(view.total_chunks, 0);
+        assert_eq!(view.success_chunks, 0);
+        assert_eq!(view.failed_chunks, 0);
+        assert_eq!(view.interrupted_chunks, 0);
         let entries = load_glossary_entries(&pool, &view.id)
             .await
             .expect("load entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].src, "Apple");
         assert_eq!(entries[0].dst, "Pingguo");
+
+        let ing_pool = connect_ing(Path::new(&view.ing_path))
+            .await
+            .expect("ing db");
+        let metadata = sqlx::query(
+            "SELECT schema_version, status, has_failures, origin_task_id,
+                    total_chunks, success_chunks, failed_chunks, interrupted_chunks
+             FROM metadata LIMIT 1",
+        )
+        .fetch_one(&ing_pool)
+        .await
+        .expect("metadata");
+        assert_eq!(metadata.get::<i64, _>("schema_version"), ING_SCHEMA_VERSION);
+        assert_eq!(metadata.get::<String, _>("status"), "success");
+        assert_eq!(metadata.get::<i64, _>("has_failures"), 0);
+        assert_eq!(metadata.get::<Option<String>, _>("origin_task_id"), None);
+        assert_eq!(metadata.get::<i64, _>("total_chunks"), 0);
+        assert_eq!(metadata.get::<i64, _>("success_chunks"), 0);
+        assert_eq!(metadata.get::<i64, _>("failed_chunks"), 0);
+        assert_eq!(metadata.get::<i64, _>("interrupted_chunks"), 0);
+        let generation_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM generation_chunks")
+            .fetch_one(&ing_pool)
+            .await
+            .expect("generation chunks");
+        assert_eq!(generation_chunks, 0);
+        ing_pool.close().await;
+
+        let usable = list_glossaries(
+            &pool,
+            Some(GlossaryListQuery {
+                usable_only: true,
+                ..GlossaryListQuery::default()
+            }),
+        )
+        .await
+        .expect("usable glossaries");
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].id, view.id);
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn imports_utf8_bom_json_and_rejects_invalid_utf8_without_orphans() {
+        let root = temp_workspace("import-encoding");
+        let pool = connect_config_db(&root).await.expect("config db");
+        let json_source = root.join("terms.json");
+        let mut json = vec![0xef, 0xbb, 0xbf];
+        json.extend_from_slice(br#"[{"source":"Apple","target":"Pingguo"}]"#);
+        tokio::fs::write(&json_source, json)
+            .await
+            .expect("write bom json");
+        let imported = import_glossary(
+            &pool,
+            &root,
+            ImportGlossaryInput {
+                file_path: json_source.to_string_lossy().to_string(),
+                name: "BOM JSON".into(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                tags: Vec::new(),
+            },
+        )
+        .await
+        .expect("import bom json");
+        assert_eq!(imported.entry_count, 1);
+
+        let invalid_source = root.join("invalid.csv");
+        tokio::fs::write(&invalid_source, [0xff, 0xfe, 0x73, 0x00])
+            .await
+            .expect("write invalid utf8");
+        let error = import_glossary(
+            &pool,
+            &root,
+            ImportGlossaryInput {
+                file_path: invalid_source.to_string_lossy().to_string(),
+                name: "Invalid Encoding".into(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                tags: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("invalid utf8 must fail");
+        assert!(error.contains("UTF-8"));
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM glossary_index WHERE name = 'Invalid Encoding'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("index count");
+        assert_eq!(index_count, 0);
+        let mut files = tokio::fs::read_dir(root.join(GLOSSARIES_DIR))
+            .await
+            .expect("glossary directory");
+        while let Some(file) = files.next_entry().await.expect("directory entry") {
+            assert!(!sqlite_paths::is_uuid_sqlite_temporary_file(
+                &file.path(),
+                "creating",
+                "ing",
+            ));
+        }
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn failed_uploaded_glossary_index_write_cleans_files_and_index() {
+        let root = temp_workspace("failed-upload-index");
+        let pool = connect_config_db(&root).await.expect("config db");
+        sqlx::query(
+            "CREATE TRIGGER reject_uploaded_glossary_index
+             BEFORE INSERT ON glossary_index
+             WHEN NEW.source_type = 'uploaded'
+             BEGIN
+                 SELECT RAISE(ABORT, 'reject uploaded glossary index');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("failure trigger");
+        let source = root.join("terms.csv");
+        tokio::fs::write(&source, "src,dst\nApple,Pingguo\n")
+            .await
+            .expect("write csv");
+
+        let error = import_glossary(
+            &pool,
+            &root,
+            ImportGlossaryInput {
+                file_path: source.to_string_lossy().to_string(),
+                name: "Rejected Upload".into(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                tags: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("index write must fail");
+        assert!(error.contains("reject uploaded glossary index"));
+        let index_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM glossary_index")
+            .fetch_one(&pool)
+            .await
+            .expect("index count");
+        assert_eq!(index_count, 0);
+        let mut files = tokio::fs::read_dir(root.join(GLOSSARIES_DIR))
+            .await
+            .expect("glossary directory");
+        assert!(files.next_entry().await.expect("directory entry").is_none());
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn csv_and_json_exports_only_include_src_dst_and_roundtrip() {
+        let root = temp_workspace("export-roundtrip");
+        let pool = connect_config_db(&root).await.expect("config db");
+        let source = root.join("terms.json");
+        tokio::fs::write(
+            &source,
+            r#"{"glossary":[{"source":"Apple, Inc.","target":"苹果公司"},{"src":"Banana","dst":"香蕉"}]}"#,
+        )
+        .await
+        .expect("write json");
+        let view = import_glossary(
+            &pool,
+            &root,
+            ImportGlossaryInput {
+                file_path: source.to_string_lossy().to_string(),
+                name: "Export Source".into(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                tags: vec!["private-tag".into()],
+            },
+        )
+        .await
+        .expect("import source");
+        let ing_pool = connect_ing(Path::new(&view.ing_path))
+            .await
+            .expect("ing db");
+        let rows = sqlx::query("SELECT src, dst FROM entries ORDER BY created_at ASC")
+            .fetch_all(&ing_pool)
+            .await
+            .expect("entries");
+        let csv = export_csv(&rows);
+        let json = export_json(&rows).expect("json export");
+        ing_pool.close().await;
+
+        assert_eq!(csv.lines().next(), Some("src,dst"));
+        assert!(!csv.contains("private-tag"));
+        let json_value: serde_json::Value = serde_json::from_str(&json).expect("export json");
+        let objects = json_value.as_array().expect("json array");
+        assert_eq!(objects.len(), 2);
+        assert!(objects.iter().all(|item| {
+            let object = item.as_object().expect("json object");
+            object.len() == 2 && object.contains_key("src") && object.contains_key("dst")
+        }));
+
+        let csv_path = root.join("roundtrip.csv");
+        let json_path = root.join("roundtrip.json");
+        tokio::fs::write(&csv_path, csv)
+            .await
+            .expect("write csv export");
+        tokio::fs::write(&json_path, json)
+            .await
+            .expect("write json export");
+        for (path, name) in [(&csv_path, "CSV Roundtrip"), (&json_path, "JSON Roundtrip")] {
+            let roundtrip = import_glossary(
+                &pool,
+                &root,
+                ImportGlossaryInput {
+                    file_path: path.to_string_lossy().to_string(),
+                    name: name.into(),
+                    source_language: "en".into(),
+                    target_language: "zh-CN".into(),
+                    tags: Vec::new(),
+                },
+            )
+            .await
+            .expect("roundtrip import");
+            assert_eq!(roundtrip.entry_count, 2);
+        }
 
         pool.close().await;
         let _ = tokio::fs::remove_dir_all(&root).await;

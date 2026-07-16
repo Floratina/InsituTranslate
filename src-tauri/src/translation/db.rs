@@ -2849,7 +2849,7 @@ pub async fn get_task_runtime_action_required(
     }
     if last_error
         .as_deref()
-        .is_some_and(|error| error.starts_with("MODEL_UNAVAILABLE:GLOSSARY:"))
+        .is_some_and(|error| error.contains("MODEL_UNAVAILABLE:GLOSSARY:"))
     {
         unavailable_domains.push(TaskRuntimeConfigDomain::Glossary);
     }
@@ -2985,10 +2985,28 @@ pub async fn replace_task_runtime_snapshot(
     provider_pool: &SqlitePool,
     config_pool: &SqlitePool,
     workspace_root: &Path,
+    glossary_config_pool: &SqlitePool,
+    glossary_workspace_root: &Path,
     input: ReplaceTaskRuntimeSnapshotInput,
 ) -> Result<TranslationTaskView, String> {
     let snapshot = resolve_task_runtime_snapshot(provider_pool, input.config).await?;
     let indexed = get_task_from_index(config_pool, &input.task_id).await?;
+    let previous_glossary_id = indexed.glossary_id.clone();
+    let keeps_auto_glossary = snapshot.glossary_config.use_glossary
+        && snapshot.glossary_config.glossary_mode == GlossaryMode::Auto;
+    let cleanup_draft_id = if keeps_auto_glossary {
+        None
+    } else {
+        match indexed.glossary_id.as_deref() {
+            Some(glossary_id) => {
+                let glossary =
+                    crate::glossaries::get_glossary(glossary_config_pool, glossary_id).await?;
+                (glossary.status != crate::glossaries::GlossaryStatus::Success)
+                    .then_some(glossary_id.to_string())
+            }
+            None => None,
+        }
+    };
     let inp_path = PathBuf::from(&indexed.inp_path);
     if !inp_path.starts_with(workspace_root) {
         return Err("Task file is outside the configured workspace".into());
@@ -3006,6 +3024,16 @@ pub async fn replace_task_runtime_snapshot(
         ),
     );
     let inp_pool = connect_inp(&inp_path).await?;
+    let previous_glossary_config = task_glossary_config(&inp_pool).await?;
+    let glossary_id_to_bind = if snapshot.glossary_config.glossary_mode == GlossaryMode::Auto {
+        if previous_glossary_config.glossary_mode == GlossaryMode::Auto {
+            previous_glossary_config.glossary_id.as_deref()
+        } else {
+            None
+        }
+    } else {
+        snapshot.glossary_config.glossary_id.as_deref()
+    };
     let total_chunks = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chunks")
         .fetch_one(&inp_pool)
         .await
@@ -3052,13 +3080,7 @@ pub async fn replace_task_runtime_snapshot(
     .bind(snapshot.config.enable_translation)
     .bind(snapshot.glossary_config.use_glossary)
     .bind(snapshot.glossary_config.glossary_mode.as_str())
-    .bind(
-        if snapshot.glossary_config.glossary_mode == GlossaryMode::Auto {
-            None
-        } else {
-            snapshot.glossary_config.glossary_id.as_deref()
-        },
-    )
+    .bind(glossary_id_to_bind)
     .bind(snapshot.glossary_generation_snapshot_json)
     .bind(config_snapshot)
     .bind(progress_detail_json)
@@ -3073,7 +3095,38 @@ pub async fn replace_task_runtime_snapshot(
         .map_err(|error| error.to_string())?;
     let local = metadata_task(&inp_pool, &inp_path).await?;
     inp_pool.close().await;
-    publish_task_index_snapshot(config_pool, &local).await
+    let task = publish_task_index_snapshot(config_pool, &local).await?;
+    if let Some(glossary_id) = cleanup_draft_id.as_deref() {
+        let ticket = crate::glossaries::stage_unreferenced_auto_glossary_deletion(
+            glossary_config_pool,
+            config_pool,
+            glossary_workspace_root,
+            &input.task_id,
+            glossary_id,
+        )
+        .await?;
+        if let Some(ticket) = ticket {
+            crate::glossaries::commit_staged_glossary_deletion(glossary_config_pool, &ticket)
+                .await?;
+        } else {
+            crate::glossaries::detach_auto_glossary_origin(
+                glossary_config_pool,
+                glossary_id,
+                &input.task_id,
+            )
+            .await?;
+        }
+    } else if !keeps_auto_glossary {
+        if let Some(glossary_id) = previous_glossary_id.as_deref() {
+            crate::glossaries::detach_auto_glossary_origin(
+                glossary_config_pool,
+                glossary_id,
+                &input.task_id,
+            )
+            .await?;
+        }
+    }
+    Ok(task)
 }
 
 pub async fn reset_task_for_retranslation(
@@ -3084,29 +3137,48 @@ pub async fn reset_task_for_retranslation(
     id: &str,
 ) -> Result<TranslationTaskView, String> {
     let indexed = get_task_from_index(config_pool, id).await?;
-    let deletion_ticket = if !indexed.enable_translation {
-        match indexed.glossary_id.as_deref() {
-            Some(glossary_id) => {
-                crate::glossaries::stage_unreferenced_auto_glossary_deletion(
-                    glossary_config_pool,
-                    config_pool,
-                    glossary_workspace_root,
-                    id,
-                    glossary_id,
+    let previous_glossary_id = indexed.glossary_id.clone();
+    let (deletion_ticket, clear_auto_glossary) = match indexed.glossary_id.as_deref() {
+        Some(glossary_id) => {
+            let glossary =
+                crate::glossaries::get_glossary(glossary_config_pool, glossary_id).await?;
+            let clear = !indexed.enable_translation
+                || glossary.status != crate::glossaries::GlossaryStatus::Success;
+            if clear {
+                (
+                    crate::glossaries::stage_unreferenced_auto_glossary_deletion(
+                        glossary_config_pool,
+                        config_pool,
+                        glossary_workspace_root,
+                        id,
+                        glossary_id,
+                    )
+                    .await?,
+                    true,
                 )
-                .await?
+            } else {
+                (None, false)
             }
-            None => None,
         }
-    } else {
-        None
+        None => (None, true),
     };
-    let reset = reset_task_for_retranslation_inner(config_pool, workspace_root, id).await;
+    let reset =
+        reset_task_for_retranslation_inner(config_pool, workspace_root, id, clear_auto_glossary)
+            .await;
     match reset {
         Ok(task) => {
             if let Some(ticket) = deletion_ticket.as_ref() {
                 crate::glossaries::commit_staged_glossary_deletion(glossary_config_pool, ticket)
                     .await?;
+            } else if clear_auto_glossary {
+                if let Some(glossary_id) = previous_glossary_id.as_deref() {
+                    crate::glossaries::detach_auto_glossary_origin(
+                        glossary_config_pool,
+                        glossary_id,
+                        id,
+                    )
+                    .await?;
+                }
             }
             Ok(task)
         }
@@ -3124,6 +3196,7 @@ async fn reset_task_for_retranslation_inner(
     config_pool: &SqlitePool,
     workspace_root: &Path,
     id: &str,
+    clear_auto_glossary: bool,
 ) -> Result<TranslationTaskView, String> {
     let indexed = get_task_from_index(config_pool, id).await?;
     if !matches!(
@@ -3141,7 +3214,7 @@ async fn reset_task_for_retranslation_inner(
     }
     let inp_pool = connect_inp(&inp_path).await?;
     let mut glossary_config = task_glossary_config(&inp_pool).await?;
-    if !indexed.enable_translation && glossary_config.glossary_mode == GlossaryMode::Auto {
+    if clear_auto_glossary && glossary_config.glossary_mode == GlossaryMode::Auto {
         glossary_config.glossary_id = None;
     }
     let total_chunks = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chunks")
@@ -3449,6 +3522,8 @@ pub async fn mark_task_interrupted(
 pub async fn delete_translation_task(
     config_pool: &SqlitePool,
     workspace_root: &Path,
+    glossary_config_pool: &SqlitePool,
+    glossary_workspace_root: &Path,
     id: &str,
 ) -> Result<(), String> {
     let task = get_task_from_index(config_pool, id).await?;
@@ -3464,6 +3539,49 @@ pub async fn delete_translation_task(
     if !inp_path.starts_with(workspace_root) {
         return Err("Refusing to delete a task outside the workspace".into());
     }
+    let deletion_ticket = match task.glossary_id.as_deref() {
+        Some(glossary_id) => {
+            let glossary =
+                crate::glossaries::get_glossary(glossary_config_pool, glossary_id).await?;
+            if glossary.status == crate::glossaries::GlossaryStatus::Success {
+                None
+            } else {
+                crate::glossaries::stage_unreferenced_auto_glossary_deletion(
+                    glossary_config_pool,
+                    config_pool,
+                    glossary_workspace_root,
+                    id,
+                    glossary_id,
+                )
+                .await?
+            }
+        }
+        None => None,
+    };
+    let result = delete_translation_task_inner(config_pool, id, &inp_path).await;
+    match result {
+        Ok(()) => {
+            if let Some(ticket) = deletion_ticket.as_ref() {
+                crate::glossaries::commit_staged_glossary_deletion(glossary_config_pool, ticket)
+                    .await?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(ticket) = deletion_ticket.as_ref() {
+                crate::glossaries::rollback_staged_glossary_deletion(glossary_config_pool, ticket)
+                    .await?;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn delete_translation_task_inner(
+    config_pool: &SqlitePool,
+    id: &str,
+    inp_path: &Path,
+) -> Result<(), String> {
     sqlx::query("DELETE FROM task_index WHERE id = ?")
         .bind(id)
         .execute(config_pool)
@@ -3479,6 +3597,8 @@ pub async fn delete_translation_task(
 pub async fn delete_translation_tasks(
     config_pool: &SqlitePool,
     workspace_root: &Path,
+    glossary_config_pool: &SqlitePool,
+    glossary_workspace_root: &Path,
     ids: &[String],
 ) -> Result<(), String> {
     for id in ids {
@@ -3493,7 +3613,14 @@ pub async fn delete_translation_tasks(
         }
     }
     for id in ids {
-        delete_translation_task(config_pool, workspace_root, id).await?;
+        delete_translation_task(
+            config_pool,
+            workspace_root,
+            glossary_config_pool,
+            glossary_workspace_root,
+            id,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -4243,7 +4370,7 @@ fn chunk_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TranslationChunkView,
 
 pub(super) async fn pending_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>, String> {
     let rows = sqlx::query(
-        "SELECT id, sequence, source_text, map_json FROM chunks WHERE status = ? ORDER BY sequence",
+        "SELECT id, sequence, preprocessed_text, source_text, map_json FROM chunks WHERE status = ? ORDER BY sequence",
     )
     .bind(TranslationChunkStatus::Pending.as_str())
     .fetch_all(pool)
@@ -4254,6 +4381,7 @@ pub(super) async fn pending_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>
         .map(|row| ChunkRecord {
             id: row.get("id"),
             sequence: row.get("sequence"),
+            preprocessed_text: row.get("preprocessed_text"),
             source_text: row.get("source_text"),
             map_json: row.get("map_json"),
         })
@@ -4272,16 +4400,18 @@ pub(super) async fn ensure_task_has_translatable_chunks(pool: &SqlitePool) -> Re
 }
 
 pub(super) async fn glossary_source_chunks(pool: &SqlitePool) -> Result<Vec<ChunkRecord>, String> {
-    let rows =
-        sqlx::query("SELECT id, sequence, source_text, map_json FROM chunks ORDER BY sequence")
-            .fetch_all(pool)
-            .await
-            .map_err(|error| error.to_string())?;
+    let rows = sqlx::query(
+        "SELECT id, sequence, preprocessed_text, source_text, map_json FROM chunks ORDER BY sequence",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
     Ok(rows
         .into_iter()
         .map(|row| ChunkRecord {
             id: row.get("id"),
             sequence: row.get("sequence"),
+            preprocessed_text: row.get("preprocessed_text"),
             source_text: row.get("source_text"),
             map_json: row.get("map_json"),
         })

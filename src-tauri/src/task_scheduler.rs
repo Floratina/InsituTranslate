@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::diagnostics::BackendLog;
+use crate::glossaries::{self, GlossaryProgressPayload, GLOSSARY_PROGRESS_EVENT};
 use crate::settings::{self, TaskSchedulerPreferences};
 use crate::translation_tasks::{
     self, RunMode, TaskRuntimeActionRequired, TranslationInterrupt, TranslationProgressPayload,
@@ -448,24 +449,21 @@ impl TaskSchedulerWorker {
         }
         if let Some(message) = completion.panic_message {
             let error = format!("Task worker panicked: {message}");
-            if let Ok(task) = translation_tasks::get_translation_task_summary(
+            match translation_tasks::get_translation_task_summary(
                 &self.context.config_pool,
                 &completion.task_id,
             )
             .await
             {
-                if let Ok(failed) = translation_tasks::mark_task_failed_after_runtime_error(
-                    &self.context.config_pool,
-                    PathBuf::from(task.inp_path).as_path(),
-                    error.clone(),
-                )
-                .await
-                {
-                    emit_task_status(&self.context.app, &failed);
+                Ok(task) => {
+                    let inp_path = PathBuf::from(task.inp_path);
+                    mark_execution_failed(&self.context, &completion.task_id, &inp_path, error)
+                        .await;
                 }
-            }
-            if let Some(log) = &self.backend_log {
-                log.write("ERROR", "task-scheduler", error);
+                Err(lookup_error) => {
+                    log_execution_error(&self.context.app, &completion.task_id, &error);
+                    log_execution_error(&self.context.app, &completion.task_id, &lookup_error);
+                }
             }
             return;
         }
@@ -610,13 +608,36 @@ async fn mark_execution_failed(
         Ok(task) => emit_task_status(&context.app, &task),
         Err(sync_error) => {
             log_execution_error(&context.app, task_id, &sync_error);
-            if let Ok(task) =
-                translation_tasks::mark_task_index_failed(&context.config_pool, task_id, error)
-                    .await
+            if let Ok(task) = translation_tasks::mark_task_index_failed(
+                &context.config_pool,
+                task_id,
+                error.clone(),
+            )
+            .await
             {
                 emit_task_status(&context.app, &task);
             }
         }
+    }
+    match glossaries::mark_auto_glossary_failed_after_runtime_error(
+        &context.glossary_config_pool,
+        task_id,
+        &error,
+    )
+    .await
+    {
+        Ok(Some(glossary)) => {
+            let _ = context.app.emit(
+                GLOSSARY_PROGRESS_EVENT,
+                GlossaryProgressPayload { glossary },
+            );
+        }
+        Ok(None) => {}
+        Err(sync_error) => log_execution_error(
+            &context.app,
+            task_id,
+            &format!("Unable to mark automatic glossary failed: {sync_error}"),
+        ),
     }
 }
 

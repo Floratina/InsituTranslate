@@ -6,6 +6,8 @@ import type {
   ExportGlossaryInput,
   GlossaryEntriesQuery,
   GlossaryEntryPage,
+  GlossaryFailedChunkPage,
+  GlossaryFailedChunksQuery,
   GlossaryEntryView,
   GlossaryListQuery,
   GlossaryView,
@@ -49,6 +51,12 @@ export function getGlossaryEntries(
   query: GlossaryEntriesQuery,
 ): Promise<GlossaryEntryPage> {
   return invoke<GlossaryEntryPage>("get_glossary_entries", { query });
+}
+
+export function getGlossaryFailedChunks(
+  query: GlossaryFailedChunksQuery,
+): Promise<GlossaryFailedChunkPage> {
+  return invoke<GlossaryFailedChunkPage>("get_glossary_failed_chunks", { query });
 }
 
 export function createGlossaryEntry(

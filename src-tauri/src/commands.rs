@@ -26,8 +26,9 @@ use crate::domain::{
 };
 use crate::glossaries::{
     self, CreateGlossaryEntryInput, DeleteGlossaryEntryInput, ExportGlossaryInput,
-    GlossaryEntriesQuery, GlossaryEntryPage, GlossaryEntryView, GlossaryListQuery, GlossaryView,
-    ImportGlossaryInput, PrepareAutoGlossaryInput, UpdateGlossaryEntryInput, UpdateGlossaryInput,
+    GlossaryEntriesQuery, GlossaryEntryPage, GlossaryEntryView, GlossaryFailedChunkPage,
+    GlossaryFailedChunksQuery, GlossaryListQuery, GlossaryView, ImportGlossaryInput,
+    PrepareAutoGlossaryInput, UpdateGlossaryEntryInput, UpdateGlossaryInput,
 };
 use crate::settings::{
     AppearancePreferences, AppearancePreferencesState, FontCacheRefresh, TaskSchedulerPreferences,
@@ -686,6 +687,8 @@ pub async fn delete_translation_task(state: State<'_, AppState>, id: String) -> 
     translation_tasks::delete_translation_task(
         &state.translation_config_pool,
         &state.translation_workspace_root,
+        &state.glossary_config_pool,
+        &state.glossary_workspace_root,
         &id,
     )
     .await
@@ -699,6 +702,8 @@ pub async fn delete_translation_tasks(
     translation_tasks::delete_translation_tasks(
         &state.translation_config_pool,
         &state.translation_workspace_root,
+        &state.glossary_config_pool,
+        &state.glossary_workspace_root,
         &input.ids,
     )
     .await
@@ -721,6 +726,8 @@ pub async fn replace_task_runtime_snapshot(
         &state.pool,
         &state.translation_config_pool,
         &state.translation_workspace_root,
+        &state.glossary_config_pool,
+        &state.glossary_workspace_root,
         input,
     )
     .await
@@ -806,6 +813,14 @@ pub async fn get_glossary_entries(
     query: GlossaryEntriesQuery,
 ) -> Result<GlossaryEntryPage, String> {
     glossaries::get_glossary_entries(&state.glossary_config_pool, query).await
+}
+
+#[tauri::command]
+pub async fn get_glossary_failed_chunks(
+    state: State<'_, AppState>,
+    query: GlossaryFailedChunksQuery,
+) -> Result<GlossaryFailedChunkPage, String> {
+    glossaries::get_glossary_failed_chunks(&state.glossary_config_pool, query).await
 }
 
 #[tauri::command]

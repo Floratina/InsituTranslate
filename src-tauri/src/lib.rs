@@ -75,6 +75,10 @@ pub fn run() {
                 &translation_config_pool,
             ))
             .map_err(|error| format!("Unable to recover glossary deletion journal: {error}"))?;
+            tauri::async_runtime::block_on(glossaries::recover_auto_glossary_drafts(
+                &glossary_config_pool,
+            ))
+            .map_err(|error| format!("Unable to recover automatic glossary drafts: {error}"))?;
             let client = commands::build_http_client()
                 .map_err(|error| format!("Unable to initialize HTTP client: {error}"))?;
             let scheduler_preferences = tauri::async_runtime::block_on(
@@ -169,6 +173,7 @@ pub fn run() {
             commands::open_glossary_folder,
             commands::export_glossary,
             commands::get_glossary_entries,
+            commands::get_glossary_failed_chunks,
             commands::create_glossary_entry,
             commands::update_glossary_entry,
             commands::delete_glossary_entry,

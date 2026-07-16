@@ -5,6 +5,7 @@ export type GlossarySortField = "name" | "tags" | "language";
 export type GlossaryEntrySortField = "src" | "dst";
 
 export type GlossaryExportFormat = "csv" | "json";
+export type GlossaryStatus = "initializing" | "building" | "interrupted" | "success" | "failed";
 
 export interface GlossarySortInput {
   field: GlossarySortField;
@@ -17,6 +18,7 @@ export interface GlossaryListQuery {
   sourceLanguage?: string | null;
   targetLanguage?: string | null;
   sort?: GlossarySortInput | null;
+  usableOnly?: boolean;
 }
 
 export interface GlossaryView {
@@ -28,6 +30,13 @@ export interface GlossaryView {
   tags: string[];
   sourceType: string;
   entryCount: number;
+  status: GlossaryStatus;
+  hasFailures: boolean;
+  originTaskId?: string | null;
+  totalChunks: number;
+  successChunks: number;
+  failedChunks: number;
+  interruptedChunks: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -77,6 +86,26 @@ export interface GlossaryEntryView {
 export interface GlossaryEntryPage {
   entries: GlossaryEntryView[];
   total: number;
+  page: number;
+  pageSize: number;
+}
+
+export interface GlossaryFailedChunkView {
+  id: string;
+  sequence: number;
+  displaySourceText: string;
+  errorMessage?: string | null;
+}
+
+export interface GlossaryFailedChunkPage {
+  chunks: GlossaryFailedChunkView[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export interface GlossaryFailedChunksQuery {
+  id: string;
   page: number;
   pageSize: number;
 }

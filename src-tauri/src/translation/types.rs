@@ -663,6 +663,7 @@ pub struct PreparedRun {
 pub(super) struct ChunkRecord {
     pub(super) id: String,
     pub(super) sequence: i64,
+    pub(super) preprocessed_text: String,
     pub(super) source_text: String,
     pub(super) map_json: String,
 }

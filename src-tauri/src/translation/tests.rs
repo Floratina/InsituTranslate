@@ -529,6 +529,10 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
     let provider_db = root.join("providers.sqlite");
     let provider_pool = app_db::connect(&provider_db).await.expect("provider db");
     let config_pool = connect_config_db(&root).await.expect("config db");
+    let glossary_root = root.join("glossary-workspace");
+    let glossary_config_pool = crate::glossaries::connect_config_db(&glossary_root)
+        .await
+        .expect("glossary config db");
     let provider = app_db::create_provider(
         &provider_pool,
         CreateProviderInput {
@@ -792,6 +796,8 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
         &provider_pool,
         &config_pool,
         &root,
+        &glossary_config_pool,
+        &glossary_root,
         ReplaceTaskRuntimeSnapshotInput {
             task_id: task.id.clone(),
             config: TranslationConfigView {
@@ -825,6 +831,7 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
     replaced_inp.close().await;
     provider_pool.close().await;
     config_pool.close().await;
+    glossary_config_pool.close().await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1804,6 +1811,7 @@ async fn translate_chunk_retries_transient_429_without_interrupting_task() {
         ChunkRecord {
             id: "chunk-429".into(),
             sequence: 0,
+            preprocessed_text: "Hello".into(),
             source_text: "Hello".into(),
             map_json: "{}".into(),
         },
@@ -1863,6 +1871,7 @@ async fn translate_chunk_interruption_returns_empty_interrupted_outcome() {
         ChunkRecord {
             id: "chunk-paused".into(),
             sequence: 0,
+            preprocessed_text: "Hello".into(),
             source_text: "Hello".into(),
             map_json: "{}".into(),
         },
@@ -1933,6 +1942,7 @@ async fn translate_chunk_interrupts_immediately_on_permanent_provider_error() {
         ChunkRecord {
             id: "chunk-401".into(),
             sequence: 0,
+            preprocessed_text: "Hello".into(),
             source_text: "Hello".into(),
             map_json: "{}".into(),
         },
@@ -2009,6 +2019,7 @@ async fn translate_chunk_marks_transient_exhaustion_failed_without_interrupt() {
         ChunkRecord {
             id: "chunk-503".into(),
             sequence: 0,
+            preprocessed_text: "Hello".into(),
             source_text: "Hello".into(),
             map_json: "{}".into(),
         },
@@ -2797,6 +2808,25 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
     )
     .await
     .expect("import task");
+    let glossary_root = root.join("glossary-workspace");
+    let glossary_pool = crate::glossaries::connect_config_db(&glossary_root)
+        .await
+        .expect("glossary config");
+    let successful_glossary = crate::glossaries::create_auto_glossary(
+        &glossary_pool,
+        &glossary_root,
+        crate::glossaries::CreateAutoGlossaryInput {
+            name: "Successful automatic glossary".into(),
+            source_language: "en".into(),
+            target_language: "zh-CN".into(),
+            entries: vec![GlossaryEntry {
+                src: "source".into(),
+                dst: "译文".into(),
+            }],
+        },
+    )
+    .await
+    .expect("create successful glossary");
     let inp_pool = connect_inp(Path::new(&imported.inp_path))
         .await
         .expect("open inp");
@@ -2816,9 +2846,10 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
             target_text_tokens = 40, total_text_tokens = 50, last_error = 'old error',
             rate_limit_status = 'limited', active_retry_json = '{}',
             global_background = 'old background', use_glossary = 1,
-            glossary_mode = 'auto', glossary_id = 'successful-auto-glossary'",
+            glossary_mode = 'auto', glossary_id = ?",
     )
     .bind(TranslationTaskStatus::Success.as_str())
+    .bind(&successful_glossary.id)
     .execute(&inp_pool)
     .await
     .expect("complete metadata");
@@ -2830,10 +2861,6 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
         .await
         .expect("publish completed task");
 
-    let glossary_root = root.join("glossary-workspace");
-    let glossary_pool = crate::glossaries::connect_config_db(&glossary_root)
-        .await
-        .expect("glossary config");
     let reset =
         reset_task_for_retranslation(&pool, &root, &glossary_pool, &glossary_root, &imported.id)
             .await
@@ -2851,7 +2878,7 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
     assert!(reset.active_retry.is_none());
     assert_eq!(
         reset.glossary_id.as_deref(),
-        Some("successful-auto-glossary")
+        Some(successful_glossary.id.as_str())
     );
 
     let reset_inp = connect_inp(Path::new(&imported.inp_path))
@@ -2902,7 +2929,7 @@ async fn retranslation_reset_clears_completed_output_before_queueing() {
             .try_get::<Option<String>, _>("glossary_id")
             .unwrap_or(None)
             .as_deref(),
-        Some("successful-auto-glossary")
+        Some(successful_glossary.id.as_str())
     );
     reset_inp.close().await;
 

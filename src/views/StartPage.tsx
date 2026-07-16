@@ -428,26 +428,15 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   const cachedGlossaryProviderOptions = appSessionCache.providers("glossary").read();
   const cachedTranslationAssistantOptions = appSessionCache.assistants("translation").read();
   const cachedGlossaryAssistantOptions = appSessionCache.assistants("glossary").read();
-  const cachedGlossaryIndex = appSessionCache.glossaryIndex.read();
-  const cachedGlossaries = cachedGlossaryIndex?.filterSeed;
   const cachedConfig = cachedDraft?.config ?? appSessionCache.translationConfig.read();
   const normalizedInitialConfig = cachedConfig
-    ? normalizeStartConfig(cachedConfig, cachedGlossaries)
+    ? normalizeStartConfig(cachedConfig)
     : normalizeStartConfig(cachedDraft?.config ?? DEFAULT_CONFIG);
   const initialConfig = initializeEmptyRuntimeConfig(
     normalizedInitialConfig,
     (cachedTranslationProviderOptions ?? []).filter((provider) => provider.enabled),
     (cachedGlossaryProviderOptions ?? []).filter((provider) => provider.enabled),
   );
-  const hasCachedOptions = Boolean(
-    cachedTranslationProviderOptions
-      && cachedGlossaryProviderOptions
-      && cachedTranslationAssistantOptions
-      && cachedGlossaryAssistantOptions
-      && cachedGlossaries
-      && cachedConfig,
-  );
-
   const [filePaths, setFilePaths] = useState<string[]>(cachedDraft?.filePaths ?? []);
   const [dragActive, setDragActive] = useState(false);
   const [sourceLanguage, setSourceLanguage] = useState(
@@ -471,15 +460,15 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
   const [glossaryAssistants, setGlossaryAssistants] = useState<AssistantView[]>(
     cachedGlossaryAssistantOptions ?? [],
   );
-  const [glossaries, setGlossaries] = useState<GlossaryView[]>(cachedGlossaries ?? []);
+  const [glossaries, setGlossaries] = useState<GlossaryView[]>([]);
   const [config, setConfig] = useState<TranslationConfigView>(initialConfig);
-  const [loading, setLoading] = useState(!hasCachedOptions);
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
   const [creationJobs, setCreationJobs] = useState<StartCreationJob[]>(
     appSessionCache.startCreationJobs.read(),
   );
-  const shouldLoadInitialOptions = useRef(!hasCachedOptions);
+  const shouldLoadInitialOptions = useRef(true);
   const dropZoneRef = useRef<HTMLButtonElement | null>(null);
   const lastNativeDropRef = useRef<{ key: string; at: number } | null>(null);
   const { pushToast } = useToast();
@@ -667,7 +656,7 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
         translationAssistantResult,
         glossaryAssistantResult,
         configResult,
-        glossaryIndex,
+        glossaryResult,
       ] = await Promise.all([
         appSessionCache
           .providers("translation")
@@ -682,24 +671,8 @@ export default function StartPage({ onTaskCreated }: StartPageProps) {
           .assistants("glossary")
           .loadOnce(() => invoke<AssistantView[]>("list_assistants", { purpose: "glossary" })),
         appSessionCache.translationConfig.loadOnce(getTranslationConfig),
-        appSessionCache.glossaryIndex.loadOnce(async () => {
-          const glossaries = await listGlossaries(null);
-          return {
-            glossaries,
-            filterSeed: glossaries,
-            selectedGlossaryId: null,
-            search: "",
-            tagFilter: START_GLOSSARY_ALL_VALUE,
-            sourceFilter: START_GLOSSARY_ALL_VALUE,
-            targetFilter: START_GLOSSARY_ALL_VALUE,
-            listSort: { field: "name" as const, mode: "created-desc" as const },
-            listPage: 0,
-            listPageSize: 20,
-            listWidths: START_GLOSSARY_WIDTHS,
-          };
-        }),
+        listGlossaries({ usableOnly: true }),
       ]);
-      const glossaryResult = glossaryIndex.filterSeed;
       const enabledTranslationProviders = translationProviderResult.filter(
         (provider) => provider.enabled,
       );

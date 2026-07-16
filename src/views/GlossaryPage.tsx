@@ -8,6 +8,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   ArrowLeft,
   ArrowUpDown,
@@ -77,6 +78,7 @@ import {
   deleteGlossaryEntry,
   exportGlossary,
   getGlossaryEntries,
+  getGlossaryFailedChunks,
   importGlossary,
   listGlossaries,
   openGlossaryFolder,
@@ -95,7 +97,9 @@ import type {
   GlossaryEntrySortField,
   GlossaryEntryView,
   GlossaryExportFormat,
+  GlossaryFailedChunkView,
   GlossarySortField,
+  GlossaryStatus,
   GlossaryView,
   SortMode,
 } from "@/features/glossary/types";
@@ -143,6 +147,32 @@ interface EntryEditorState {
 
 interface GlossaryEditorState {
   glossary: GlossaryView;
+}
+
+interface GlossaryProgressPayload {
+  glossary: GlossaryView;
+}
+
+const GLOSSARY_STATUS_LABELS: Record<GlossaryStatus, string> = {
+  initializing: "初始化中",
+  building: "建立中",
+  interrupted: "已中断",
+  success: "成功",
+  failed: "失败",
+};
+
+function GlossaryStatusBadge({ glossary }: { glossary: GlossaryView }) {
+  const label = glossary.status === "success" && glossary.hasFailures
+    ? "存在失败"
+    : GLOSSARY_STATUS_LABELS[glossary.status];
+  return (
+    <Badge
+      variant={glossary.status === "failed" ? "destructive" : "secondary"}
+      className="shrink-0"
+    >
+      {label}
+    </Badge>
+  );
 }
 
 function isTauriRuntime(): boolean {
@@ -323,6 +353,7 @@ export default function GlossaryPage() {
     ) ?? null;
   const listRequestId = useRef(0);
   const entryRequestId = useRef(0);
+  const failedChunkRequestId = useRef(0);
   const listHasLoaded = useRef(Boolean(cachedIndex));
   const skipInitialGlossaryRefresh = useRef(Boolean(cachedIndex));
   const entryLoadedGlossaryId = useRef<string | null>(null);
@@ -368,6 +399,14 @@ export default function GlossaryPage() {
   const [entryPageSize, setEntryPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [detailWidths, setDetailWidths] = useState(DETAIL_INITIAL_WIDTHS);
   const [entryRefreshKey, setEntryRefreshKey] = useState(0);
+  const [failedChunkLoading, setFailedChunkLoading] = useState(false);
+  const [failedChunkPage, setFailedChunkPage] = useState({
+    chunks: [] as GlossaryFailedChunkView[],
+    total: 0,
+    page: 0,
+    pageSize: DEFAULT_PAGE_SIZE,
+  });
+  const [failedChunkPageSize, setFailedChunkPageSize] = useState(DEFAULT_PAGE_SIZE);
 
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -402,6 +441,10 @@ export default function GlossaryPage() {
     return glossaries.slice(start, start + listPageSize);
   }, [glossaries, listPage, listPageSize]);
   const selectedEntryTotalPages = Math.max(1, Math.ceil(entryPage.total / entryPageSize));
+  const selectedFailedChunkTotalPages = Math.max(
+    1,
+    Math.ceil(failedChunkPage.total / failedChunkPageSize),
+  );
   const selectedGlossaryId = selectedGlossary?.id ?? null;
 
   useEffect(() => {
@@ -520,6 +563,31 @@ export default function GlossaryPage() {
   }, [refreshGlossaries]);
 
   useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let cancelled = false;
+    let cleanup: (() => void) | null = null;
+    void listen<GlossaryProgressPayload>("glossary-progress", (event) => {
+      const updated = event.payload.glossary;
+      const replace = (items: GlossaryView[]): GlossaryView[] => {
+        const index = items.findIndex((item) => item.id === updated.id);
+        if (index < 0) return [updated, ...items];
+        return items.map((item) => (item.id === updated.id ? updated : item));
+      };
+      setGlossaries(replace);
+      setFilterSeed(replace);
+      setSelectedGlossary((current) => current?.id === updated.id ? updated : current);
+      setEntryRefreshKey((current) => current + 1);
+    }).then((unlisten) => {
+      if (cancelled) unlisten();
+      else cleanup = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+  }, []);
+
+  useEffect(() => {
     setEntryPage((current) => ({ ...current, page: 0 }));
   }, [entrySearch, entrySort, selectedGlossaryId, entryPageSize]);
 
@@ -529,6 +597,51 @@ export default function GlossaryPage() {
       page: Math.min(current.page, selectedEntryTotalPages - 1),
     }));
   }, [selectedEntryTotalPages]);
+
+  useEffect(() => {
+    setFailedChunkPage((current) => ({ ...current, page: 0 }));
+  }, [selectedGlossaryId, failedChunkPageSize]);
+
+  useEffect(() => {
+    setFailedChunkPage((current) => ({
+      ...current,
+      page: Math.min(current.page, selectedFailedChunkTotalPages - 1),
+    }));
+  }, [selectedFailedChunkTotalPages]);
+
+  useEffect(() => {
+    async function loadFailedChunks(): Promise<void> {
+      const requestId = failedChunkRequestId.current + 1;
+      failedChunkRequestId.current = requestId;
+      if (!selectedGlossaryId || !isTauriRuntime()) {
+        setFailedChunkPage({ chunks: [], total: 0, page: 0, pageSize: failedChunkPageSize });
+        return;
+      }
+      setFailedChunkLoading(true);
+      try {
+        const page = await getGlossaryFailedChunks({
+          id: selectedGlossaryId,
+          page: failedChunkPage.page,
+          pageSize: failedChunkPageSize,
+        });
+        if (failedChunkRequestId.current !== requestId) return;
+        setFailedChunkPage(page);
+      } catch (error) {
+        if (failedChunkRequestId.current === requestId) {
+          pushToast(getErrorMessage(error), "error");
+        }
+      } finally {
+        if (failedChunkRequestId.current === requestId) setFailedChunkLoading(false);
+      }
+    }
+    void loadFailedChunks();
+  }, [
+    entryRefreshKey,
+    failedChunkPage.page,
+    failedChunkPageSize,
+    pushToast,
+    selectedGlossaryId,
+  ]);
 
   useEffect(() => {
     async function loadEntries(): Promise<void> {
@@ -858,9 +971,12 @@ export default function GlossaryPage() {
             entrySearch={entrySearch}
             entrySort={entrySort}
             entryLoading={entryLoading}
+            failedChunkPage={failedChunkPage}
+            failedChunkLoading={failedChunkLoading}
             entrySortLoading={entrySortLoading}
             widths={detailWidths}
             totalPages={selectedEntryTotalPages}
+            failedChunkTotalPages={selectedFailedChunkTotalPages}
             animateEnter={animateSecondaryView}
             onBack={closeGlossaryDetail}
             onSearchChange={setEntrySearch}
@@ -870,6 +986,8 @@ export default function GlossaryPage() {
             onSort={updateEntrySort}
             onPageChange={(page) => setEntryPage((current) => ({ ...current, page }))}
             onPageSizeChange={setEntryPageSize}
+            onFailedChunkPageChange={(page) => setFailedChunkPage((current) => ({ ...current, page }))}
+            onFailedChunkPageSizeChange={setFailedChunkPageSize}
             onResize={(event, index, renderedWidths) => startResize(event, index, renderedWidths, DETAIL_MIN_WIDTHS, setDetailWidths)}
             onAutoFit={autoFitDetailColumn}
           />
@@ -1280,12 +1398,20 @@ function GlossaryListTable({
                         onDoubleClick={() => onOpen(glossary)}
                       >
                         <td className="h-10 min-w-0 px-3 py-2">
-                          <div className="truncate font-medium text-foreground" title={glossary.name}>
-                            {glossary.name}
+                          <div className="flex min-w-0 items-center gap-2">
+                            <div className="min-w-0 flex-1 truncate font-medium text-foreground" title={glossary.name}>
+                              {glossary.name}
+                            </div>
+                            <GlossaryStatusBadge glossary={glossary} />
                           </div>
                         </td>
                         <td className="h-10 whitespace-nowrap px-3 py-2 text-sm text-muted-foreground">
-                          {glossary.entryCount} 条
+                          <div>{glossary.entryCount} 条</div>
+                          {glossary.totalChunks > 0 && (
+                            <div className="text-xs">
+                              {glossary.successChunks + glossary.failedChunks}/{glossary.totalChunks} 分块
+                            </div>
+                          )}
                         </td>
                         <td className="h-10 min-w-0 px-3 py-2">
                           <TagList tags={glossary.tags} />
@@ -1348,13 +1474,14 @@ function GlossaryListContextMenuContent({
   onExport,
   onDelete,
 }: GlossaryListActionMenuProps) {
+  const usable = glossary.status === "success";
   return (
     <ContextMenuContent className="w-56">
       <ContextMenuItem onSelect={() => onOpen(glossary)}>
         <BookOpen className="size-3.5" />
         打开术语表
       </ContextMenuItem>
-      <ContextMenuItem onSelect={() => onEditInfo(glossary)}>
+      <ContextMenuItem disabled={!usable} onSelect={() => onEditInfo(glossary)}>
         <Pencil className="size-3.5" />
         编辑术语表信息
       </ContextMenuItem>
@@ -1369,11 +1496,11 @@ function GlossaryListContextMenuContent({
           导出术语表
         </ContextMenuSubTriggerItem>
         <ContextMenuSubContent className="w-40">
-          <ContextMenuItem onSelect={() => onExport(glossary, "csv")}>
+          <ContextMenuItem disabled={!usable} onSelect={() => onExport(glossary, "csv")}>
             <FileSpreadsheet className="size-3.5" />
             导出 CSV
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => onExport(glossary, "json")}>
+          <ContextMenuItem disabled={!usable} onSelect={() => onExport(glossary, "json")}>
             <FileJson className="size-3.5" />
             导出 JSON
           </ContextMenuItem>
@@ -1399,6 +1526,7 @@ function GlossaryListActionDropdown({
   onExport,
   onDelete,
 }: GlossaryListActionMenuProps) {
+  const usable = glossary.status === "success";
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -1420,7 +1548,7 @@ function GlossaryListActionDropdown({
           <BookOpen className="size-3.5" />
           打开术语表
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => onEditInfo(glossary)}>
+        <DropdownMenuItem disabled={!usable} onSelect={() => onEditInfo(glossary)}>
           <Pencil className="size-3.5" />
           编辑术语表信息
         </DropdownMenuItem>
@@ -1435,11 +1563,11 @@ function GlossaryListActionDropdown({
             导出术语表
           </DropdownMenuSubTriggerItem>
           <DropdownMenuSubContent className="w-40">
-            <DropdownMenuItem onSelect={() => onExport(glossary, "csv")}>
+            <DropdownMenuItem disabled={!usable} onSelect={() => onExport(glossary, "csv")}>
               <FileSpreadsheet className="size-3.5" />
               导出 CSV
             </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => onExport(glossary, "json")}>
+            <DropdownMenuItem disabled={!usable} onSelect={() => onExport(glossary, "json")}>
               <FileJson className="size-3.5" />
               导出 JSON
             </DropdownMenuItem>
@@ -1470,9 +1598,17 @@ interface GlossaryDetailViewProps {
   entrySearch: string;
   entrySort: DetailSortState;
   entryLoading: boolean;
+  failedChunkPage: {
+    chunks: GlossaryFailedChunkView[];
+    total: number;
+    page: number;
+    pageSize: number;
+  };
+  failedChunkLoading: boolean;
   entrySortLoading: GlossaryEntrySortField | null;
   widths: number[];
   totalPages: number;
+  failedChunkTotalPages: number;
   onBack: () => void;
   onSearchChange: (value: string) => void;
   onAdd: () => void;
@@ -1481,6 +1617,8 @@ interface GlossaryDetailViewProps {
   onSort: (field: GlossaryEntrySortField) => void;
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
+  onFailedChunkPageChange: (page: number) => void;
+  onFailedChunkPageSizeChange: (pageSize: number) => void;
   onResize: (
     event: ReactPointerEvent<HTMLButtonElement>,
     index: number,
@@ -1496,9 +1634,12 @@ function GlossaryDetailView({
   entrySearch,
   entrySort,
   entryLoading,
+  failedChunkPage,
+  failedChunkLoading,
   entrySortLoading,
   widths,
   totalPages,
+  failedChunkTotalPages,
   onBack,
   onSearchChange,
   onAdd,
@@ -1507,6 +1648,8 @@ function GlossaryDetailView({
   onSort,
   onPageChange,
   onPageSizeChange,
+  onFailedChunkPageChange,
+  onFailedChunkPageSizeChange,
   onResize,
   onAutoFit,
 }: GlossaryDetailViewProps) {
@@ -1518,6 +1661,7 @@ function GlossaryDetailView({
   );
   const tableWidth = sum(adaptiveWidths) + ACTION_COLUMN_WIDTH;
   const tableNeedsHorizontalScroll = tableWidth > tableViewportWidth + 1;
+  const readOnly = glossary.status !== "success";
 
   return (
     <div
@@ -1533,17 +1677,61 @@ function GlossaryDetailView({
             <ArrowLeft className="size-4" />
           </Button>
           <div className="min-w-0 flex-1">
-            <h1 className="truncate text-xl font-medium tracking-tight">{glossary.name}</h1>
+            <div className="flex items-center gap-2">
+              <h1 className="truncate text-xl font-medium tracking-tight">{glossary.name}</h1>
+              <GlossaryStatusBadge glossary={glossary} />
+            </div>
             <p className="mt-0.5 text-xs text-muted-foreground">
               {displayLanguagePair(glossary.sourceLanguage, glossary.targetLanguage)} · {glossary.entryCount} 条术语
+              {glossary.totalChunks > 0 && ` · ${glossary.successChunks + glossary.failedChunks}/${glossary.totalChunks} 分块`}
             </p>
           </div>
-          <Button type="button" onClick={onAdd}>
+          <Button type="button" disabled={readOnly} onClick={onAdd}>
             <Plus className="size-4" />
             增加术语
           </Button>
         </div>
       </header>
+
+      {(failedChunkLoading || failedChunkPage.total > 0) && (
+        <section className="mb-3 shrink-0 overflow-hidden rounded-[6px] border bg-card">
+          <div className="flex items-center justify-between border-b px-3 py-2">
+            <div>
+              <h2 className="text-sm font-medium">失败分块</h2>
+              <p className="text-xs text-muted-foreground">原文仅供查看，暂不支持编辑或重试</p>
+            </div>
+            <Badge variant="secondary">{failedChunkPage.total} 块</Badge>
+          </div>
+          <ScrollArea className="h-56" viewportClassName="overscroll-contain">
+            <div className="divide-y">
+              {failedChunkLoading ? (
+                <div className="flex items-center justify-center gap-2 p-4 text-xs text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  正在加载失败分块
+                </div>
+              ) : failedChunkPage.chunks.map((chunk) => (
+                <div key={chunk.id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2">
+                  <div className="min-w-0 whitespace-pre-wrap break-words text-sm">
+                    {chunk.displaySourceText}
+                  </div>
+                  <span className="text-sm text-muted-foreground">(空)</span>
+                  {chunk.errorMessage && (
+                    <p className="col-span-2 text-xs text-destructive">{chunk.errorMessage}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </ScrollArea>
+          <PaginationBar
+            page={failedChunkPage.page}
+            pageSize={failedChunkPage.pageSize}
+            totalItems={failedChunkPage.total}
+            totalPages={failedChunkTotalPages}
+            onPageChange={onFailedChunkPageChange}
+            onPageSizeChange={onFailedChunkPageSizeChange}
+          />
+        </section>
+      )}
 
       <div className="relative mb-3 shrink-0">
         <Search className="pointer-events-none absolute top-1/2 left-2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -1612,7 +1800,17 @@ function GlossaryDetailView({
               ) : entryPage.entries.length === 0 ? (
                 <TableMessage colSpan={3}>暂无术语条目</TableMessage>
               ) : (
-                entryPage.entries.map((entry) => (
+                entryPage.entries.map((entry) => readOnly ? (
+                  <tr key={entry.id} className="border-b">
+                    <td className="h-9 min-w-0 truncate px-3 py-2" title={entry.src}>
+                      {entry.src}
+                    </td>
+                    <td className="h-9 min-w-0 truncate px-3 py-2" title={entry.dst}>
+                      {entry.dst}
+                    </td>
+                    <td className="h-9 px-2 py-1 text-center text-muted-foreground">—</td>
+                  </tr>
+                ) : (
                   <ContextMenu key={entry.id}>
                     <ContextMenuTrigger asChild>
                       <tr

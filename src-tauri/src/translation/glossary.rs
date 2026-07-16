@@ -18,7 +18,11 @@ use crate::adapters::RuntimeAdapter;
 use crate::db as app_db;
 use crate::diagnostics::BackendLog;
 use crate::domain::{ProviderPurpose, ThinkingConfig, UnifiedChatRequest};
-use crate::glossaries::{self, CreateAutoGlossaryInput, GlossaryView, PrepareAutoGlossaryInput};
+use crate::glossaries::{
+    self, AutoGlossaryDraft, AutoGlossarySourceChunk, EnsureAutoGlossaryDraftInput,
+    GlossaryProgressPayload, GlossaryStatus, GlossaryView, PrepareAutoGlossaryInput,
+    GLOSSARY_PROGRESS_EVENT,
+};
 use crate::glossary_prompt::{
     build_glossary_prompt, sanitize_and_flatten_glossary, GlossaryEntry, GlossaryPromptBuildResult,
     GlossaryPromptInput,
@@ -54,6 +58,15 @@ struct GlossaryRuntime {
     top_p: Option<f64>,
     web_search: bool,
     thinking: Option<ThinkingConfig>,
+}
+
+fn emit_glossary_progress(app: &AppHandle, glossary: &GlossaryView) {
+    let _ = app.emit(
+        GLOSSARY_PROGRESS_EVENT,
+        GlossaryProgressPayload {
+            glossary: glossary.clone(),
+        },
+    );
 }
 
 #[derive(Clone)]
@@ -178,11 +191,11 @@ impl GlossaryRequestReporter {
 #[derive(Debug, Clone)]
 enum AutoGlossaryChunkOutcome {
     Success {
-        sequence: i64,
+        chunk_id: String,
         entries: Vec<GlossaryEntry>,
     },
     Failed {
-        sequence: i64,
+        chunk_id: String,
         error: String,
     },
     Interrupted {
@@ -524,8 +537,15 @@ pub(super) async fn prepare_task_glossary(
             .glossary_id
             .ok_or_else(|| "Glossary selection is required for this task".to_string())?,
         GlossaryMode::Auto => match glossary_config.glossary_id {
-            Some(id) => id,
-            None => {
+            Some(id)
+                if glossaries::get_glossary(glossary_config_pool, &id)
+                    .await?
+                    .status
+                    == GlossaryStatus::Success =>
+            {
+                id
+            }
+            _ => {
                 match generate_auto_glossary(
                     app,
                     provider_pool,
@@ -625,18 +645,89 @@ async fn generate_auto_glossary(
         web_search: snapshot.web_search,
         thinking: snapshot.thinking,
     };
-    let chunks = pending_chunks
+    let source_chunks = pending_chunks
         .iter()
         .filter(|chunk| !chunk.source_text.trim().is_empty())
         .cloned()
         .collect::<Vec<_>>();
-    if chunks.is_empty() {
+    if source_chunks.is_empty() {
         return Err(
             "Task contains no translatable chunks for automatic glossary generation".into(),
         );
     }
-    let total_chunks = chunks.len() as u64;
+    let draft = glossaries::ensure_auto_glossary_draft(
+        glossary_config_pool,
+        glossary_workspace_root,
+        EnsureAutoGlossaryDraftInput {
+            name: format!("{} 自动术语表", task.name),
+            source_language: task.source_language.clone(),
+            target_language: task.target_language.clone(),
+            origin_task_id: task.id.clone(),
+            chunks: source_chunks
+                .into_iter()
+                .map(|chunk| AutoGlossarySourceChunk {
+                    id: chunk.id,
+                    sequence: chunk.sequence,
+                    glossary_source_text: chunk.source_text,
+                    display_source_text: chunk.preprocessed_text,
+                })
+                .collect(),
+        },
+    )
+    .await?;
+    set_task_glossary_id(inp_pool, &draft.view.id).await?;
+    emit_glossary_progress(app, &draft.view);
+    if draft.view.status == GlossaryStatus::Success {
+        return Ok(AutoGlossaryGeneration::Created(draft.view));
+    }
+    if draft.view.status == GlossaryStatus::Failed {
+        return Ok(AutoGlossaryGeneration::Failed(
+            "Automatic glossary generation previously failed".into(),
+        ));
+    }
+    let draft_chunks = glossaries::pending_auto_glossary_chunks(&draft).await?;
+    let chunks = draft_chunks
+        .into_iter()
+        .map(|chunk| ChunkRecord {
+            id: chunk.id,
+            sequence: chunk.sequence,
+            preprocessed_text: chunk.display_source_text,
+            source_text: chunk.glossary_source_text,
+            map_json: String::new(),
+        })
+        .collect::<Vec<_>>();
+    let total_chunks = draft.view.total_chunks.max(0) as u64;
+    let initial_completed = (draft.view.success_chunks + draft.view.failed_chunks).max(0) as u64;
     let failure_thresholds = task_failure_thresholds(inp_pool).await?;
+    if let Some(reason) = glossary_threshold_failure_reason(
+        draft.view.failed_chunks,
+        draft.view.total_chunks,
+        failure_thresholds.glossary_max_failure_percentage,
+        "a previously persisted glossary chunk failed",
+    )? {
+        let failed_view = glossaries::finalize_auto_glossary(
+            glossary_config_pool,
+            &draft,
+            GlossaryStatus::Failed,
+        )
+        .await?;
+        emit_glossary_progress(app, &failed_view);
+        apply_glossary_report_and_emit(
+            app,
+            inp_pool,
+            config_pool,
+            inp_path,
+            &GlossaryProgressSnapshot {
+                current: initial_completed,
+                total: total_chunks,
+                state: "failed".into(),
+                label: "自动术语表生成失败".into(),
+            },
+            None,
+        )
+        .await?;
+        return Ok(AutoGlossaryGeneration::Failed(reason));
+    }
     let document_format = document_format_from_source_path(&task.source_path)?;
     let content_format = content_format_from_source_path(&task.source_path)?;
     let (request_reporter, reporter_handle) = start_glossary_reporter(
@@ -648,7 +739,10 @@ async fn generate_auto_glossary(
         BackendLog::from_app(app).ok(),
     );
     request_reporter
-        .status(format!("术语表建立 (0/{total_chunks})"))
+        .completed_chunks
+        .store(initial_completed, Ordering::SeqCst);
+    request_reporter
+        .status(format!("术语表建立 ({initial_completed}/{total_chunks})"))
         .await;
     let dynamic_rate_limit = config.rate_limit_strategy == RateLimitStrategy::Dynamic;
     let limiter = Arc::new(AdaptiveLimiter::new(
@@ -668,6 +762,7 @@ async fn generate_auto_glossary(
     let max_retries = config.max_retries.max(0) as u32;
     let target_language = task.target_language.clone();
     let runtime = Arc::new(glossary_runtime);
+    let draft = Arc::new(draft);
     let mut outcome_stream = stream::iter(chunks.clone())
         .map(|chunk| {
             let runtime = runtime.clone();
@@ -677,7 +772,16 @@ async fn generate_auto_glossary(
             let target_language = target_language.clone();
             let interrupted = interrupt.clone();
             let reporter = request_reporter.clone();
+            let draft = draft.clone();
             async move {
+                if let Err(error) =
+                    glossaries::mark_auto_glossary_chunk_running(&draft, &chunk.id).await
+                {
+                    return AutoGlossaryChunkOutcome::Failed {
+                        chunk_id: chunk.id,
+                        error,
+                    };
+                }
                 generate_glossary_for_chunk(
                     runtime,
                     target_language,
@@ -690,13 +794,13 @@ async fn generate_auto_glossary(
                     manual_limiter,
                     interrupted,
                     reporter,
+                    draft,
                 )
                 .await
             }
         })
         .buffer_unordered(max_concurrency);
-    let mut outcomes = Vec::new();
-    let mut completed_chunks = 0_u64;
+    let mut completed_chunks = initial_completed;
     while let Some(outcome) = outcome_stream.next().await {
         completed_chunks += 1;
         request_reporter
@@ -716,33 +820,44 @@ async fn generate_auto_glossary(
                 label: format!("术语表建立 ({completed_chunks}/{total_chunks})"),
             })
             .await;
-        outcomes.push(outcome);
-    }
-    drop(outcome_stream);
-    outcomes.sort_by_key(|outcome| match outcome {
-        AutoGlossaryChunkOutcome::Success { sequence, .. }
-        | AutoGlossaryChunkOutcome::Failed { sequence, .. } => *sequence,
-        AutoGlossaryChunkOutcome::Interrupted { .. } => i64::MAX,
-    });
-
-    let mut entries = Vec::new();
-    let mut failed_chunks = 0_usize;
-    for outcome in outcomes {
         match outcome {
             AutoGlossaryChunkOutcome::Success {
-                entries: chunk_entries,
-                ..
+                chunk_id, entries, ..
             } => {
-                entries.extend(chunk_entries);
+                let view = glossaries::persist_auto_glossary_chunk_success(
+                    glossary_config_pool,
+                    &draft,
+                    &chunk_id,
+                    entries,
+                )
+                .await?;
+                emit_glossary_progress(app, &view);
             }
-            AutoGlossaryChunkOutcome::Failed { error, .. } => {
-                failed_chunks += 1;
+            AutoGlossaryChunkOutcome::Failed {
+                chunk_id, error, ..
+            } => {
+                let view = glossaries::persist_auto_glossary_chunk_failed(
+                    glossary_config_pool,
+                    &draft,
+                    &chunk_id,
+                    &error,
+                )
+                .await?;
+                emit_glossary_progress(app, &view);
                 if let Some(reason) = glossary_threshold_failure_reason(
-                    failed_chunks as i64,
-                    chunks.len() as i64,
+                    view.failed_chunks,
+                    view.total_chunks,
                     failure_thresholds.glossary_max_failure_percentage,
                     &error,
                 )? {
+                    drop(outcome_stream);
+                    let failed_view = glossaries::finalize_auto_glossary(
+                        glossary_config_pool,
+                        &draft,
+                        GlossaryStatus::Failed,
+                    )
+                    .await?;
+                    emit_glossary_progress(app, &failed_view);
                     finish_glossary_reporter(
                         request_reporter,
                         reporter_handle,
@@ -757,7 +872,15 @@ async fn generate_auto_glossary(
                     return Ok(AutoGlossaryGeneration::Failed(reason));
                 }
             }
-            AutoGlossaryChunkOutcome::Interrupted { error } => {
+            AutoGlossaryChunkOutcome::Interrupted { error, .. } => {
+                drop(outcome_stream);
+                let interrupted_view = glossaries::mark_auto_glossary_interrupted(
+                    glossary_config_pool,
+                    &draft,
+                    &error,
+                )
+                .await?;
+                emit_glossary_progress(app, &interrupted_view);
                 finish_glossary_reporter(
                     request_reporter,
                     reporter_handle,
@@ -773,6 +896,7 @@ async fn generate_auto_glossary(
             }
         }
     }
+    drop(outcome_stream);
 
     request_reporter
         .status(format!(
@@ -782,71 +906,30 @@ async fn generate_auto_glossary(
     request_reporter.log(
         "INFO",
         format!(
-            "task={} saving auto glossary from {} chunks with {} entries",
-            task.id,
-            total_chunks,
-            entries.len(),
+            "task={} finalizing auto glossary from {} chunks",
+            task.id, total_chunks,
         ),
     );
-    let result = glossaries::create_auto_glossary(
-        glossary_config_pool,
-        glossary_workspace_root,
-        CreateAutoGlossaryInput {
-            name: format!("{} 自动术语表", task.name),
-            source_language: task.source_language.clone(),
-            target_language: task.target_language.clone(),
-            entries,
+    let view =
+        glossaries::finalize_auto_glossary(glossary_config_pool, &draft, GlossaryStatus::Success)
+            .await?;
+    emit_glossary_progress(app, &view);
+    request_reporter.log(
+        "INFO",
+        format!("task={} auto glossary finalized id={}", task.id, view.id),
+    );
+    finish_glossary_reporter(
+        request_reporter,
+        reporter_handle,
+        GlossaryReport::Status {
+            current: total_chunks,
+            total: total_chunks,
+            state: "success".into(),
+            label: format!("术语表建立 ({total_chunks}/{total_chunks})"),
         },
     )
-    .await;
-    match result {
-        Ok(view) => {
-            request_reporter.log(
-                "INFO",
-                format!("task={} auto glossary created id={}", task.id, view.id),
-            );
-            if let Err(error) = set_task_glossary_id(inp_pool, &view.id).await {
-                finish_glossary_reporter(
-                    request_reporter,
-                    reporter_handle,
-                    GlossaryReport::Status {
-                        current: total_chunks,
-                        total: total_chunks,
-                        state: "failed".into(),
-                        label: "自动术语表绑定失败".into(),
-                    },
-                )
-                .await?;
-                return Err(error);
-            }
-            finish_glossary_reporter(
-                request_reporter,
-                reporter_handle,
-                GlossaryReport::Status {
-                    current: total_chunks,
-                    total: total_chunks,
-                    state: "success".into(),
-                    label: format!("术语表建立 ({total_chunks}/{total_chunks})"),
-                },
-            )
-            .await?;
-            Ok(AutoGlossaryGeneration::Created(view))
-        }
-        Err(error) => {
-            finish_glossary_reporter(
-                request_reporter,
-                reporter_handle,
-                GlossaryReport::Status {
-                    current: total_chunks,
-                    total: total_chunks,
-                    state: "failed".into(),
-                    label: "自动术语表保存失败".into(),
-                },
-            )
-            .await?;
-            Err(error)
-        }
-    }
+    .await?;
+    Ok(AutoGlossaryGeneration::Created(view))
 }
 
 async fn generate_glossary_for_chunk(
@@ -861,6 +944,7 @@ async fn generate_glossary_for_chunk(
     manual_limiter: Option<Arc<ManualRateLimiter>>,
     interrupted: TranslationInterrupt,
     reporter: GlossaryRequestReporter,
+    draft: Arc<AutoGlossaryDraft>,
 ) -> AutoGlossaryChunkOutcome {
     let chunk_id = chunk.id.clone();
     let completion_reporter = reporter.clone();
@@ -876,6 +960,7 @@ async fn generate_glossary_for_chunk(
         manual_limiter,
         interrupted,
         reporter,
+        draft,
     )
     .await;
     completion_reporter.retry(&chunk_id, 0, 0, None).await;
@@ -894,6 +979,7 @@ async fn generate_glossary_for_chunk_inner(
     manual_limiter: Option<Arc<ManualRateLimiter>>,
     interrupted: TranslationInterrupt,
     reporter: GlossaryRequestReporter,
+    draft: Arc<AutoGlossaryDraft>,
 ) -> AutoGlossaryChunkOutcome {
     let mut last_error = None;
     for attempt in 0..=max_retries {
@@ -931,13 +1017,13 @@ async fn generate_glossary_for_chunk_inner(
             Ok(GlossaryPromptBuildResult::Request { messages }) => messages,
             Ok(GlossaryPromptBuildResult::Skipped { .. }) => {
                 return AutoGlossaryChunkOutcome::Success {
-                    sequence: chunk.sequence,
+                    chunk_id: chunk.id.clone(),
                     entries: Vec::new(),
                 };
             }
             Err(error) => {
                 return AutoGlossaryChunkOutcome::Failed {
-                    sequence: chunk.sequence,
+                    chunk_id: chunk.id.clone(),
                     error,
                 };
             }
@@ -1086,7 +1172,7 @@ async fn generate_glossary_for_chunk_inner(
                 match sanitize_and_flatten_glossary(&meta.response.text, Some(&chunk.source_text)) {
                     Ok(parsed) => {
                         return AutoGlossaryChunkOutcome::Success {
-                            sequence: chunk.sequence,
+                            chunk_id: chunk.id.clone(),
                             entries: parsed.entries,
                         }
                     }
@@ -1101,6 +1187,19 @@ async fn generate_glossary_for_chunk_inner(
                                 max_retries + 1,
                             ),
                         );
+                        if let Err(persist_error) = glossaries::update_auto_glossary_chunk_retry(
+                            &draft,
+                            &chunk.id,
+                            attempt as i64 + 1,
+                            Some(&error),
+                        )
+                        .await
+                        {
+                            return AutoGlossaryChunkOutcome::Failed {
+                                chunk_id: chunk.id.clone(),
+                                error: persist_error,
+                            };
+                        }
                         last_error = Some(error);
                     }
                 }
@@ -1130,17 +1229,33 @@ async fn generate_glossary_for_chunk_inner(
                     )
                     .await;
                 if error.is_model_unavailable() {
-                    return AutoGlossaryChunkOutcome::Interrupted {
+                    return AutoGlossaryChunkOutcome::Failed {
+                        chunk_id: chunk.id.clone(),
                         error: format!("MODEL_UNAVAILABLE:GLOSSARY:{error}"),
                     };
                 }
                 let is_transient = error.is_transient();
                 if !is_transient {
-                    return AutoGlossaryChunkOutcome::Interrupted {
+                    return AutoGlossaryChunkOutcome::Failed {
+                        chunk_id: chunk.id.clone(),
                         error: error.to_string(),
                     };
                 }
-                last_error = Some(error.to_string());
+                let error_text = error.to_string();
+                if let Err(persist_error) = glossaries::update_auto_glossary_chunk_retry(
+                    &draft,
+                    &chunk.id,
+                    attempt as i64 + 1,
+                    Some(&error_text),
+                )
+                .await
+                {
+                    return AutoGlossaryChunkOutcome::Failed {
+                        chunk_id: chunk.id.clone(),
+                        error: persist_error,
+                    };
+                }
+                last_error = Some(error_text);
                 if attempt < max_retries {
                     let base_delay = transient_retry_base_delay_ms(&error, attempt);
                     let sleep_ms = retry_delay_with_jitter_ms(base_delay);
@@ -1229,7 +1344,7 @@ async fn generate_glossary_for_chunk_inner(
         }
     }
     AutoGlossaryChunkOutcome::Failed {
-        sequence: chunk.sequence,
+        chunk_id: chunk.id,
         error: last_error.unwrap_or_else(|| "Auto glossary generation failed".to_string()),
     }
 }

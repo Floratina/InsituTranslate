@@ -130,14 +130,6 @@ const compactStandardButtonClass = cn(
   "active:!border-[var(--button-standard-pressed-border)] active:!bg-[var(--button-standard-pressed-bg)]",
 );
 
-const compactDestructiveButtonClass = cn(
-  "!border-destructive/30 !bg-destructive/10 !text-destructive",
-  "hover:!border-destructive/40 hover:!bg-destructive/20 hover:!text-destructive",
-  "active:!border-destructive/35 active:!bg-destructive/25",
-  "focus-visible:!border-destructive/40 focus-visible:!ring-destructive/20",
-  "dark:!bg-destructive/20 dark:hover:!bg-destructive/30 dark:active:!bg-destructive/25 dark:focus-visible:!ring-destructive/40",
-);
-
 interface TaskSortState {
   field: TaskSortField;
   mode: SortMode;
@@ -1109,7 +1101,6 @@ export default function TranslationTasksPage({ onOpenProofreading, onOpenGlossar
             <Button
               size="sm"
               variant="destructive"
-              className={compactDestructiveButtonClass}
               onClick={() => setClearTargets(sortedTasks)}
               disabled={batchBusy || sortedTasks.length === 0}
             >

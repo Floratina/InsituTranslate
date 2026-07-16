@@ -37,8 +37,8 @@ const buttonVariants = cva(
         ghost: subtleButtonState,
         destructive:
           cn(
-            "border-destructive/30 bg-destructive/10 text-destructive hover:border-destructive/40 hover:bg-destructive/20 active:border-destructive/35 active:bg-destructive/25",
-            "focus-visible:border-destructive/40 focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:hover:bg-destructive/30 dark:active:bg-destructive/25 dark:focus-visible:ring-destructive/40"
+            "!border-destructive/30 !bg-destructive/10 !text-destructive hover:!border-destructive/40 hover:!bg-destructive/20 active:!border-destructive/35 active:!bg-destructive/25",
+            "focus-visible:!border-destructive/40 focus-visible:!ring-destructive/20 dark:!bg-destructive/20 dark:hover:!bg-destructive/30 dark:active:!bg-destructive/25 dark:focus-visible:!ring-destructive/40"
           ),
         link: "text-primary underline-offset-4 hover:underline",
       },

@@ -1,9 +1,14 @@
 # InsituTranslate
 
+<img width="1770" height="1140" alt="image" src="https://github.com/user-attachments/assets/31efb6e9-9a8b-4bb4-a4ed-32fd6c384fe8" />
+
+<img width="1770" height="1140" alt="image" src="https://github.com/user-attachments/assets/f858c090-2cfe-46c0-ae37-6c60ca2f0f60" />
 
 > <mark style="background:rgba(5, 117, 197, 0.2)">此项目仍然在开发中，很多功能尚不完善。</mark>
 
 InsituTranslate 是一款的本地桌面文档翻译工具，基于 Tauri 2、React、TypeScript 和 Rust 构建。
+
+<img width="256" height="256" alt="icon-256" src="https://github.com/user-attachments/assets/8e9fcc3a-9aa4-4769-bcd5-ef33ec608044" />
 
 项目的核心目标是：在翻译文档内容的同时，尽可能保留原文件的格式、结构、样式和非文本数据，并将翻译结果重新写回对应格式。
 

@@ -3542,7 +3542,11 @@ pub async fn delete_translation_task(
     let deletion_ticket = match task.glossary_id.as_deref() {
         Some(glossary_id) => {
             let glossary =
-                crate::glossaries::get_glossary(glossary_config_pool, glossary_id).await?;
+                crate::glossaries::get_glossary_if_exists(glossary_config_pool, glossary_id)
+                    .await?;
+            let Some(glossary) = glossary else {
+                return delete_translation_task_inner(config_pool, id, &inp_path).await;
+            };
             if glossary.status == crate::glossaries::GlossaryStatus::Success {
                 None
             } else {

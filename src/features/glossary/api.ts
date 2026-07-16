@@ -39,6 +39,10 @@ export function deleteGlossary(id: string): Promise<void> {
   return invoke("delete_glossary", { id });
 }
 
+export function glossaryFileAvailable(id: string): Promise<boolean> {
+  return invoke<boolean>("glossary_file_available", { id });
+}
+
 export function openGlossaryFolder(id: string): Promise<void> {
   return invoke("open_glossary_folder", { id });
 }

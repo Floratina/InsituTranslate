@@ -172,6 +172,7 @@ pub fn run() {
             commands::import_glossary,
             commands::update_glossary,
             commands::delete_glossary,
+            commands::glossary_file_available,
             commands::open_glossary_folder,
             commands::export_glossary,
             commands::get_glossary_entries,

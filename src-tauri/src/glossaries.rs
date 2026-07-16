@@ -643,6 +643,27 @@ pub async fn get_glossary(pool: &SqlitePool, id: &str) -> Result<GlossaryView, S
     get_glossary_from_index(pool, id).await
 }
 
+pub async fn get_glossary_if_exists(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Option<GlossaryView>, String> {
+    let row = sqlx::query("SELECT * FROM glossary_index WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    row.as_ref().map(glossary_from_row).transpose()
+}
+
+pub async fn glossary_file_available(pool: &SqlitePool, id: &str) -> Result<bool, String> {
+    let Some(glossary) = get_glossary_if_exists(pool, id).await? else {
+        return Ok(false);
+    };
+    tokio::fs::try_exists(&glossary.ing_path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 pub async fn detach_auto_glossary_origin(
     pool: &SqlitePool,
     glossary_id: &str,
@@ -895,30 +916,18 @@ pub async fn update_glossary(
 
 pub async fn delete_glossary(
     pool: &SqlitePool,
-    translation_config_pool: &SqlitePool,
     workspace_root: &Path,
     id: &str,
 ) -> Result<(), String> {
-    let ticket =
-        stage_manual_glossary_deletion(pool, translation_config_pool, workspace_root, id).await?;
+    let ticket = stage_manual_glossary_deletion(pool, workspace_root, id).await?;
     commit_staged_glossary_deletion(pool, &ticket).await
 }
 
 async fn stage_manual_glossary_deletion(
     pool: &SqlitePool,
-    translation_config_pool: &SqlitePool,
     workspace_root: &Path,
     glossary_id: &str,
 ) -> Result<GlossaryDeletionTicket, String> {
-    let references: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM task_index WHERE glossary_id = ?")
-            .bind(glossary_id)
-            .fetch_one(translation_config_pool)
-            .await
-            .map_err(|error| error.to_string())?;
-    if references > 0 {
-        return Err("术语表仍被任务引用，无法删除".into());
-    }
     let glossary = get_glossary_from_index(pool, glossary_id).await?;
     let original_path = PathBuf::from(&glossary.ing_path);
     if !original_path.starts_with(workspace_root) {
@@ -1081,6 +1090,7 @@ pub async fn recover_glossary_deletion_journal(
         .await
         .map_err(|error| error.to_string())?;
     for row in rows {
+        let task_id: String = row.get("task_id");
         let glossary = serde_json::from_str::<GlossaryView>(row.get("glossary_json"))
             .map_err(|error| format!("Stored glossary deletion journal is invalid: {error}"))?;
         let ticket = GlossaryDeletionTicket {
@@ -1088,6 +1098,10 @@ pub async fn recover_glossary_deletion_journal(
             staged_path: PathBuf::from(row.get::<String, _>("staged_path")),
             glossary,
         };
+        if task_id == "__manual__" {
+            commit_staged_glossary_deletion(pool, &ticket).await?;
+            continue;
+        }
         let references: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM task_index WHERE glossary_id = ?")
                 .bind(&ticket.glossary.id)
@@ -3678,10 +3692,6 @@ mod tests {
     async fn deletion_staging_uses_uuid_paths_for_rollback_and_commit() {
         let root = temp_workspace("uuid-deletion-staging");
         let pool = connect_config_db(&root).await.expect("glossary config");
-        let translation_root = root.join("translation-workspace");
-        let translation_pool = crate::translation_tasks::connect_config_db(&translation_root)
-            .await
-            .expect("translation config");
         let glossary = create_auto_glossary(
             &pool,
             &root,
@@ -3695,7 +3705,7 @@ mod tests {
         .await
         .expect("create glossary");
 
-        let ticket = stage_manual_glossary_deletion(&pool, &translation_pool, &root, &glossary.id)
+        let ticket = stage_manual_glossary_deletion(&pool, &root, &glossary.id)
             .await
             .expect("stage deletion");
         assert!(sqlite_paths::is_uuid_sqlite_temporary_file(
@@ -3710,7 +3720,7 @@ mod tests {
             .await
             .expect("restored glossary"));
 
-        let ticket = stage_manual_glossary_deletion(&pool, &translation_pool, &root, &glossary.id)
+        let ticket = stage_manual_glossary_deletion(&pool, &root, &glossary.id)
             .await
             .expect("restage deletion");
         commit_staged_glossary_deletion(&pool, &ticket)
@@ -3719,6 +3729,69 @@ mod tests {
         assert!(!tokio::fs::try_exists(&ticket.staged_path)
             .await
             .expect("deleted staged glossary"));
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn manual_glossary_deletion_ignores_task_references_and_recovery_commits_it() {
+        let root = temp_workspace("referenced-manual-deletion");
+        let pool = connect_config_db(&root).await.expect("glossary config");
+        let translation_root = root.join("translation-workspace");
+        let translation_pool = crate::translation_tasks::connect_config_db(&translation_root)
+            .await
+            .expect("translation config");
+        let glossary = create_auto_glossary(
+            &pool,
+            &root,
+            CreateAutoGlossaryInput {
+                name: "Referenced Glossary".into(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                entries: Vec::new(),
+            },
+        )
+        .await
+        .expect("create glossary");
+        sqlx::query(
+            "INSERT INTO task_index (
+                id, name, inp_path, source_path, source_language, target_language,
+                status, provider_id, model_id, model_request_name, glossary_id,
+                created_at, updated_at
+             ) VALUES (
+                'referencing-task', 'Task', 'task.inp', 'source.txt', 'en', 'zh-CN',
+                'success', 'provider', 'model', 'model', ?, 'now', 'now'
+             )",
+        )
+        .bind(&glossary.id)
+        .execute(&translation_pool)
+        .await
+        .expect("task reference");
+
+        let ticket = stage_manual_glossary_deletion(&pool, &root, &glossary.id)
+            .await
+            .expect("stage referenced glossary deletion");
+        recover_glossary_deletion_journal(&pool, &translation_pool)
+            .await
+            .expect("recover manual deletion");
+
+        assert!(!tokio::fs::try_exists(&ticket.original_path)
+            .await
+            .expect("original path"));
+        assert!(!tokio::fs::try_exists(&ticket.staged_path)
+            .await
+            .expect("staged path"));
+        assert!(!glossary_file_available(&pool, &glossary.id)
+            .await
+            .expect("glossary availability"));
+        let references: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_index WHERE glossary_id = ?")
+                .bind(&glossary.id)
+                .fetch_one(&translation_pool)
+                .await
+                .expect("task references");
+        assert_eq!(references, 1);
 
         translation_pool.close().await;
         pool.close().await;

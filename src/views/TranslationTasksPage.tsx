@@ -68,6 +68,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/toast-stack";
+import { glossaryFileAvailable } from "@/features/glossary/api";
 import {
   deleteTranslationTask,
   deleteTranslationTasks,
@@ -544,6 +545,7 @@ export default function TranslationTasksPage({ onOpenProofreading, onOpenGlossar
   const [taskInfoState, setTaskInfoState] = useState<TaskInfoState | null>(null);
   const [exportState, setExportState] = useState<ExportState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<TranslationTaskView | null>(null);
+  const [missingGlossaryTask, setMissingGlossaryTask] = useState<TranslationTaskView | null>(null);
   const [clearTargets, setClearTargets] = useState<TranslationTaskView[] | null>(null);
   const [runtimeActionState, setRuntimeActionState] = useState<RuntimeActionDialogState | null>(null);
   const silentRefreshPromiseRef = useRef<Promise<void> | null>(null);
@@ -722,10 +724,28 @@ export default function TranslationTasksPage({ onOpenProofreading, onOpenGlossar
         return;
       }
       if (!ack.success) {
-        pushToast(ack.message ?? "调度指令未被接受", "error");
+        const message = ack.message ?? "调度指令未被接受";
+        if (
+          action.type === "retranslate"
+          && !task.enableTranslation
+          && message.includes("Glossary not found")
+        ) {
+          setMissingGlossaryTask(task);
+          return;
+        }
+        pushToast(message, "error");
       }
     } catch (error) {
-      pushToast(getErrorMessage(error), "error");
+      const message = getErrorMessage(error);
+      if (
+        action.type === "retranslate"
+        && !task.enableTranslation
+        && message.includes("Glossary not found")
+      ) {
+        setMissingGlossaryTask(task);
+        return;
+      }
+      pushToast(message, "error");
     } finally {
       setBusyId("");
     }
@@ -812,19 +832,57 @@ export default function TranslationTasksPage({ onOpenProofreading, onOpenGlossar
     }
   }
 
-  async function deleteOne(): Promise<void> {
-    if (!deleteTarget) return;
-    setBusyId(deleteTarget.id);
+  async function removeTask(task: TranslationTaskView): Promise<boolean> {
+    setBusyId(task.id);
     try {
-      await deleteTranslationTask(deleteTarget.id);
-      setTasks((current) => current.filter((task) => task.id !== deleteTarget.id));
-      setDeleteTarget(null);
+      await deleteTranslationTask(task.id);
+      setTasks((current) => current.filter((item) => item.id !== task.id));
       pushToast("任务已删除", "success");
+      return true;
     } catch (error) {
       pushToast(getErrorMessage(error), "error");
+      return false;
     } finally {
       setBusyId("");
     }
+  }
+
+  async function deleteOne(): Promise<void> {
+    if (!deleteTarget) return;
+    if (await removeTask(deleteTarget)) setDeleteTarget(null);
+  }
+
+  async function deleteMissingGlossaryTask(): Promise<void> {
+    if (!missingGlossaryTask) return;
+    if (await removeTask(missingGlossaryTask)) setMissingGlossaryTask(null);
+  }
+
+  async function openTaskGlossary(task: TranslationTaskView): Promise<void> {
+    if (!task.glossaryId) return;
+    try {
+      if (!await glossaryFileAvailable(task.glossaryId)) {
+        setMissingGlossaryTask(task);
+        return;
+      }
+      onOpenGlossary?.(task.glossaryId);
+    } catch (error) {
+      pushToast(getErrorMessage(error), "error");
+    }
+  }
+
+  async function retranslateTask(task: TranslationTaskView): Promise<void> {
+    if (!task.enableTranslation && task.glossaryId) {
+      try {
+        if (!await glossaryFileAvailable(task.glossaryId)) {
+          setMissingGlossaryTask(task);
+          return;
+        }
+      } catch (error) {
+        pushToast(getErrorMessage(error), "error");
+        return;
+      }
+    }
+    await runTaskAction(task, { type: "retranslate", taskId: task.id });
   }
 
   async function clearVisibleTasks(): Promise<void> {
@@ -1081,11 +1139,9 @@ export default function TranslationTasksPage({ onOpenProofreading, onOpenGlossar
         onStart={(task) => void runTaskAction(task, { type: "enqueue", taskId: task.id })}
         onResume={(task) => void runTaskAction(task, { type: "enqueue", taskId: task.id })}
         onPause={(task) => void runTaskAction(task, { type: "pause", taskId: task.id })}
-        onRetranslate={(task) => void runTaskAction(task, { type: "retranslate", taskId: task.id })}
+        onRetranslate={(task) => void retranslateTask(task)}
         onProofread={(task) => onOpenProofreading?.(task.id)}
-        onOpenGlossary={(task) => {
-          if (task.glossaryId) onOpenGlossary?.(task.glossaryId);
-        }}
+        onOpenGlossary={(task) => void openTaskGlossary(task)}
         onEditInfo={(task) => setTaskInfoState({ task, name: task.name, tags: task.tags.join("，") })}
         onOpenFolder={(task) => {
           void openTranslationTaskFolder(task.id).catch((error: unknown) => {
@@ -1136,6 +1192,40 @@ export default function TranslationTasksPage({ onOpenProofreading, onOpenGlossar
         }}
         onConfirm={() => void deleteOne()}
       />
+      <Dialog
+        open={missingGlossaryTask !== null}
+        onOpenChange={(open) => {
+          if (!open) setMissingGlossaryTask(null);
+        }}
+      >
+        <DialogContent open={missingGlossaryTask !== null} className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>未找到术语表文件</DialogTitle>
+            <DialogDescription>
+              术语表对应的 ING 文件已被删除或移动，您可以删除任务并重新上传文件以自动建立术语表。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="justify-between">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={busyId === missingGlossaryTask?.id}
+              onClick={() => setMissingGlossaryTask(null)}
+            >
+              取消
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={busyId === missingGlossaryTask?.id}
+              onClick={() => void deleteMissingGlossaryTask()}
+            >
+              {busyId === missingGlossaryTask?.id && <Loader2 className="size-4 animate-spin" />}
+              删除任务
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <ConfirmDialog
         open={clearTargets !== null}
         title="清空当前列表任务"
@@ -1539,12 +1629,12 @@ function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetrans
       <Separator />
       <Item disabled={!task.enableTranslation} onSelect={() => onProofread(task)}>
         <FilePenLine className="size-3.5" />
-        {task.enableTranslation ? "译后编辑和校对" : "译后编辑和校对（未启用翻译）"}
+        译后编辑和校对
       </Item>
       {task.glossaryId && (
         <Item onSelect={() => onOpenGlossary(task)}>
           <BookOpen className="size-3.5" />
-          打开关联术语表
+          打开术语表
         </Item>
       )}
       <Item onSelect={() => onEditInfo(task)}>
@@ -1558,7 +1648,7 @@ function TaskMenuItems({ kind, task, busy, onStart, onResume, onPause, onRetrans
       </Item>
       <Item disabled={!task.enableTranslation} onSelect={() => onExport(task)}>
         <Download className="size-3.5" />
-        {task.enableTranslation ? "导出任务为..." : "导出任务（未启用翻译）"}
+        导出任务
       </Item>
       <Separator />
       <Item

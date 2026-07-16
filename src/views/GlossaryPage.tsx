@@ -99,7 +99,6 @@ import type {
   GlossaryExportFormat,
   GlossaryFailedChunkView,
   GlossarySortField,
-  GlossaryStatus,
   GlossaryView,
   SortMode,
 } from "@/features/glossary/types";
@@ -153,26 +152,9 @@ interface GlossaryProgressPayload {
   glossary: GlossaryView;
 }
 
-const GLOSSARY_STATUS_LABELS: Record<GlossaryStatus, string> = {
-  initializing: "初始化中",
-  building: "建立中",
-  interrupted: "已中断",
-  success: "成功",
-  failed: "失败",
-};
-
-function GlossaryStatusBadge({ glossary }: { glossary: GlossaryView }) {
-  const label = glossary.status === "success" && glossary.hasFailures
-    ? "存在失败"
-    : GLOSSARY_STATUS_LABELS[glossary.status];
-  return (
-    <Badge
-      variant={glossary.status === "failed" ? "destructive" : "secondary"}
-      className="shrink-0"
-    >
-      {label}
-    </Badge>
-  );
+function GlossaryActivityIndicator({ glossary }: { glossary: GlossaryView }) {
+  if (glossary.status !== "initializing" && glossary.status !== "building") return null;
+  return <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />;
 }
 
 function isTauriRuntime(): boolean {
@@ -1402,16 +1384,11 @@ function GlossaryListTable({
                             <div className="min-w-0 flex-1 truncate font-medium text-foreground" title={glossary.name}>
                               {glossary.name}
                             </div>
-                            <GlossaryStatusBadge glossary={glossary} />
+                            <GlossaryActivityIndicator glossary={glossary} />
                           </div>
                         </td>
                         <td className="h-10 whitespace-nowrap px-3 py-2 text-sm text-muted-foreground">
-                          <div>{glossary.entryCount} 条</div>
-                          {glossary.totalChunks > 0 && (
-                            <div className="text-xs">
-                              {glossary.successChunks + glossary.failedChunks}/{glossary.totalChunks} 分块
-                            </div>
-                          )}
+                          {glossary.entryCount} 条
                         </td>
                         <td className="h-10 min-w-0 px-3 py-2">
                           <TagList tags={glossary.tags} />
@@ -1679,11 +1656,10 @@ function GlossaryDetailView({
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <h1 className="truncate text-xl font-medium tracking-tight">{glossary.name}</h1>
-              <GlossaryStatusBadge glossary={glossary} />
+              <GlossaryActivityIndicator glossary={glossary} />
             </div>
             <p className="mt-0.5 text-xs text-muted-foreground">
               {displayLanguagePair(glossary.sourceLanguage, glossary.targetLanguage)} · {glossary.entryCount} 条术语
-              {glossary.totalChunks > 0 && ` · ${glossary.successChunks + glossary.failedChunks}/${glossary.totalChunks} 分块`}
             </p>
           </div>
           <Button type="button" disabled={readOnly} onClick={onAdd}>

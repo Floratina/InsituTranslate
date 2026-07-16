@@ -2,9 +2,15 @@
 
 English | [简体中文](https://github.com/Floratina/InsituTranslate/blob/main/docs/README_zh-CN.md)
 
+<img width="1770" height="1140" alt="image" src="https://github.com/user-attachments/assets/31efb6e9-9a8b-4bb4-a4ed-32fd6c384fe8" />
+
+<img width="1770" height="1140" alt="image" src="https://github.com/user-attachments/assets/f858c090-2cfe-46c0-ae37-6c60ca2f0f60" />
+
 > <mark style="background:rgba(5, 117, 197, 0.2)">This project is still under development, and many features are not yet complete.</mark>
 
 InsituTranslate is a local desktop document translation tool built with Tauri 2, React, TypeScript, and Rust.
+
+<img width="256" height="256" alt="icon-256" src="https://github.com/user-attachments/assets/8e9fcc3a-9aa4-4769-bcd5-ef33ec608044" />
 
 The core objective of the project is to preserve the original file’s formatting, structure, styles, and non-textual data as much as possible while translating its content, and then write the translated text back into the corresponding format.
 

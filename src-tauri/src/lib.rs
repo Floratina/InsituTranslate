@@ -13,6 +13,7 @@ mod pdf_parsing;
 mod glossary_prompt;
 mod secrets;
 mod settings;
+mod sqlite_paths;
 mod system_fonts;
 mod task_scheduler;
 // Shared infrastructure for task-specific document prompt builders.
@@ -77,6 +78,7 @@ pub fn run() {
             .map_err(|error| format!("Unable to recover glossary deletion journal: {error}"))?;
             tauri::async_runtime::block_on(glossaries::recover_auto_glossary_drafts(
                 &glossary_config_pool,
+                &glossary_workspace_root,
             ))
             .map_err(|error| format!("Unable to recover automatic glossary drafts: {error}"))?;
             let client = commands::build_http_client()

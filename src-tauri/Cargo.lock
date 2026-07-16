@@ -2665,6 +2665,7 @@ dependencies = [
  "tokio-util",
  "unicode-segmentation",
  "url",
+ "uuid",
  "xml5ever",
  "zip 2.4.2",
 ]

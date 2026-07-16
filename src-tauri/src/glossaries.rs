@@ -14,6 +14,7 @@ use crate::glossary_prompt::{sanitize_and_flatten_glossary, GlossaryEntry};
 use crate::languages::{
     normalize_language_code, normalize_source_language, normalize_target_language,
 };
+use crate::sqlite_paths;
 
 const CONFIG_DB_FILE: &str = "config.db";
 const GLOSSARIES_DIR: &str = "glossaries";
@@ -794,7 +795,7 @@ async fn stage_manual_glossary_deletion(
         return Err("Refusing to delete a glossary outside the workspace".into());
     }
     let glossary_json = serde_json::to_string(&glossary).map_err(|error| error.to_string())?;
-    let staged_path = original_path.with_extension(format!("deleting-{}", new_id("cleanup")));
+    let staged_path = uuid_ing_temporary_path(&original_path, "deleting")?;
     tokio::fs::rename(&original_path, &staged_path)
         .await
         .map_err(|error| format!("Unable to stage glossary for deletion: {error}"))?;
@@ -861,7 +862,7 @@ pub async fn stage_unreferenced_auto_glossary_deletion(
         return Err("Refusing to stage a glossary outside the workspace".into());
     }
     let glossary_json = serde_json::to_string(&glossary).map_err(|error| error.to_string())?;
-    let staged_path = original_path.with_extension(format!("deleting-{}", new_id("cleanup")));
+    let staged_path = uuid_ing_temporary_path(&original_path, "deleting")?;
     tokio::fs::rename(&original_path, &staged_path)
         .await
         .map_err(|error| format!("Unable to stage old glossary for deletion: {error}"))?;
@@ -972,7 +973,11 @@ pub async fn recover_glossary_deletion_journal(
     Ok(())
 }
 
-pub async fn recover_auto_glossary_drafts(pool: &SqlitePool) -> Result<(), String> {
+pub async fn recover_auto_glossary_drafts(
+    pool: &SqlitePool,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    cleanup_orphaned_auto_glossary_creation_files(workspace_root).await?;
     let rows =
         sqlx::query("SELECT * FROM glossary_index WHERE status IN ('initializing', 'building')")
             .fetch_all(pool)
@@ -985,15 +990,6 @@ pub async fn recover_auto_glossary_drafts(pool: &SqlitePool) -> Result<(), Strin
             .await
             .map_err(|error| error.to_string())?
         {
-            let temporary_path = ing_path.with_extension(format!("creating-{}", glossary.id));
-            if tokio::fs::try_exists(&temporary_path)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                tokio::fs::remove_file(&temporary_path)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
             sqlx::query("DELETE FROM glossary_index WHERE id = ? AND status = 'initializing'")
                 .bind(&glossary.id)
                 .execute(pool)
@@ -1041,6 +1037,30 @@ pub async fn recover_auto_glossary_drafts(pool: &SqlitePool) -> Result<(), Strin
         let recovered = metadata_glossary(&ing_pool, &ing_path).await?;
         upsert_glossary_index(pool, &recovered).await?;
         ing_pool.close().await;
+    }
+    Ok(())
+}
+
+async fn cleanup_orphaned_auto_glossary_creation_files(
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let directory = workspace_root.join(GLOSSARIES_DIR);
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let path = entry.path();
+        if sqlite_paths::is_uuid_sqlite_temporary_file(&path, "creating", "ing") {
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -1395,18 +1415,9 @@ pub async fn ensure_auto_glossary_draft(
         .await
         .map_err(|error| error.to_string())?
     {
-        let temporary_path = ing_path.with_extension(format!("creating-{}", reserved.id));
-        if tokio::fs::try_exists(&temporary_path)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            tokio::fs::remove_file(&temporary_path)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        let temporary_pool = connect_ing(&temporary_path).await?;
-        initialize_auto_glossary_contents(
-            &temporary_pool,
+        publish_auto_glossary_draft_file(
+            pool,
+            &ing_path,
             &reserved,
             &name,
             &source_language,
@@ -1415,10 +1426,6 @@ pub async fn ensure_auto_glossary_draft(
             &input.chunks,
         )
         .await?;
-        temporary_pool.close().await;
-        tokio::fs::rename(&temporary_path, &ing_path)
-            .await
-            .map_err(|error| format!("Unable to publish automatic glossary draft: {error}"))?;
     }
     let ing_pool = connect_ing(&ing_path).await?;
     let metadata_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata")
@@ -1467,6 +1474,97 @@ pub async fn ensure_auto_glossary_draft(
         view,
         pool: ing_pool,
     })
+}
+
+async fn publish_auto_glossary_draft_file(
+    config_pool: &SqlitePool,
+    ing_path: &Path,
+    reserved: &GlossaryView,
+    name: &str,
+    source_language: &str,
+    target_language: &str,
+    origin_task_id: &str,
+    chunks: &[AutoGlossarySourceChunk],
+) -> Result<(), String> {
+    let temporary_path = match uuid_ing_temporary_path(ing_path, "creating") {
+        Ok(path) => path,
+        Err(error) => {
+            let cleanup_error = delete_initializing_glossary_reservation(config_pool, &reserved.id)
+                .await
+                .err();
+            return match cleanup_error {
+                Some(cleanup_error) => Err(format!(
+                    "{error}; unable to clean failed glossary initialization: {cleanup_error}"
+                )),
+                None => Err(error),
+            };
+        }
+    };
+    let publish_result = async {
+        let temporary_pool = connect_ing(&temporary_path).await?;
+        let initialize_result = initialize_auto_glossary_contents(
+            &temporary_pool,
+            reserved,
+            name,
+            source_language,
+            target_language,
+            origin_task_id,
+            chunks,
+        )
+        .await;
+        temporary_pool.close().await;
+        initialize_result?;
+        tokio::fs::rename(&temporary_path, ing_path)
+            .await
+            .map_err(|error| format!("Unable to publish automatic glossary draft: {error}"))
+    }
+    .await;
+    if let Err(error) = publish_result {
+        let cleanup_result =
+            discard_failed_auto_glossary_initialization(config_pool, &reserved.id, &temporary_path)
+                .await;
+        return match cleanup_result {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "{error}; unable to clean failed glossary initialization: {cleanup_error}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+async fn discard_failed_auto_glossary_initialization(
+    config_pool: &SqlitePool,
+    glossary_id: &str,
+    temporary_path: &Path,
+) -> Result<(), String> {
+    let file_error = match tokio::fs::remove_file(temporary_path).await {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(error.to_string()),
+    };
+    let index_error = delete_initializing_glossary_reservation(config_pool, glossary_id)
+        .await
+        .err();
+    match (file_error, index_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) | (None, Some(error)) => Err(error),
+        (Some(file_error), Some(index_error)) => Err(format!(
+            "temporary file cleanup failed: {file_error}; index cleanup failed: {index_error}"
+        )),
+    }
+}
+
+async fn delete_initializing_glossary_reservation(
+    config_pool: &SqlitePool,
+    glossary_id: &str,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM glossary_index WHERE id = ? AND status = 'initializing'")
+        .bind(glossary_id)
+        .execute(config_pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 async fn initialize_auto_glossary_contents(
@@ -2689,26 +2787,17 @@ fn entry_error(error: sqlx::Error) -> String {
 
 async fn next_ing_path(workspace_root: &Path, name: &str) -> Result<PathBuf, String> {
     let dir = workspace_root.join(GLOSSARIES_DIR);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|error| error.to_string())?;
     let base = sanitize_file_stem(name);
-    for index in 0..10_000 {
-        let filename = if index == 0 {
-            format!("{base}.ing")
-        } else {
-            format!("{base}-{index:02}.ing")
-        };
-        let candidate = dir.join(filename);
-        if tokio::fs::try_exists(&candidate)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            continue;
-        }
-        return Ok(candidate);
-    }
-    Err("Unable to allocate a unique ING file name".into())
+    let candidate = sqlite_paths::next_sqlite_database_path(&dir, &base, "glossary", "ing").await?;
+    uuid_ing_temporary_path(&candidate, "creating")?;
+    Ok(candidate)
+}
+
+fn uuid_ing_temporary_path(ing_path: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let directory = ing_path
+        .parent()
+        .ok_or_else(|| "Glossary path has no parent directory".to_string())?;
+    sqlite_paths::uuid_sqlite_temporary_path(directory, prefix, "ing")
 }
 
 fn sanitize_file_stem(value: &str) -> String {
@@ -3082,6 +3171,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn long_ing_names_are_truncated_without_changing_glossary_metadata() {
+        let base_root = temp_workspace("long-ing-path");
+        let root = base_root.join(format!("nested-{}", "d".repeat(40)));
+        let pool = connect_config_db(&root).await.expect("config db");
+        let name = "Chan - 2016 - A Multi-perspective Investigation of Attitudes Towards English Accents in Hong Kong Implications fo 自动术语表".to_string();
+        let draft = ensure_auto_glossary_draft(
+            &pool,
+            &root,
+            EnsureAutoGlossaryDraftInput {
+                name: name.clone(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                origin_task_id: "task-long-ing".into(),
+                chunks: vec![AutoGlossarySourceChunk {
+                    id: "chunk-long-ing".into(),
+                    sequence: 0,
+                    glossary_source_text: "Apple".into(),
+                    display_source_text: "Apple".into(),
+                }],
+            },
+        )
+        .await
+        .expect("long path draft");
+        assert_eq!(draft.view.name, name);
+        let ing_path = PathBuf::from(&draft.view.ing_path);
+        let full_stem = sanitize_file_stem(&name);
+        assert_ne!(
+            ing_path.file_stem().and_then(|value| value.to_str()),
+            Some(full_stem.as_str()),
+        );
+        assert!(
+            sqlite_paths::utf16_path_len(&ing_path)
+                <= sqlite_paths::SQLITE_DATABASE_PATH_UTF16_LIMIT
+        );
+        assert!(
+            sqlite_paths::utf16_path_len(Path::new(&format!(
+                "{}-journal",
+                ing_path.to_string_lossy()
+            ))) < 260
+        );
+        let mut entries = tokio::fs::read_dir(root.join(GLOSSARIES_DIR))
+            .await
+            .expect("glossary directory");
+        while let Some(entry) = entries.next_entry().await.expect("directory entry") {
+            assert!(!sqlite_paths::is_uuid_sqlite_temporary_file(
+                &entry.path(),
+                "creating",
+                "ing",
+            ));
+        }
+
+        draft.pool.close().await;
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(base_root).await;
+    }
+
+    #[tokio::test]
+    async fn failed_uuid_draft_initialization_removes_temp_file_and_index_reservation() {
+        let root = temp_workspace("failed-uuid-initialization");
+        let pool = connect_config_db(&root).await.expect("config db");
+        let result = ensure_auto_glossary_draft(
+            &pool,
+            &root,
+            EnsureAutoGlossaryDraftInput {
+                name: "Broken Draft".into(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                origin_task_id: "task-broken-draft".into(),
+                chunks: vec![
+                    AutoGlossarySourceChunk {
+                        id: "duplicate-chunk".into(),
+                        sequence: 0,
+                        glossary_source_text: "Apple".into(),
+                        display_source_text: "Apple".into(),
+                    },
+                    AutoGlossarySourceChunk {
+                        id: "duplicate-chunk".into(),
+                        sequence: 1,
+                        glossary_source_text: "Banana".into(),
+                        display_source_text: "Banana".into(),
+                    },
+                ],
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("duplicate chunks must fail initialization"),
+            Err(error) => error,
+        };
+        assert!(error.contains("UNIQUE") || error.contains("unique"));
+        let reservations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM glossary_index WHERE origin_task_id = 'task-broken-draft'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("reservation count");
+        assert_eq!(reservations, 0);
+        let mut entries = tokio::fs::read_dir(root.join(GLOSSARIES_DIR))
+            .await
+            .expect("glossary directory");
+        while let Some(entry) = entries.next_entry().await.expect("directory entry") {
+            assert!(!sqlite_paths::is_uuid_sqlite_temporary_file(
+                &entry.path(),
+                "creating",
+                "ing",
+            ));
+        }
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn startup_removes_only_new_uuid_creation_temps() {
+        let root = temp_workspace("uuid-temp-recovery");
+        let pool = connect_config_db(&root).await.expect("config db");
+        let directory = root.join(GLOSSARIES_DIR);
+        let uuid_temp = sqlite_paths::uuid_sqlite_temporary_path(&directory, "creating", "ing")
+            .expect("uuid temp path");
+        let legacy_temp = directory.join("legacy.ing.creating-glossary_old");
+        tokio::fs::write(&uuid_temp, [])
+            .await
+            .expect("write uuid temp");
+        tokio::fs::write(&legacy_temp, [])
+            .await
+            .expect("write legacy temp");
+
+        recover_auto_glossary_drafts(&pool, &root)
+            .await
+            .expect("recover drafts");
+        assert!(!tokio::fs::try_exists(&uuid_temp)
+            .await
+            .expect("uuid temp existence"));
+        assert!(tokio::fs::try_exists(&legacy_temp)
+            .await
+            .expect("legacy temp existence"));
+
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn deletion_staging_uses_uuid_paths_for_rollback_and_commit() {
+        let root = temp_workspace("uuid-deletion-staging");
+        let pool = connect_config_db(&root).await.expect("glossary config");
+        let translation_root = root.join("translation-workspace");
+        let translation_pool = crate::translation_tasks::connect_config_db(&translation_root)
+            .await
+            .expect("translation config");
+        let glossary = create_auto_glossary(
+            &pool,
+            &root,
+            CreateAutoGlossaryInput {
+                name: "Deletion Staging".into(),
+                source_language: "en".into(),
+                target_language: "zh-CN".into(),
+                entries: Vec::new(),
+            },
+        )
+        .await
+        .expect("create glossary");
+
+        let ticket = stage_manual_glossary_deletion(&pool, &translation_pool, &root, &glossary.id)
+            .await
+            .expect("stage deletion");
+        assert!(sqlite_paths::is_uuid_sqlite_temporary_file(
+            &ticket.staged_path,
+            "deleting",
+            "ing",
+        ));
+        rollback_staged_glossary_deletion(&pool, &ticket)
+            .await
+            .expect("rollback deletion");
+        assert!(tokio::fs::try_exists(&ticket.original_path)
+            .await
+            .expect("restored glossary"));
+
+        let ticket = stage_manual_glossary_deletion(&pool, &translation_pool, &root, &glossary.id)
+            .await
+            .expect("restage deletion");
+        commit_staged_glossary_deletion(&pool, &ticket)
+            .await
+            .expect("commit deletion");
+        assert!(!tokio::fs::try_exists(&ticket.staged_path)
+            .await
+            .expect("deleted staged glossary"));
+
+        translation_pool.close().await;
+        pool.close().await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
     async fn opening_legacy_ing_adds_status_columns_and_generation_table() {
         let root = temp_workspace("legacy-ing-migration");
         let ing_path = root.join("legacy.ing");
@@ -3160,7 +3442,7 @@ mod tests {
             .await
             .expect("mark running");
 
-        recover_auto_glossary_drafts(&pool)
+        recover_auto_glossary_drafts(&pool, &root)
             .await
             .expect("recover drafts");
         let recovered = get_glossary(&pool, &draft.view.id)

@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 use super::context::{
-    ensure_task_global_background, estimate_tokens, global_background_from_texts,
+    ensure_task_global_background, estimate_tokens, global_background_from_texts, next_inp_path,
     previous_source_context, previous_translation_context, sanitize_file_stem, unix_timestamp,
 };
 use super::db::{
@@ -2045,6 +2045,44 @@ fn sanitizes_inp_file_stems() {
     assert_eq!(sanitize_file_stem("bad:name?.md"), "badname.md");
     assert_eq!(sanitize_file_stem("..."), "task");
     assert_eq!(sanitize_file_stem("  book  "), "book");
+}
+
+#[tokio::test]
+async fn long_inp_names_fit_the_sqlite_path_budget_with_collision_suffixes() {
+    let root = temp_root("long-inp-path");
+    let long_name = "Chan - 2016 - A Multi-perspective Investigation of Attitudes Towards English Accents in Hong Kong Implications for Language Teaching and Learning ".repeat(3);
+    let first = next_inp_path(&root, &long_name)
+        .await
+        .expect("first safe inp path");
+    assert!(
+        crate::sqlite_paths::utf16_path_len(&first)
+            <= crate::sqlite_paths::SQLITE_DATABASE_PATH_UTF16_LIMIT
+    );
+    assert!(
+        crate::sqlite_paths::utf16_path_len(Path::new(&format!(
+            "{}-journal",
+            first.to_string_lossy()
+        ))) < 260
+    );
+    let first_pool = connect_inp(&first).await.expect("open first inp");
+    first_pool.close().await;
+
+    let second = next_inp_path(&root, &long_name)
+        .await
+        .expect("second safe inp path");
+    assert!(
+        crate::sqlite_paths::utf16_path_len(&second)
+            <= crate::sqlite_paths::SQLITE_DATABASE_PATH_UTF16_LIMIT
+    );
+    assert!(second
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .expect("second stem")
+        .ends_with("-01"));
+    let second_pool = connect_inp(&second).await.expect("open second inp");
+    second_pool.close().await;
+
+    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[test]

@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::{Row, SqlitePool};
 
 use crate::document_parsing;
+use crate::sqlite_paths;
 
 use super::{
     TranslationChunkStatus, GLOBAL_BACKGROUND_BATCH_CHUNKS, GLOBAL_BACKGROUND_TARGET_TOKENS,
@@ -204,26 +205,8 @@ pub(super) async fn next_inp_path(
     display_name: &str,
 ) -> Result<PathBuf, String> {
     let tasks_dir = workspace_root.join(TASKS_DIR);
-    tokio::fs::create_dir_all(&tasks_dir)
-        .await
-        .map_err(|error| error.to_string())?;
     let base = sanitize_file_stem(display_name);
-    for index in 0..10_000 {
-        let filename = if index == 0 {
-            format!("{base}.inp")
-        } else {
-            format!("{base}-{index:02}.inp")
-        };
-        let candidate = tasks_dir.join(filename);
-        if tokio::fs::try_exists(&candidate)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            continue;
-        }
-        return Ok(candidate);
-    }
-    Err("Unable to allocate a unique INP file name".into())
+    sqlite_paths::next_sqlite_database_path(&tasks_dir, &base, "task", "inp").await
 }
 
 pub(super) fn display_name_from_path(path: &Path) -> String {

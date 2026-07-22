@@ -2,9 +2,9 @@
 
 English | [简体中文](https://github.com/Floratina/InsituTranslate/blob/main/docs/README_zh-CN.md)
 
-<img width="1770" height="1140" alt="image" src="https://github.com/user-attachments/assets/31efb6e9-9a8b-4bb4-a4ed-32fd6c384fe8" />
+<img width="1770" height="1140" alt="image" src="https://github.com/user-attachments/assets/592e80c2-fd89-4e9e-a224-5487735f71a1" />
 
-<img width="1770" height="1140" alt="image" src="https://github.com/user-attachments/assets/f858c090-2cfe-46c0-ae37-6c60ca2f0f60" />
+<img width="1770" height="1140" alt="image" src="https://github.com/user-attachments/assets/9021d721-6975-47e2-8247-63386f71a956" />
 
 > <mark style="background:rgba(5, 117, 197, 0.2)">This project is still under development, and many features are not yet complete.</mark>
 

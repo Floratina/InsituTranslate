@@ -21,9 +21,10 @@ import {
 import { cn } from "@/lib/utils";
 
 const LEGACY_SIDEBAR_STORAGE_KEY = "insitu-sidebar-v1";
-const SIDEBAR_STORAGE_KEY = "insitu-sidebar-v2";
+const PREVIOUS_SIDEBAR_STORAGE_KEYS = ["insitu-sidebar-v2", "insitu-sidebar-v3"];
+const SIDEBAR_STORAGE_KEY = "insitu-sidebar-v4";
 const SIDEBAR_COLLAPSED_WIDTH = 53;
-const SIDEBAR_DEFAULT_WIDTH = 220;
+const SIDEBAR_DEFAULT_WIDTH = 160;
 const SIDEBAR_MAX_WIDTH = 240;
 const SIDEBAR_LABEL_THRESHOLD = 104;
 
@@ -71,6 +72,7 @@ function SidebarToggleIcon({ expanded }: { expanded: boolean }) {
 
 function loadSidebarPreferences(): SidebarPreferences {
   window.localStorage.removeItem(LEGACY_SIDEBAR_STORAGE_KEY);
+  PREVIOUS_SIDEBAR_STORAGE_KEYS.forEach((key) => window.localStorage.removeItem(key));
   const stored = window.localStorage.getItem(SIDEBAR_STORAGE_KEY);
   if (!stored) return defaultSidebarPreferences;
 
@@ -282,12 +284,6 @@ export function AppShell({ children, activePage, onNavigate }: AppShellProps) {
             </TooltipContent>
           </Tooltip>
         </div>
-        <img
-          src="/logo.png"
-          alt=""
-          aria-hidden="true"
-          className="pointer-events-none absolute bottom-25 left-1/2 z-0 size-56 max-w-none -translate-x-1/2 select-none opacity-[0.12] dark:opacity-[0.06]"
-        />
         <nav className="relative z-10 mt-2 grid gap-1">
           {navigationItems.map((item) => (
             <SidebarNavigationButton

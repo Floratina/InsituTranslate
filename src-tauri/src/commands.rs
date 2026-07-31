@@ -13,16 +13,16 @@ use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Mutex;
 
-use crate::adapters::{ProviderAdapter, RuntimeAdapter};
 use crate::db;
 use crate::domain::{
     AddModelInput, AssistantView, ConnectivityResult, CopyAssistantInput, CopyProviderInput,
     CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput, ModelView,
-    ProviderPurpose, ProviderRuntimeConfig, ProviderView, RemoteModel, ReorderAssistantsInput,
-    ReorderProvidersInput, SetProviderEnabledInput, UnifiedChatRequest, UnifiedChatResponse,
-    UnifiedContent, UnifiedMessage, UpdateAssistantCustomParametersInput,
-    UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
-    UpdateProviderConfigInput, UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
+    PreviewProtocolEndpointsInput, ProviderPurpose, ProviderRuntimeConfig, ProviderView,
+    RemoteModel, ReorderAssistantsInput, ReorderProvidersInput, SetProviderEnabledInput,
+    UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedMessage,
+    UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput, UpdateAssistantSettingsInput,
+    UpdateModelInput, UpdateProviderConfigInput, UpdateProviderMetadataInput,
+    UpdateVertexAiConfigInput,
 };
 use crate::glossaries::{
     self, CreateGlossaryEntryInput, DeleteGlossaryEntryInput, ExportGlossaryInput,
@@ -30,6 +30,9 @@ use crate::glossaries::{
     GlossaryFailedChunksQuery, GlossaryListQuery, GlossaryView, ImportGlossaryInput,
     PrepareAutoGlossaryInput, UpdateGlossaryEntryInput, UpdateGlossaryInput,
 };
+use crate::providers::registry::ProtocolDescriptorView;
+use crate::providers::EndpointPreview;
+use crate::providers::{ProviderAdapter, RuntimeAdapter};
 use crate::settings::{
     AppearancePreferences, AppearancePreferencesState, FontCacheRefresh, TaskSchedulerPreferences,
 };
@@ -166,6 +169,27 @@ pub async fn copy_assistant(
 #[tauri::command]
 pub async fn delete_assistant(state: State<'_, AppState>, id: String) -> Result<(), String> {
     db::delete_assistant(&state.pool, &id).await
+}
+
+#[tauri::command]
+pub fn list_protocol_descriptors() -> Vec<ProtocolDescriptorView> {
+    crate::providers::registry::descriptor_views()
+}
+
+#[tauri::command]
+pub fn preview_protocol_endpoints(
+    input: PreviewProtocolEndpointsInput,
+) -> Result<EndpointPreview, String> {
+    let descriptor = crate::providers::registry::resolve_input(&input.protocol)?;
+    let runtime = crate::domain::ProviderRuntimeConfig {
+        protocol: input.protocol,
+        base_url: input.base_url,
+        use_raw_base_url: input.use_raw_base_url,
+        config: input.config,
+        credential: None,
+        custom_headers: Vec::new(),
+    };
+    descriptor.codec.preview_endpoints(&runtime)
 }
 
 #[tauri::command]

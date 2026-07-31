@@ -43,9 +43,11 @@ export function ProviderListItem({
   const [dragging, setDragging] = useState(false);
   const draggedAt = useRef(0);
   const persistTimer = useRef<number | null>(null);
-  const copyTargets = isMinerUProvider(provider)
-    ? PURPOSES.filter((item) => item.value === "document-parsing")
-    : PURPOSES;
+  const copyTargets = provider.protocolStatus === "unknown"
+    ? []
+    : isMinerUProvider(provider)
+      ? PURPOSES.filter((item) => item.value === "document-parsing")
+      : PURPOSES;
   const showCopyMenu = copyTargets.length > 0;
   const showDeleteAction = !provider.isBuiltin;
 
@@ -125,7 +127,11 @@ export function ProviderListItem({
               <div className="truncate text-sm font-medium">{provider.name}</div>
               <div className="text-2xs text-muted-foreground">{provider.models.length} 个模型</div>
             </div>
-            {provider.enabled && (
+            {provider.protocolStatus === "unknown" ? (
+              <span className="inline-flex h-5 shrink-0 self-center items-center rounded-[6px] bg-destructive/10 px-1.5 text-3xs leading-none font-medium text-destructive">
+                协议不可用
+              </span>
+            ) : provider.enabled && (
               <span className="inline-flex h-5 shrink-0 self-center items-center rounded-[6px] bg-enabled-accent/15 px-1.5 text-3xs leading-none font-medium text-enabled-accent">
                 已启用
               </span>

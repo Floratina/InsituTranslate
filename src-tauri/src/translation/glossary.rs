@@ -14,7 +14,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::adapters::RuntimeAdapter;
 use crate::db as app_db;
 use crate::diagnostics::BackendLog;
 use crate::domain::{ProviderPurpose, ThinkingConfig, UnifiedChatRequest};
@@ -27,6 +26,7 @@ use crate::glossary_prompt::{
     build_glossary_prompt, sanitize_and_flatten_glossary, GlossaryEntry, GlossaryPromptBuildResult,
     GlossaryPromptInput,
 };
+use crate::providers::RuntimeAdapter;
 use crate::task_prompt::{ContentFormat, DocumentFormat, TaskChunkInput};
 
 use super::context::estimate_tokens;

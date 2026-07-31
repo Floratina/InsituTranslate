@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,12 +9,18 @@ use sqlx::{Row, SqlitePool};
 use crate::domain::{
     AddModelInput, AssistantIconKind, AssistantView, CopyAssistantInput, CopyProviderInput,
     CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput, ModelView,
-    ProviderProtocol, ProviderPurpose, ProviderRuntimeConfig, ProviderView, ReorderAssistantsInput,
-    ReorderProvidersInput, SetProviderEnabledInput, UpdateAssistantCustomParametersInput,
-    UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
-    UpdateProviderConfigInput, UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
+    ProtocolId, ProtocolStatus, ProviderPurpose, ProviderRuntimeConfig, ProviderView,
+    ReorderAssistantsInput, ReorderProvidersInput, SetProviderEnabledInput,
+    UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput, UpdateAssistantSettingsInput,
+    UpdateModelInput, UpdateProviderConfigInput, UpdateProviderMetadataInput,
+    UpdateVertexAiConfigInput,
 };
-use crate::features::{infer_model_capabilities, supported_thinking_efforts};
+use crate::providers::capabilities::{
+    infer_capabilities, resolve_capabilities, CapabilityId, CapabilityOverrides,
+};
+use crate::providers::registry::{
+    descriptor_by_id, resolve_input, resolve_persisted, ProtocolDescriptor, ProtocolResolution,
+};
 use crate::secrets;
 use crate::vertex_ai;
 
@@ -37,9 +44,9 @@ pub fn default_vertex_ai_config() -> Value {
     vertex_ai::default_config()
 }
 
-fn default_provider_config(protocol: ProviderProtocol) -> Value {
-    match protocol {
-        ProviderProtocol::VertexAi => default_vertex_ai_config(),
+fn default_provider_config(descriptor: &ProtocolDescriptor) -> Value {
+    match descriptor.config_kind {
+        "vertex-ai" => default_vertex_ai_config(),
         _ => json!({}),
     }
 }
@@ -97,6 +104,7 @@ pub async fn connect(path: &std::path::Path) -> Result<SqlitePool, String> {
     seed_mineru_builtin_provider(&pool).await?;
     migrate_builtin_disabled_default(&pool).await?;
     backfill_model_capabilities(&pool).await?;
+    migrate_model_capability_overrides(&pool).await?;
     Ok(pool)
 }
 
@@ -146,6 +154,14 @@ async fn migrate(pool: &SqlitePool) -> Result<(), String> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(provider_id, request_name)
         )"#,
+        r#"CREATE TABLE IF NOT EXISTS model_capability_overrides (
+            model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+            capability_id TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (model_id, capability_id)
+        )"#,
         r#"CREATE TABLE IF NOT EXISTS assistants (
             id TEXT PRIMARY KEY NOT NULL,
             name TEXT NOT NULL,
@@ -166,6 +182,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), String> {
         )"#,
         "CREATE INDEX IF NOT EXISTS idx_provider_purposes_purpose ON provider_purposes(purpose)",
         "CREATE INDEX IF NOT EXISTS idx_models_provider ON models(provider_id, sort_order, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_model_capability_overrides_model ON model_capability_overrides(model_id)",
         "CREATE INDEX IF NOT EXISTS idx_assistants_purpose ON assistants(purpose, sort_order, created_at)",
     ];
     for statement in statements {
@@ -361,7 +378,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         (
             "builtin_openai",
             "OpenAI",
-            ProviderProtocol::OpenaiResponses,
+            "openai-responses",
             "https://api.openai.com",
             "openai",
             json!({}),
@@ -369,7 +386,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         (
             "builtin_gemini",
             "Gemini",
-            ProviderProtocol::Gemini,
+            "gemini",
             "https://generativelanguage.googleapis.com",
             "gemini",
             json!({}),
@@ -377,7 +394,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         (
             "builtin_agent_platform",
             "Agent Platform",
-            ProviderProtocol::VertexAi,
+            "vertex-ai",
             vertex_ai::DEFAULT_BASE_URL,
             "vertex-ai",
             default_vertex_ai_config(),
@@ -385,7 +402,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         (
             "builtin_anthropic",
             "Anthropic",
-            ProviderProtocol::Anthropic,
+            "anthropic",
             "https://api.anthropic.com",
             "anthropic",
             json!({}),
@@ -393,7 +410,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         (
             "builtin_deepseek",
             "DeepSeek",
-            ProviderProtocol::OpenaiChat,
+            "openai-chat",
             "https://api.deepseek.com",
             "deepseek",
             json!({}),
@@ -401,7 +418,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         (
             "builtin_qwen",
             "Qwen",
-            ProviderProtocol::OpenaiChat,
+            "openai-chat",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
             "qwen",
             json!({}),
@@ -409,7 +426,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         (
             "builtin_openrouter",
             "OpenRouter",
-            ProviderProtocol::OpenaiChat,
+            "openai-chat",
             "https://openrouter.ai/api/v1",
             "openrouter",
             json!({}),
@@ -417,7 +434,7 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
         (
             "builtin_ollama",
             "Ollama",
-            ProviderProtocol::Ollama,
+            "ollama",
             "http://localhost:11434/api",
             "ollama",
             json!({}),
@@ -438,13 +455,14 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())?;
         if exists == 0 {
-            let (auth_type, auth_header) = authentication_for_protocol(*protocol);
+            let descriptor = descriptor_by_id(protocol).expect("builtin protocol is registered");
+            let (auth_type, auth_header) = authentication_for_protocol(descriptor);
             let inserted = sqlx::query(
                 "INSERT INTO providers (id, name, protocol, base_url, auth_type, auth_header, config_json, avatar, is_builtin, enabled, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?) ON CONFLICT(id) DO NOTHING",
             )
             .bind(&id)
             .bind(name)
-            .bind(protocol.as_str())
+            .bind(protocol)
             .bind(base_url)
             .bind(auth_type)
             .bind(auth_header)
@@ -483,12 +501,13 @@ async fn seed_mineru_builtin_provider(pool: &SqlitePool) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let mut inserted_any = false;
     if exists == 0 {
-        let (auth_type, auth_header) = authentication_for_protocol(ProviderProtocol::OpenaiChat);
+        let descriptor = descriptor_by_id("openai-chat").expect("MinerU protocol is registered");
+        let (auth_type, auth_header) = authentication_for_protocol(descriptor);
         let inserted = sqlx::query(
             "INSERT INTO providers (id, name, protocol, base_url, use_raw_base_url, auth_type, auth_header, config_json, avatar, is_builtin, enabled, sort_order) VALUES (?, 'MinerU', ?, ?, 1, ?, ?, ?, 'mineru', 1, 0, 0) ON CONFLICT(id) DO NOTHING",
         )
         .bind(MINERU_PROVIDER_ID)
-        .bind(ProviderProtocol::OpenaiChat.as_str())
+        .bind(descriptor.id)
         .bind(MINERU_STANDARD_BASE_URL)
         .bind(auth_type)
         .bind(auth_header)
@@ -786,13 +805,17 @@ async fn backfill_model_capabilities(pool: &SqlitePool) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     for row in rows {
-        let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
+        let raw_protocol: String = row.get("protocol");
+        let ProtocolResolution::Known(descriptor) = resolve_persisted(&raw_protocol) else {
+            eprintln!(
+                "Skipping model capability backfill for unknown provider protocol: {raw_protocol}"
+            );
+            continue;
+        };
         let request_name: String = row.get("request_name");
-        let inferred = infer_model_capabilities(
-            protocol,
-            row.get::<String, _>("base_url").as_str(),
-            &request_name,
-        );
+        let inferred = descriptor
+            .codec
+            .infer_capabilities(row.get::<String, _>("base_url").as_str(), &request_name);
         let capability_reasoning =
             row.get::<i64, _>("capability_reasoning") != 0 || inferred.reasoning;
         let capability_web = row.get::<i64, _>("capability_web") != 0 || inferred.web;
@@ -824,28 +847,158 @@ async fn backfill_model_capabilities(pool: &SqlitePool) -> Result<(), String> {
     Ok(())
 }
 
-fn default_base_url(protocol: ProviderProtocol) -> &'static str {
-    match protocol {
-        ProviderProtocol::OpenaiChat | ProviderProtocol::OpenaiResponses => {
-            "https://api.openai.com"
+async fn migrate_model_capability_overrides(pool: &SqlitePool) -> Result<(), String> {
+    let migrated: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM app_metadata WHERE key = 'model-capability-overrides-v1'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if migrated.is_some() {
+        return Ok(());
+    }
+
+    let rows = sqlx::query(
+        "SELECT m.id, m.request_name, m.capability_reasoning, m.capability_web,
+                p.protocol, p.base_url
+         FROM models m
+         JOIN providers p ON p.id = m.provider_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+    for row in rows {
+        let raw_protocol: String = row.get("protocol");
+        let ProtocolResolution::Known(descriptor) = resolve_persisted(&raw_protocol) else {
+            eprintln!(
+                "Skipping model capability override migration for unknown protocol: {raw_protocol}"
+            );
+            continue;
+        };
+        let model_id: String = row.get("id");
+        let request_name: String = row.get("request_name");
+        let base_url: String = row.get("base_url");
+        let inferred = descriptor
+            .codec
+            .infer_capabilities(&base_url, &request_name);
+        for (capability, legacy_value, inferred_value) in [
+            (
+                CapabilityId::REASONING,
+                row.get::<i64, _>("capability_reasoning") != 0,
+                inferred.reasoning,
+            ),
+            (
+                CapabilityId::WEB,
+                row.get::<i64, _>("capability_web") != 0,
+                inferred.web,
+            ),
+        ] {
+            if legacy_value != inferred_value {
+                sqlx::query(
+                    "INSERT INTO model_capability_overrides
+                     (model_id, capability_id, value_json)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(model_id, capability_id) DO NOTHING",
+                )
+                .bind(&model_id)
+                .bind(capability.as_str())
+                .bind(if legacy_value { "true" } else { "false" })
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| error.to_string())?;
+            }
         }
-        ProviderProtocol::Anthropic => "https://api.anthropic.com",
-        ProviderProtocol::Gemini => "https://generativelanguage.googleapis.com",
-        ProviderProtocol::VertexAi => vertex_ai::DEFAULT_BASE_URL,
-        ProviderProtocol::Ollama => "http://localhost:11434/api",
+    }
+    sqlx::query(
+        "INSERT INTO app_metadata (key, value)
+         VALUES ('model-capability-overrides-v1', 'done')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn capability_overrides_for_provider(
+    pool: &SqlitePool,
+    provider_id: &str,
+) -> Result<HashMap<String, CapabilityOverrides>, String> {
+    let rows = sqlx::query(
+        "SELECT o.model_id, o.capability_id, o.value_json
+         FROM model_capability_overrides o
+         JOIN models m ON m.id = o.model_id
+         WHERE m.provider_id = ?",
+    )
+    .bind(provider_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut overrides = HashMap::<String, CapabilityOverrides>::new();
+    for row in rows {
+        let capability_id: String = row.get("capability_id");
+        let Some(capability) = CapabilityId::from_registered(&capability_id) else {
+            eprintln!("Ignoring unregistered model capability override: {capability_id}");
+            continue;
+        };
+        let value_json: String = row.get("value_json");
+        let value = serde_json::from_str(&value_json)
+            .map_err(|error| format!("Invalid capability override {capability_id}: {error}"))?;
+        overrides
+            .entry(row.get("model_id"))
+            .or_default()
+            .insert_json(capability, value);
+    }
+    Ok(overrides)
+}
+
+async fn capability_overrides_for_model(
+    pool: &SqlitePool,
+    model_id: &str,
+) -> Result<CapabilityOverrides, String> {
+    let rows = sqlx::query(
+        "SELECT capability_id, value_json
+         FROM model_capability_overrides
+         WHERE model_id = ?",
+    )
+    .bind(model_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut overrides = CapabilityOverrides::default();
+    for row in rows {
+        let capability_id: String = row.get("capability_id");
+        let Some(capability) = CapabilityId::from_registered(&capability_id) else {
+            eprintln!("Ignoring unregistered model capability override: {capability_id}");
+            continue;
+        };
+        let value_json: String = row.get("value_json");
+        let value = serde_json::from_str(&value_json)
+            .map_err(|error| format!("Invalid capability override {capability_id}: {error}"))?;
+        overrides.insert_json(capability, value);
+    }
+    Ok(overrides)
+}
+
+fn registered_descriptor(raw_id: &str) -> Result<&'static ProtocolDescriptor, String> {
+    match resolve_persisted(raw_id) {
+        ProtocolResolution::Known(descriptor) => Ok(descriptor),
+        ProtocolResolution::Unknown { raw_id, .. } => Err(format!(
+            "UnknownProtocol: provider protocol \"{raw_id}\" is unknown or no longer available"
+        )),
     }
 }
 
-fn authentication_for_protocol(protocol: ProviderProtocol) -> (&'static str, &'static str) {
-    match protocol {
-        ProviderProtocol::Anthropic => ("api-key", "x-api-key"),
-        ProviderProtocol::Gemini => ("api-key", "x-goog-api-key"),
-        ProviderProtocol::VertexAi => ("service-account", "Authorization"),
-        ProviderProtocol::Ollama => ("none", "Authorization"),
-        ProviderProtocol::OpenaiChat | ProviderProtocol::OpenaiResponses => {
-            ("bearer", "Authorization")
-        }
-    }
+fn authentication_for_protocol(descriptor: &ProtocolDescriptor) -> (&'static str, &'static str) {
+    (
+        descriptor.auth.strategy.legacy_auth_type(),
+        descriptor.auth.strategy.header(),
+    )
 }
 
 pub async fn list_assistants(
@@ -1143,7 +1296,28 @@ async fn provider_from_row(
             .fetch_one(pool)
             .await
             .map_err(|error| error.to_string())?;
-    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
+    let raw_protocol: String = row.get("protocol");
+    let (protocol, protocol_status, protocol_raw_id, known_protocol) =
+        match resolve_persisted(raw_protocol) {
+            ProtocolResolution::Known(descriptor) => (
+                ProtocolId::registered(descriptor.id),
+                ProtocolStatus::Available,
+                None,
+                Some(descriptor),
+            ),
+            ProtocolResolution::Unknown {
+                id: unknown_protocol,
+                raw_id,
+            } => {
+                eprintln!("Loaded provider {id} with unknown protocol: {raw_id}");
+                (
+                    unknown_protocol,
+                    ProtocolStatus::Unknown,
+                    Some(raw_id),
+                    None,
+                )
+            }
+        };
     let base_url: String = row.get("base_url");
     let model_rows =
         sqlx::query("SELECT * FROM models WHERE provider_id = ? ORDER BY sort_order, created_at")
@@ -1151,16 +1325,27 @@ async fn provider_from_row(
             .fetch_all(pool)
             .await
             .map_err(|error| error.to_string())?;
+    let capability_overrides = capability_overrides_for_provider(pool, &id).await?;
     let models = model_rows
         .iter()
-        .map(|row| model_from_row(row, protocol, &base_url))
-        .collect();
+        .map(|row| {
+            let model_id: String = row.get("id");
+            model_from_row(
+                row,
+                known_protocol,
+                &base_url,
+                capability_overrides.get(&model_id),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let header_keys_json: String = row.get("header_keys_json");
     let config_json: String = row.get("config_json");
     Ok(ProviderView {
         id,
         name: row.get("name"),
         protocol,
+        protocol_status,
+        protocol_raw_id,
         base_url,
         use_raw_base_url: row.get::<i64, _>("use_raw_base_url") != 0,
         config: serde_json::from_str(&config_json).unwrap_or_else(|_| json!({})),
@@ -1176,14 +1361,33 @@ async fn provider_from_row(
 
 fn model_from_row(
     row: &sqlx::sqlite::SqliteRow,
-    protocol: ProviderProtocol,
+    descriptor: Option<&ProtocolDescriptor>,
     base_url: &str,
-) -> ModelView {
+    overrides: Option<&CapabilityOverrides>,
+) -> Result<ModelView, String> {
     let request_name: String = row.get("request_name");
-    let capability_reasoning = row.get::<i64, _>("capability_reasoning") != 0;
-    let supported_thinking_efforts =
-        supported_thinking_efforts(protocol, base_url, &request_name, capability_reasoning);
-    ModelView {
+    let (capability_reasoning, capability_web, supported_thinking_efforts) = match descriptor {
+        Some(descriptor) => {
+            let empty_overrides = CapabilityOverrides::default();
+            let capabilities = resolve_capabilities(
+                descriptor.codec,
+                base_url,
+                &request_name,
+                overrides.unwrap_or(&empty_overrides),
+            )?;
+            (
+                capabilities.reasoning,
+                capabilities.web,
+                capabilities.thinking_efforts,
+            )
+        }
+        None => (
+            row.get::<i64, _>("capability_reasoning") != 0,
+            row.get::<i64, _>("capability_web") != 0,
+            Vec::new(),
+        ),
+    };
+    Ok(ModelView {
         id: row.get("id"),
         provider_id: row.get("provider_id"),
         request_name,
@@ -1191,12 +1395,12 @@ fn model_from_row(
         source: row.get("source"),
         capability_reasoning,
         supported_thinking_efforts,
-        capability_web: row.get::<i64, _>("capability_web") != 0,
+        capability_web,
         test_status: row.get("test_status"),
         latency_ms: row.get("latency_ms"),
         tested_at: row.get("tested_at"),
         test_error: row.get("test_error"),
-    }
+    })
 }
 
 pub async fn create_provider(
@@ -1206,20 +1410,21 @@ pub async fn create_provider(
     if input.name.trim().is_empty() {
         return Err("Provider name is required".into());
     }
+    let descriptor = resolve_input(&input.protocol)?;
     let id = new_id("provider");
     let credential_ref = format!("provider/{id}/credential");
-    let (auth_type, auth_header) = authentication_for_protocol(input.protocol);
+    let (auth_type, auth_header) = authentication_for_protocol(descriptor);
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query(
         "INSERT INTO providers (id, name, protocol, base_url, auth_type, auth_header, config_json, credential_ref, avatar) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(input.name.trim())
-    .bind(input.protocol.as_str())
-    .bind(default_base_url(input.protocol))
+    .bind(descriptor.id)
+    .bind(descriptor.default_base_url)
     .bind(auth_type)
     .bind(auth_header)
-    .bind(default_provider_config(input.protocol).to_string())
+    .bind(default_provider_config(descriptor).to_string())
     .bind(&credential_ref)
     .bind(input.avatar)
     .execute(&mut *transaction)
@@ -1422,8 +1627,8 @@ pub async fn get_vertex_ai_private_key(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Provider not found".to_string())?;
-    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
-    if protocol != ProviderProtocol::VertexAi {
+    let descriptor = registered_descriptor(row.get::<String, _>("protocol").as_str())?;
+    if descriptor.config_kind != "vertex-ai" {
         return Err("Private key can only be read from Agent Platform providers".into());
     }
     let credential_ref: Option<String> = row.get("credential_ref");
@@ -1447,8 +1652,8 @@ async fn save_vertex_ai_config(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Provider not found".to_string())?;
-    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
-    if protocol != ProviderProtocol::VertexAi {
+    let descriptor = registered_descriptor(row.get::<String, _>("protocol").as_str())?;
+    if descriptor.config_kind != "vertex-ai" {
         return Err("Agent Platform config can only be saved on Agent Platform providers".into());
     }
     let config_json: String = row.get("config_json");
@@ -1519,10 +1724,11 @@ pub async fn update_provider_metadata(
     if input.name.trim().is_empty() {
         return Err("Provider name is required".into());
     }
-    let (auth_type, auth_header) = authentication_for_protocol(input.protocol);
+    let descriptor = resolve_input(&input.protocol)?;
+    let (auth_type, auth_header) = authentication_for_protocol(descriptor);
     sqlx::query("UPDATE providers SET name = ?, protocol = ?, auth_type = ?, auth_header = ?, avatar = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(input.name.trim())
-        .bind(input.protocol.as_str())
+        .bind(descriptor.id)
         .bind(auth_type)
         .bind(auth_header)
         .bind(input.avatar)
@@ -1537,6 +1743,20 @@ pub async fn set_provider_enabled(
     pool: &SqlitePool,
     input: SetProviderEnabledInput,
 ) -> Result<ProviderView, String> {
+    let raw_protocol: String = sqlx::query_scalar("SELECT protocol FROM providers WHERE id = ?")
+        .bind(&input.id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Provider not found".to_string())?;
+    if matches!(
+        resolve_persisted(&raw_protocol),
+        ProtocolResolution::Unknown { .. }
+    ) {
+        return Err(format!(
+            "Provider protocol \"{raw_protocol}\" is unknown or no longer available"
+        ));
+    }
     sqlx::query("UPDATE providers SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(input.enabled)
         .bind(&input.id)
@@ -1704,6 +1924,20 @@ async fn clone_provider(
         .execute(&mut *transaction)
         .await
         .map_err(|error| error.to_string())?;
+    sqlx::query(
+        "INSERT INTO model_capability_overrides (model_id, capability_id, value_json)
+         SELECT copied.id, overrides.capability_id, overrides.value_json
+         FROM models source
+         JOIN model_capability_overrides overrides ON overrides.model_id = source.id
+         JOIN models copied
+           ON copied.provider_id = ? AND copied.request_name = source.request_name
+         WHERE source.provider_id = ?",
+    )
+    .bind(&id)
+    .bind(provider_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
     transaction
         .commit()
         .await
@@ -1811,7 +2045,7 @@ pub async fn add_model(pool: &SqlitePool, input: AddModelInput) -> Result<ModelV
         .fetch_one(pool)
         .await
         .map_err(|error| error.to_string())?;
-    let protocol = ProviderProtocol::parse(provider.get::<String, _>("protocol").as_str())?;
+    let descriptor = registered_descriptor(provider.get::<String, _>("protocol").as_str())?;
     let base_url: String = provider.get("base_url");
     let request_name = input.request_name.trim();
     let alias = if input.alias.trim().is_empty() {
@@ -1819,7 +2053,7 @@ pub async fn add_model(pool: &SqlitePool, input: AddModelInput) -> Result<ModelV
     } else {
         input.alias.trim()
     };
-    let inferred = infer_model_capabilities(protocol, base_url.as_str(), request_name);
+    let inferred = infer_capabilities(descriptor.codec, base_url.as_str(), request_name);
     sqlx::query("INSERT INTO models (id, provider_id, request_name, alias, source, capability_reasoning, capability_web, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM models WHERE provider_id = ?), 0)) ON CONFLICT(provider_id, request_name) DO UPDATE SET alias = excluded.alias")
         .bind(&id)
         .bind(&input.provider_id)
@@ -1838,16 +2072,74 @@ pub async fn add_model(pool: &SqlitePool, input: AddModelInput) -> Result<ModelV
         .fetch_one(pool)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(model_from_row(&row, protocol, &base_url))
+    let model_id: String = row.get("id");
+    let overrides = capability_overrides_for_model(pool, &model_id).await?;
+    model_from_row(&row, Some(descriptor), &base_url, Some(&overrides))
 }
 
 pub async fn update_model(pool: &SqlitePool, input: UpdateModelInput) -> Result<ModelView, String> {
+    let model = sqlx::query(
+        "SELECT m.request_name, p.protocol, p.base_url
+         FROM models m
+         JOIN providers p ON p.id = m.provider_id
+         WHERE m.id = ?",
+    )
+    .bind(&input.id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "Model not found".to_string())?;
+    let descriptor = registered_descriptor(model.get::<String, _>("protocol").as_str())?;
+    let base_url: String = model.get("base_url");
+    let request_name: String = model.get("request_name");
+    let inferred = infer_capabilities(descriptor.codec, &base_url, &request_name);
+
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query("UPDATE models SET alias = ?, capability_reasoning = ?, capability_web = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(input.alias.trim())
         .bind(input.capability_reasoning)
         .bind(input.capability_web)
         .bind(&input.id)
-        .execute(pool)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error.to_string())?;
+    for (capability, final_value, inferred_value) in [
+        (
+            CapabilityId::REASONING,
+            input.capability_reasoning,
+            inferred.reasoning,
+        ),
+        (CapabilityId::WEB, input.capability_web, inferred.web),
+    ] {
+        if final_value == inferred_value {
+            sqlx::query(
+                "DELETE FROM model_capability_overrides
+                 WHERE model_id = ? AND capability_id = ?",
+            )
+            .bind(&input.id)
+            .bind(capability.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?;
+        } else {
+            sqlx::query(
+                "INSERT INTO model_capability_overrides
+                 (model_id, capability_id, value_json)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(model_id, capability_id) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = CURRENT_TIMESTAMP",
+            )
+            .bind(&input.id)
+            .bind(capability.as_str())
+            .bind(if final_value { "true" } else { "false" })
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction
+        .commit()
         .await
         .map_err(|error| error.to_string())?;
     get_model(pool, &input.id).await
@@ -1865,9 +2157,10 @@ pub async fn get_model(pool: &SqlitePool, id: &str) -> Result<ModelView, String>
     .await
     .map_err(|error| error.to_string())?
     .ok_or_else(|| "Model not found".to_string())?;
-    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
+    let descriptor = registered_descriptor(row.get::<String, _>("protocol").as_str())?;
     let base_url: String = row.get("base_url");
-    Ok(model_from_row(&row, protocol, &base_url))
+    let overrides = capability_overrides_for_model(pool, id).await?;
+    model_from_row(&row, Some(descriptor), &base_url, Some(&overrides))
 }
 
 pub async fn delete_model(pool: &SqlitePool, id: &str) -> Result<(), String> {
@@ -1904,16 +2197,13 @@ pub async fn runtime_config(pool: &SqlitePool, id: &str) -> Result<ProviderRunti
             }
             None => Vec::new(),
         };
-    let protocol = ProviderProtocol::parse(row.get::<String, _>("protocol").as_str())?;
-    let (auth_type, auth_header) = authentication_for_protocol(protocol);
+    let descriptor = registered_descriptor(row.get::<String, _>("protocol").as_str())?;
     let config_json: String = row.get("config_json");
     Ok(ProviderRuntimeConfig {
-        protocol,
+        protocol: ProtocolId::registered(descriptor.id),
         base_url: row.get("base_url"),
         use_raw_base_url: row.get::<i64, _>("use_raw_base_url") != 0,
         config: serde_json::from_str(&config_json).unwrap_or_else(|_| json!({})),
-        auth_type: auth_type.into(),
-        auth_header: auth_header.into(),
         credential,
         custom_headers,
     })
@@ -1944,12 +2234,94 @@ mod tests {
     use super::*;
     use crate::domain::{
         AddModelInput, AssistantIconKind, CopyAssistantInput, CopyProviderInput,
-        CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput,
-        ProviderProtocol, ProviderPurpose, ReorderAssistantsInput, ReorderProvidersInput,
+        CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput, ProtocolId,
+        ProviderPurpose, ReorderAssistantsInput, ReorderProvidersInput,
         UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput,
         UpdateAssistantSettingsInput, UpdateModelInput, UpdateProviderConfigInput,
         UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
     };
+
+    #[tokio::test]
+    async fn unknown_protocol_rows_survive_startup_and_can_be_repaired() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("initial connect");
+        let provider_id = new_id("provider");
+        sqlx::query("INSERT INTO providers (id, name, protocol, base_url) VALUES (?, ?, ?, ?)")
+            .bind(&provider_id)
+            .bind("Retired provider")
+            .bind("retired-chat-v0")
+            .bind("https://retired.invalid")
+            .execute(&pool)
+            .await
+            .expect("insert unknown provider");
+        sqlx::query(
+            "INSERT INTO provider_purposes (provider_id, purpose, sort_order) VALUES (?, ?, 0)",
+        )
+        .bind(&provider_id)
+        .bind(ProviderPurpose::Translation.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert provider purpose");
+        sqlx::query(
+            "INSERT INTO models (id, provider_id, request_name, alias) VALUES (?, ?, ?, ?)",
+        )
+        .bind(new_id("model"))
+        .bind(&provider_id)
+        .bind("retired-model")
+        .bind("Retired model")
+        .execute(&pool)
+        .await
+        .expect("insert model");
+        sqlx::query("DELETE FROM app_metadata WHERE key = 'model-capability-backfill-v1'")
+            .execute(&pool)
+            .await
+            .expect("reset capability migration");
+        pool.close().await;
+
+        let pool = connect(&path)
+            .await
+            .expect("reconnect with unknown protocol");
+        let persisted: String = sqlx::query_scalar("SELECT protocol FROM providers WHERE id = ?")
+            .bind(&provider_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read persisted protocol");
+        assert_eq!(persisted, "retired-chat-v0");
+
+        let provider = get_provider(&pool, &provider_id)
+            .await
+            .expect("unknown provider remains visible");
+        assert!(provider.protocol.is_unknown());
+        assert_eq!(provider.protocol_status, ProtocolStatus::Unknown);
+        assert_eq!(provider.protocol_raw_id.as_deref(), Some("retired-chat-v0"));
+        assert!(provider.models[0].supported_thinking_efforts.is_empty());
+        assert!(runtime_config(&pool, &provider_id).await.is_err());
+        assert!(set_provider_enabled(
+            &pool,
+            SetProviderEnabledInput {
+                id: provider_id.clone(),
+                enabled: true,
+            },
+        )
+        .await
+        .is_err());
+
+        let repaired = update_provider_metadata(
+            &pool,
+            UpdateProviderMetadataInput {
+                id: provider_id.clone(),
+                name: "Repaired provider".into(),
+                protocol: ProtocolId::registered("openai-chat"),
+                avatar: None,
+            },
+        )
+        .await
+        .expect("repair protocol");
+        assert_eq!(repaired.protocol_status, ProtocolStatus::Available);
+        assert_eq!(repaired.protocol_raw_id, None);
+        assert_eq!(repaired.protocol.as_str(), "openai-chat");
+    }
 
     #[tokio::test]
     async fn persists_provider_relations_and_keeps_model_request_name_immutable() {
@@ -1960,7 +2332,7 @@ mod tests {
             &pool,
             CreateProviderInput {
                 name: "Test".into(),
-                protocol: ProviderProtocol::OpenaiChat,
+                protocol: ProtocolId::registered("openai-chat"),
                 purpose: ProviderPurpose::Translation,
                 avatar: None,
             },
@@ -2013,7 +2385,7 @@ mod tests {
             &pool,
             CreateProviderInput {
                 name: "OpenAI Responses Test".into(),
-                protocol: ProviderProtocol::OpenaiResponses,
+                protocol: ProtocolId::registered("openai-responses"),
                 purpose: ProviderPurpose::Translation,
                 avatar: None,
             },
@@ -2047,7 +2419,7 @@ mod tests {
             &pool,
             CreateProviderInput {
                 name: "Legacy OpenAI".into(),
-                protocol: ProviderProtocol::OpenaiResponses,
+                protocol: ProtocolId::registered("openai-responses"),
                 purpose: ProviderPurpose::Translation,
                 avatar: None,
             },
@@ -2092,6 +2464,75 @@ mod tests {
             .expect("second backfill skips");
         let manual = get_model(&pool, &model_id).await.expect("manual model");
         assert!(!manual.capability_web);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn capability_override_migration_and_provider_copy_preserve_effective_values() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let provider = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Capability migration".into(),
+                protocol: ProtocolId::registered("openai-responses"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create provider");
+        let model_id = new_id("model");
+        sqlx::query(
+            "INSERT INTO models
+             (id, provider_id, request_name, alias, capability_reasoning, capability_web)
+             VALUES (?, ?, 'gpt-5', 'GPT-5', 0, 0)",
+        )
+        .bind(&model_id)
+        .bind(&provider.id)
+        .execute(&pool)
+        .await
+        .expect("insert legacy model");
+        sqlx::query("DELETE FROM app_metadata WHERE key = 'model-capability-overrides-v1'")
+            .execute(&pool)
+            .await
+            .expect("reset override migration");
+
+        migrate_model_capability_overrides(&pool)
+            .await
+            .expect("migrate overrides");
+        let migrated = get_model(&pool, &model_id).await.expect("migrated model");
+        assert!(!migrated.capability_reasoning);
+        assert!(!migrated.capability_web);
+
+        let updated = update_model(
+            &pool,
+            UpdateModelInput {
+                id: model_id,
+                alias: "GPT-5".into(),
+                capability_reasoning: true,
+                capability_web: false,
+            },
+        )
+        .await
+        .expect("update override");
+        assert!(updated.capability_reasoning);
+        assert!(!updated.capability_web);
+
+        let copied = copy_provider(
+            &pool,
+            CopyProviderInput {
+                provider_id: provider.id,
+                purpose: ProviderPurpose::Translation,
+            },
+        )
+        .await
+        .expect("copy provider");
+        assert!(copied.models[0].capability_reasoning);
+        assert!(!copied.models[0].capability_web);
 
         pool.close().await;
         let _ = std::fs::remove_file(path);
@@ -2146,7 +2587,7 @@ mod tests {
             &pool,
             CreateProviderInput {
                 name: "First custom".into(),
-                protocol: ProviderProtocol::OpenaiChat,
+                protocol: ProtocolId::registered("openai-chat"),
                 purpose: ProviderPurpose::Translation,
                 avatar: None,
             },
@@ -2157,7 +2598,7 @@ mod tests {
             &pool,
             CreateProviderInput {
                 name: "Second custom".into(),
-                protocol: ProviderProtocol::OpenaiChat,
+                protocol: ProtocolId::registered("openai-chat"),
                 purpose: ProviderPurpose::Translation,
                 avatar: None,
             },
@@ -2213,7 +2654,7 @@ mod tests {
         assert!(imported.credential_mask.is_some());
 
         let runtime = runtime_config(&pool, &imported.id).await.expect("runtime");
-        assert_eq!(runtime.protocol, ProviderProtocol::VertexAi);
+        assert_eq!(runtime.protocol.as_str(), "vertex-ai");
         assert!(runtime
             .credential
             .as_deref()
@@ -2255,7 +2696,7 @@ mod tests {
         let copied_runtime = runtime_config(&pool, &copied.id)
             .await
             .expect("copied runtime");
-        assert_eq!(copied_runtime.protocol, ProviderProtocol::VertexAi);
+        assert_eq!(copied_runtime.protocol.as_str(), "vertex-ai");
         assert!(copied_runtime.credential.is_some());
 
         let _ = secrets::delete(&format!("provider/{}/credential", imported.id));
@@ -2273,7 +2714,7 @@ mod tests {
             &pool,
             CreateProviderInput {
                 name: "Qwen".into(),
-                protocol: ProviderProtocol::OpenaiChat,
+                protocol: ProtocolId::registered("openai-chat"),
                 purpose: ProviderPurpose::Translation,
                 avatar: None,
             },
@@ -2341,7 +2782,7 @@ mod tests {
             &pool,
             CreateProviderInput {
                 name: "Shared".into(),
-                protocol: ProviderProtocol::OpenaiChat,
+                protocol: ProtocolId::registered("openai-chat"),
                 purpose: ProviderPurpose::Translation,
                 avatar: Some("avatar".into()),
             },
@@ -2419,7 +2860,7 @@ mod tests {
             UpdateProviderMetadataInput {
                 id: builtin.id.clone(),
                 name: "Changed".into(),
-                protocol: ProviderProtocol::OpenaiChat,
+                protocol: ProtocolId::registered("openai-chat"),
                 avatar: None,
             },
         )
@@ -2568,7 +3009,7 @@ mod tests {
             &pool,
             CreateProviderInput {
                 name: "Legacy Shared".into(),
-                protocol: ProviderProtocol::OpenaiChat,
+                protocol: ProtocolId::registered("openai-chat"),
                 purpose: ProviderPurpose::Translation,
                 avatar: None,
             },

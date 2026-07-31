@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Braces, KeyRound, Network } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -22,14 +24,24 @@ import {
   withMinerUConfig,
 } from "./mineru";
 import { ProviderAvatar } from "./ProviderAvatar";
+import { ProtocolConfigFields } from "./ProtocolConfigFields";
 import { ProviderModelList } from "./ProviderModelList";
 import { VertexAiConfigPanel } from "./VertexAiConfigPanel";
-import type { MinerUMode, ModelView, ProviderDraft, ProviderProtocol, ProviderView } from "./types";
+import type {
+  MinerUMode,
+  ModelView,
+  ProtocolDescriptor,
+  ProtocolEndpointPreview,
+  ProviderDraft,
+  ProviderView,
+} from "./types";
 import type { UpdateVertexAiConfigInput } from "./vertexAi";
 
 interface ProviderDetailsPanelProps {
   provider: ProviderView | null;
   draft: ProviderDraft | null;
+  protocolDisplayName: string;
+  protocolDescriptor: ProtocolDescriptor | null;
   testingModelId: string;
   onDraftChange: (draft: ProviderDraft) => void;
   onEnabledChange: (provider: ProviderView, enabled: boolean) => void;
@@ -46,20 +58,6 @@ interface ProviderDetailsPanelProps {
 }
 
 const BASE_URL_HELP_TEXT = "在末尾添加“#”会以当前输入为完整路径";
-const GEMINI_KEY_TYPE_HELP_TEXT =
-  "Google 正在从标准 API 密钥切换到授权 (auth) 密钥，2026 年 9 月起将拒绝任何标准密钥的请求，InsituTranslate 已经适配。详情参考 Gemini API 文档。";
-
-function protocolLabel(protocol: ProviderProtocol): string {
-  const labels: Record<ProviderProtocol, string> = {
-    "openai-chat": "OpenAI Chat Completions",
-    "openai-responses": "OpenAI Responses",
-    anthropic: "Anthropic Messages",
-    gemini: "Gemini API",
-    "vertex-ai": "Agent Platform",
-    ollama: "Ollama Chat",
-  };
-  return labels[protocol];
-}
 
 function splitBaseUrlMarker(baseUrl: string): { base: string; markerRaw: boolean } {
   const markerIndex = baseUrl.indexOf("#");
@@ -71,35 +69,6 @@ function splitBaseUrlMarker(baseUrl: string): { base: string; markerRaw: boolean
 
 function appendPreviewEndpoint(baseUrl: string, suffix: string): string {
   return `${baseUrl}${suffix}`;
-}
-
-function isVersionedBase(baseUrl: string): boolean {
-  try {
-    const path = new URL(baseUrl).pathname.replace(/\/+$/, "");
-    return /\/v\d+$/i.test(path);
-  } catch {
-    return /\/v\d+\/?$/i.test(baseUrl);
-  }
-}
-
-function baseUrlPreview(baseUrl: string, protocol: ProviderProtocol, useRawBaseUrl: boolean): string {
-  const { base, markerRaw } = splitBaseUrlMarker(baseUrl);
-  const raw = useRawBaseUrl || markerRaw;
-  if (!base.trim()) return "请先填写 Base URL";
-  if (protocol === "ollama") {
-    const suffix = raw ? "/chat" : base.endsWith("/api") ? "/chat" : "/api/chat";
-    return `预览: ${appendPreviewEndpoint(base, suffix)}`;
-  }
-  if (protocol === "anthropic") {
-    return `预览: ${appendPreviewEndpoint(base, raw ? "/messages" : "/v1/messages")}`;
-  }
-  if (protocol === "gemini") {
-    return `预览: ${appendPreviewEndpoint(base, raw ? "/models/{model}:generateContent" : "/v1beta/models/{model}:generateContent")}`;
-  }
-  const versioned = isVersionedBase(base);
-  return protocol === "openai-responses"
-    ? `预览: ${appendPreviewEndpoint(base, raw || versioned ? "/responses" : "/v1/responses")}`
-    : `预览: ${appendPreviewEndpoint(base, raw || versioned ? "/chat/completions" : "/v1/chat/completions")}`;
 }
 
 function mineruBasePreview(baseUrl: string, mode: MinerUMode): string[] {
@@ -136,6 +105,8 @@ function updateMinerUDraft(
 export function ProviderDetailsPanel({
   provider,
   draft,
+  protocolDisplayName,
+  protocolDescriptor,
   testingModelId,
   onDraftChange,
   onEnabledChange,
@@ -150,6 +121,45 @@ export function ProviderDetailsPanel({
   onUpdateVertexAiConfig,
   onError,
 }: ProviderDetailsPanelProps) {
+  const [endpointPreview, setEndpointPreview] = useState<ProtocolEndpointPreview | null>(null);
+  const [endpointPreviewError, setEndpointPreviewError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (
+      !provider
+      || !draft
+      || provider.protocolStatus !== "available"
+      || isMinerUProvider(provider)
+      || !draft.baseUrl.trim()
+    ) {
+      setEndpointPreview(null);
+      setEndpointPreviewError(null);
+      return;
+    }
+    let active = true;
+    void invoke<ProtocolEndpointPreview>("preview_protocol_endpoints", {
+      input: {
+        protocol: provider.protocol,
+        baseUrl: draft.baseUrl,
+        useRawBaseUrl: draft.useRawBaseUrl,
+        config: draft.config,
+      },
+    })
+      .then((preview) => {
+        if (!active) return;
+        setEndpointPreview(preview);
+        setEndpointPreviewError(null);
+      })
+      .catch((cause: unknown) => {
+        if (!active) return;
+        setEndpointPreview(null);
+        setEndpointPreviewError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => {
+      active = false;
+    };
+  }, [draft, provider]);
+
   if (!provider || !draft) {
     return (
       <div className="flex h-full min-h-80 flex-col items-center justify-center gap-2 text-muted-foreground">
@@ -160,8 +170,9 @@ export function ProviderDetailsPanel({
   }
 
   const isMinerU = isMinerUProvider(provider);
-  const isGemini = provider.protocol === "gemini" && !isMinerU;
-  const isVertexAi = provider.protocol === "vertex-ai";
+  const protocolAvailable = provider.protocolStatus === "available";
+  const isVertexAi = protocolDescriptor?.configKind === "vertex-ai";
+  const requiresCredential = protocolDescriptor?.auth.kind !== "none";
   const mineruConfig = getMinerUConfig(draft.config);
   const activeMinerUBaseUrl =
     mineruConfig.mode === "flash" ? mineruConfig.flashBaseUrl : draft.baseUrl;
@@ -177,23 +188,29 @@ export function ProviderDetailsPanel({
           <ProviderAvatar name={provider.name} avatar={provider.avatar} size="lg" />
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 className="min-w-0 truncate text-base font-semibold">{provider.name}</h2>
-            <Badge variant="outline" className="text-xs">
-              {isMinerU ? "MinerU Document Parsing" : protocolLabel(provider.protocol)}
+            <Badge variant={protocolAvailable ? "outline" : "destructive"} className="text-xs">
+              {isMinerU ? "MinerU Document Parsing" : protocolDisplayName}
             </Badge>
-            {isGemini && (
-              <HelpTooltip contentClassName="max-w-96">{GEMINI_KEY_TYPE_HELP_TEXT}</HelpTooltip>
+            {protocolDescriptor?.helpText && (
+              <HelpTooltip contentClassName="max-w-96">{protocolDescriptor.helpText}</HelpTooltip>
             )}
           </div>
         </div>
         <Switch
           className="self-center"
           checked={provider.enabled}
+          disabled={!protocolAvailable}
           onCheckedChange={(checked) => onEnabledChange(provider, checked)}
         />
       </div>
 
       <ScrollArea className="min-h-0 flex-1">
         <div className="grid gap-3 p-3">
+          {!protocolAvailable && (
+            <div className="rounded-[6px] border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+              此提供商引用了当前版本无法识别的协议。修复协议前不会发送任何网络请求；您仍可在“编辑提供商”中改选已注册协议，或删除这条记录。
+            </div>
+          )}
           <section className="grid min-w-0 gap-2 rounded-[6px] border p-3">
             {isMinerU ? (
               <>
@@ -261,11 +278,11 @@ export function ProviderDetailsPanel({
                       }
                     />
                   </div>
-                  <Button className="min-w-0" variant="outline" size="control-sm" onClick={onOpenCredential}>
+                  <Button disabled={!protocolAvailable} className="min-w-0" variant="outline" size="control-sm" onClick={onOpenCredential}>
                     <KeyRound className="size-3.5" />
                     管理 API Key
                   </Button>
-                  <Button className="min-w-0" variant="outline" size="control-sm" onClick={onOpenHeaders}>
+                  <Button disabled={!protocolAvailable} className="min-w-0" variant="outline" size="control-sm" onClick={onOpenHeaders}>
                     <Braces className="size-3.5" />
                     自定义请求头
                   </Button>
@@ -298,19 +315,48 @@ export function ProviderDetailsPanel({
                     }}
                   />
                   <div className="break-all px-1 text-2xs text-muted-foreground/70">
-                    {baseUrlPreview(draft.baseUrl, provider.protocol, draft.useRawBaseUrl)}
+                    {!protocolAvailable
+                      ? "未知协议无法生成请求路径预览"
+                      : endpointPreviewError
+                        ? `无法预览：${endpointPreviewError}`
+                        : endpointPreview
+                          ? `聊天：${endpointPreview.chat}`
+                          : "正在生成请求路径预览…"}
+                    {endpointPreview?.models && (
+                      <div>模型：{endpointPreview.models}</div>
+                    )}
                   </div>
                 </div>
+                <ProtocolConfigFields
+                  fields={protocolDescriptor?.configFields ?? []}
+                  config={draft.config}
+                  onChange={(config) => onDraftChange({ ...draft, config })}
+                />
                 <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-end gap-2 max-[820px]:grid-cols-1">
-                  <div className="grid gap-1">
-                    <Label className="text-sm">API Key</Label>
-                    <Input disabled value={provider.credentialMask ? "•••••••••••••••••••••••••••••••••" : "尚未配置 API Key"} />
-                  </div>
-                  <Button className="min-w-0" variant="outline" size="control-sm" onClick={onOpenCredential}>
-                    <KeyRound className="size-3.5" />
-                    设置 API Key
-                  </Button>
-                  <Button className="min-w-0" variant="outline" size="control-sm" onClick={onOpenHeaders}>
+                  {requiresCredential ? (
+                    <div className="grid gap-1">
+                      <div className="flex items-center gap-1.5">
+                        <Label className="text-sm">{protocolDescriptor?.auth.label ?? "API Key"}</Label>
+                        {protocolDescriptor?.auth.helpText && (
+                          <HelpTooltip contentClassName="max-w-96">
+                            {protocolDescriptor.auth.helpText}
+                          </HelpTooltip>
+                        )}
+                      </div>
+                      <Input disabled value={provider.credentialMask ? "•••••••••••••••••••••••••••••••••" : `尚未配置${protocolDescriptor?.auth.label ?? " API Key"}`} />
+                    </div>
+                  ) : (
+                    <div className="flex min-h-9 items-center text-sm text-muted-foreground">
+                      {protocolDescriptor?.auth.label ?? "此协议无需凭证"}
+                    </div>
+                  )}
+                  {requiresCredential && (
+                    <Button disabled={!protocolAvailable} className="min-w-0" variant="outline" size="control-sm" onClick={onOpenCredential}>
+                      <KeyRound className="size-3.5" />
+                      设置 API Key
+                    </Button>
+                  )}
+                  <Button disabled={!protocolAvailable} className="min-w-0" variant="outline" size="control-sm" onClick={onOpenHeaders}>
                     <Braces className="size-3.5" />
                     自定义请求头
                   </Button>
@@ -322,6 +368,8 @@ export function ProviderDetailsPanel({
           <ProviderModelList
             models={provider.models}
             testingModelId={testingModelId}
+            disabled={!protocolAvailable}
+            supportsModelListing={protocolDescriptor?.supportsModelListing ?? false}
             onOpenRemoteModels={onOpenRemoteModels}
             onAddModel={onAddModel}
             onTestModel={onTestModel}

@@ -26,6 +26,8 @@ import type { ModelView } from "./types";
 interface ProviderModelListProps {
   models: ModelView[];
   testingModelId: string;
+  disabled?: boolean;
+  supportsModelListing?: boolean;
   onOpenRemoteModels: () => void;
   onAddModel: () => void;
   onTestModel: (model: ModelView) => void;
@@ -63,6 +65,8 @@ function CapabilityPill({ icon: Icon, label, active }: CapabilityPillProps) {
 export function ProviderModelList({
   models,
   testingModelId,
+  disabled = false,
+  supportsModelListing = true,
   onOpenRemoteModels,
   onAddModel,
   onTestModel,
@@ -83,11 +87,16 @@ export function ProviderModelList({
           )}
         </div>
         <div className="flex shrink-0 gap-1">
-          <Button variant="outline" size="sm" onClick={onOpenRemoteModels}>
+          <Button
+            disabled={disabled || !supportsModelListing}
+            variant="outline"
+            size="sm"
+            onClick={onOpenRemoteModels}
+          >
             <CloudDownload className="size-3.5" />
             获取模型列表
           </Button>
-          <Button variant="outline" size="icon-sm" onClick={onAddModel}>
+          <Button disabled={disabled} variant="outline" size="icon-sm" onClick={onAddModel}>
             <Plus className="size-4" />
           </Button>
         </div>
@@ -143,7 +152,7 @@ export function ProviderModelList({
                     <Button
                       size="icon-sm"
                       variant="ghost"
-                      disabled={testingModelId === model.id}
+                      disabled={disabled || testingModelId === model.id}
                       title={isMinerU ? "测试 MinerU 连通性" : "测试连通性"}
                       onClick={() => onTestModel(model)}
                     >

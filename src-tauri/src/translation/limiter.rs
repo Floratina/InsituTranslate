@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::RateLimitTelemetry;
+use crate::providers::RateLimitTelemetry;
 
 fn rate_limit_status(telemetry: &RateLimitTelemetry, window: usize) -> Option<String> {
     if telemetry.has_quota_headers() {

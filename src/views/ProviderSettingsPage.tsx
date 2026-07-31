@@ -73,6 +73,7 @@ import type {
   NewModelForm,
   ProviderDraft,
   ProviderForm,
+  ProtocolDescriptor,
   ProviderProtocol,
   ProviderPurpose,
   ProviderView,
@@ -124,16 +125,11 @@ function getErrorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-function protocolLabel(protocol: ProviderProtocol): string {
-  const labels: Record<ProviderProtocol, string> = {
-    "openai-chat": "OpenAI Chat Completions",
-    "openai-responses": "OpenAI Responses",
-    anthropic: "Anthropic Messages",
-    gemini: "Gemini API",
-    "vertex-ai": "Agent Platform (Vertex AI)",
-    ollama: "Ollama Chat",
-  };
-  return labels[protocol];
+function protocolLabel(
+  protocol: ProviderProtocol,
+  descriptors: ProtocolDescriptor[],
+): string {
+  return descriptors.find((descriptor) => descriptor.id === protocol)?.displayName ?? protocol;
 }
 
 function purposeLabel(purpose: ProviderPurpose): string {
@@ -365,6 +361,7 @@ function ProviderSettingsPage() {
     appSessionCache.providerSelectedIds.get("translation") ?? "";
   const [purpose, setPurpose] = useState<ProviderPurpose>("translation");
   const [providers, setProviders] = useState<ProviderView[] | null>(cachedProviders ?? null);
+  const [protocolDescriptors, setProtocolDescriptors] = useState<ProtocolDescriptor[]>([]);
   const [selectedProviderId, setSelectedProviderId] = useState<string>(
     cachedProviders?.some((provider) => provider.id === cachedSelectedProviderId)
       ? cachedSelectedProviderId
@@ -439,6 +436,16 @@ function ProviderSettingsPage() {
     () => visibleProviders.find((provider) => provider.id === selectedProviderId) ?? null,
     [selectedProviderId, visibleProviders],
   );
+  const editingProvider = useMemo(
+    () => visibleProviders.find((provider) => provider.id === editingProviderId) ?? null,
+    [editingProviderId, visibleProviders],
+  );
+  const selectedProtocolDescriptor = useMemo(
+    () => protocolDescriptors.find(
+      (descriptor) => descriptor.id === selectedProvider?.protocol,
+    ) ?? null,
+    [protocolDescriptors, selectedProvider?.protocol],
+  );
   const selectedProviderIsMinerU = useMemo(
     () => isMinerUProvider(selectedProvider),
     [selectedProvider],
@@ -463,6 +470,21 @@ function ProviderSettingsPage() {
   useEffect(() => {
     void refreshProviders();
   }, [purpose]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let active = true;
+    void invoke<ProtocolDescriptor[]>("list_protocol_descriptors")
+      .then((descriptors) => {
+        if (active) setProtocolDescriptors(descriptors);
+      })
+      .catch((cause: unknown) => {
+        if (active) setError(getErrorMessage(cause));
+      });
+    return () => {
+      active = false;
+    };
+  }, [setError]);
 
   useEffect(() => {
     if (!selectedProvider) {
@@ -744,7 +766,10 @@ function ProviderSettingsPage() {
 
   function openAddProvider(): void {
     setEditingProviderId(null);
-    setProviderForm(EMPTY_PROVIDER_FORM);
+    setProviderForm({
+      ...EMPTY_PROVIDER_FORM,
+      protocol: protocolDescriptors[0]?.id ?? "",
+    });
     setAddProviderOpen(true);
   }
 
@@ -752,7 +777,9 @@ function ProviderSettingsPage() {
     setEditingProviderId(provider.id);
     setProviderForm({
       name: provider.name,
-      protocol: provider.protocol,
+      protocol: provider.protocolStatus === "available"
+        ? provider.protocol
+        : (protocolDescriptors[0]?.id ?? EMPTY_PROVIDER_FORM.protocol),
       avatar: provider.avatar,
     });
     setAddProviderOpen(true);
@@ -1092,6 +1119,10 @@ function ProviderSettingsPage() {
               <ProviderDetailsPanel
                 provider={selectedProvider}
                 draft={providerDraft}
+                protocolDisplayName={selectedProvider?.protocolStatus === "unknown"
+                  ? `未知或已废弃协议：${selectedProvider.protocolRawId ?? "unknown"}`
+                  : protocolLabel(selectedProvider?.protocol ?? "unknown", protocolDescriptors)}
+                protocolDescriptor={selectedProtocolDescriptor}
                 testingModelId={testingModelId}
                 onDraftChange={setProviderDraft}
                 onEnabledChange={setEnabledOptimistically}
@@ -1116,7 +1147,9 @@ function ProviderSettingsPage() {
           <DialogHeader>
             <DialogTitle>{editingProviderId ? "编辑提供商" : "添加提供商"}</DialogTitle>
             <DialogDescription>
-              {editingProviderId
+              {editingProvider?.protocolStatus === "unknown"
+                ? `原协议“${editingProvider.protocolRawId ?? "unknown"}”已不可用。请选择一个已注册协议完成修复。`
+                : editingProviderId
                 ? "修改提供商名称、头像与协议。"
                 : "添加自定义提供商。新增后可在右侧配置 Base URL 与 API Key。"}
             </DialogDescription>
@@ -1148,7 +1181,7 @@ function ProviderSettingsPage() {
                 onValueChange={(value) =>
                   setProviderForm({
                     ...providerForm,
-                    protocol: value as ProviderProtocol,
+                    protocol: value,
                   })
                 }
               >
@@ -1156,18 +1189,9 @@ function ProviderSettingsPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(
-                    [
-                      "openai-chat",
-                      "openai-responses",
-                      "anthropic",
-                      "gemini",
-                      "vertex-ai",
-                      "ollama",
-                    ] as ProviderProtocol[]
-                  ).map((protocol) => (
-                    <SelectItem key={protocol} value={protocol}>
-                      {protocolLabel(protocol)}
+                  {protocolDescriptors.map((descriptor) => (
+                    <SelectItem key={descriptor.id} value={descriptor.id}>
+                      {descriptor.displayName}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -1176,7 +1200,13 @@ function ProviderSettingsPage() {
           </div>
           <DialogFooter>
             <Button
-              disabled={busy || !providerForm.name.trim()}
+              disabled={
+                busy
+                || !providerForm.name.trim()
+                || !protocolDescriptors.some(
+                  (descriptor) => descriptor.id === providerForm.protocol,
+                )
+              }
               onClick={() => void saveProviderMetadata()}
             >
               {editingProviderId ? "保存修改" : "添加提供商"}

@@ -1,40 +1,49 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct ProtocolId(String);
+
+impl ProtocolId {
+    pub const UNKNOWN_VALUE: &'static str = "unknown";
+
+    pub fn registered(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn unknown() -> Self {
+        Self(Self::UNKNOWN_VALUE.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.0 == Self::UNKNOWN_VALUE
+    }
+}
+
+impl<'de> Deserialize<'de> for ProtocolId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        if crate::providers::registry::descriptor_by_id(&raw).is_some() {
+            Ok(Self::registered(raw))
+        } else {
+            Ok(Self::unknown())
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum ProviderProtocol {
-    OpenaiChat,
-    OpenaiResponses,
-    Anthropic,
-    Gemini,
-    VertexAi,
-    Ollama,
-}
-
-impl ProviderProtocol {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenaiChat => "openai-chat",
-            Self::OpenaiResponses => "openai-responses",
-            Self::Anthropic => "anthropic",
-            Self::Gemini => "gemini",
-            Self::VertexAi => "vertex-ai",
-            Self::Ollama => "ollama",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "openai-chat" => Ok(Self::OpenaiChat),
-            "openai-responses" => Ok(Self::OpenaiResponses),
-            "anthropic" => Ok(Self::Anthropic),
-            "gemini" => Ok(Self::Gemini),
-            "vertex-ai" => Ok(Self::VertexAi),
-            "ollama" => Ok(Self::Ollama),
-            _ => Err(format!("Unsupported provider protocol: {value}")),
-        }
-    }
+pub enum ProtocolStatus {
+    Available,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,7 +168,9 @@ pub struct CopyAssistantInput {
 pub struct ProviderView {
     pub id: String,
     pub name: String,
-    pub protocol: ProviderProtocol,
+    pub protocol: ProtocolId,
+    pub protocol_status: ProtocolStatus,
+    pub protocol_raw_id: Option<String>,
     pub base_url: String,
     pub use_raw_base_url: bool,
     pub config: Value,
@@ -193,7 +204,7 @@ pub struct ModelView {
 #[serde(rename_all = "camelCase")]
 pub struct CreateProviderInput {
     pub name: String,
-    pub protocol: ProviderProtocol,
+    pub protocol: ProtocolId,
     pub purpose: ProviderPurpose,
     pub avatar: Option<String>,
 }
@@ -206,6 +217,16 @@ pub struct UpdateProviderConfigInput {
     pub use_raw_base_url: bool,
     #[serde(default)]
     pub config: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewProtocolEndpointsInput {
+    pub protocol: ProtocolId,
+    pub base_url: String,
+    pub use_raw_base_url: bool,
+    #[serde(default)]
+    pub config: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,7 +254,7 @@ pub struct ImportVertexAiServiceAccountInput {
 pub struct UpdateProviderMetadataInput {
     pub id: String,
     pub name: String,
-    pub protocol: ProviderProtocol,
+    pub protocol: ProtocolId,
     pub avatar: Option<String>,
 }
 
@@ -417,12 +438,28 @@ pub struct UnifiedChatResponse {
 
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeConfig {
-    pub protocol: ProviderProtocol,
+    pub protocol: ProtocolId,
     pub base_url: String,
     pub use_raw_base_url: bool,
     pub config: Value,
-    pub auth_type: String,
-    pub auth_header: String,
     pub credential: Option<String>,
     pub custom_headers: Vec<(String, String)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_id_deserialization_degrades_unknown_strings() {
+        let known: ProtocolId = serde_json::from_str("\"openai-chat\"").expect("known id");
+        assert_eq!(known.as_str(), "openai-chat");
+
+        let unknown: ProtocolId =
+            serde_json::from_str("\"retired-chat-v0\"").expect("unknown string");
+        assert!(unknown.is_unknown());
+        let blank: ProtocolId = serde_json::from_str("\"   \"").expect("blank string");
+        assert!(blank.is_unknown());
+        assert!(serde_json::from_str::<ProtocolId>("42").is_err());
+    }
 }

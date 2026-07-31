@@ -1,7 +1,7 @@
 use regex::Regex;
 use url::Url;
 
-use crate::domain::{ProviderProtocol, ThinkingEffort};
+use crate::domain::ThinkingEffort;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InferredModelCapabilities {
@@ -101,27 +101,78 @@ fn gemini_google_search_model(model_id: &str) -> bool {
     model_name_starts(model_id, &["gemini-2.0", "gemini-2.5", "gemini-3"])
 }
 
-fn reasoning_model(protocol: ProviderProtocol, base_url: &str, model_id: &str) -> bool {
-    match protocol {
-        ProviderProtocol::OpenaiResponses => model_name_starts(
+fn thinking_efforts(
+    capability_reasoning: bool,
+    family: ThinkingEffortFamily,
+) -> Vec<ThinkingEffort> {
+    if !capability_reasoning {
+        return vec![ThinkingEffort::None];
+    }
+    match family {
+        ThinkingEffortFamily::Budget => vec![
+            ThinkingEffort::None,
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+        ],
+        ThinkingEffortFamily::Level => vec![
+            ThinkingEffort::None,
+            ThinkingEffort::Minimal,
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+        ],
+        ThinkingEffortFamily::OpenAi => vec![
+            ThinkingEffort::None,
+            ThinkingEffort::Minimal,
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+            ThinkingEffort::Xhigh,
+        ],
+        ThinkingEffortFamily::DeepSeek => vec![
+            ThinkingEffort::None,
+            ThinkingEffort::High,
+            ThinkingEffort::Max,
+        ],
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ThinkingEffortFamily {
+    Budget,
+    Level,
+    OpenAi,
+    DeepSeek,
+}
+
+pub fn openai_chat_capabilities(base_url: &str, model_id: &str) -> InferredModelCapabilities {
+    InferredModelCapabilities {
+        reasoning: model_name_starts(
+            model_id,
+            &["gpt-5", "o1", "o3", "o4", "codex-mini", "gpt-oss"],
+        ) || is_feature_supported(FeatureId::OpenAiReasoningObject, base_url, model_id)
+            || is_feature_supported(FeatureId::OpenAiThinkingObject, base_url, model_id)
+            || is_feature_supported(FeatureId::OpenAiReasoningEffort, base_url, model_id)
+            || is_feature_supported(FeatureId::OpenAiDeepSeekReasoningEffort, base_url, model_id)
+            || is_feature_supported(FeatureId::OpenAiEnableThinking, base_url, model_id),
+        web: is_openai_chat_search_model(model_id),
+    }
+}
+
+pub fn openai_responses_capabilities(model_id: &str) -> InferredModelCapabilities {
+    InferredModelCapabilities {
+        reasoning: model_name_starts(
             model_id,
             &["gpt-5", "o1", "o3", "o4", "codex-mini", "gpt-oss"],
         ),
-        ProviderProtocol::OpenaiChat => {
-            model_name_starts(
-                model_id,
-                &["gpt-5", "o1", "o3", "o4", "codex-mini", "gpt-oss"],
-            ) || is_feature_supported(FeatureId::OpenAiReasoningObject, base_url, model_id)
-                || is_feature_supported(FeatureId::OpenAiThinkingObject, base_url, model_id)
-                || is_feature_supported(FeatureId::OpenAiReasoningEffort, base_url, model_id)
-                || is_feature_supported(
-                    FeatureId::OpenAiDeepSeekReasoningEffort,
-                    base_url,
-                    model_id,
-                )
-                || is_feature_supported(FeatureId::OpenAiEnableThinking, base_url, model_id)
-        }
-        ProviderProtocol::Anthropic => model_name_starts(
+        web: true,
+    }
+}
+
+pub fn anthropic_capabilities(base_url: &str, model_id: &str) -> InferredModelCapabilities {
+    InferredModelCapabilities {
+        reasoning: model_name_starts(
             model_id,
             &[
                 "claude-opus-4",
@@ -130,103 +181,61 @@ fn reasoning_model(protocol: ProviderProtocol, base_url: &str, model_id: &str) -
                 "claude-3-7-sonnet",
             ],
         ),
-        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
-            model_name_starts(model_id, &["gemini-2.5", "gemini-3", "gemma-4"])
-        }
-        ProviderProtocol::Ollama => {
-            model_contains(model_id, &["deepseek-r1", "qwen3", "gpt-oss", "magistral"])
-        }
+        web: is_feature_supported(FeatureId::AnthropicWebSearch, base_url, model_id),
     }
 }
 
-pub fn native_web_search_supported(
-    protocol: ProviderProtocol,
-    base_url: &str,
-    model_id: &str,
-) -> bool {
-    match protocol {
-        ProviderProtocol::OpenaiResponses => true,
-        ProviderProtocol::OpenaiChat => is_openai_chat_search_model(model_id),
-        ProviderProtocol::Anthropic => {
-            is_feature_supported(FeatureId::AnthropicWebSearch, base_url, model_id)
-        }
-        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
-            gemini_google_search_model(model_id)
-        }
-        ProviderProtocol::Ollama => false,
-    }
-}
-
-pub fn infer_model_capabilities(
-    protocol: ProviderProtocol,
-    base_url: &str,
-    model_id: &str,
-) -> InferredModelCapabilities {
+pub fn gemini_capabilities(model_id: &str) -> InferredModelCapabilities {
     InferredModelCapabilities {
-        reasoning: reasoning_model(protocol, base_url, model_id),
-        web: native_web_search_supported(protocol, base_url, model_id),
+        reasoning: model_name_starts(model_id, &["gemini-2.5", "gemini-3", "gemma-4"]),
+        web: gemini_google_search_model(model_id),
     }
 }
 
-pub fn supported_thinking_efforts(
-    protocol: ProviderProtocol,
+pub fn ollama_capabilities(model_id: &str) -> InferredModelCapabilities {
+    InferredModelCapabilities {
+        reasoning: model_contains(model_id, &["deepseek-r1", "qwen3", "gpt-oss", "magistral"]),
+        web: false,
+    }
+}
+
+pub fn openai_chat_thinking_efforts(
     base_url: &str,
     model_id: &str,
-    capability_reasoning: bool,
+    reasoning: bool,
 ) -> Vec<ThinkingEffort> {
-    if !capability_reasoning {
-        return vec![ThinkingEffort::None];
-    }
+    let family =
+        if is_feature_supported(FeatureId::OpenAiDeepSeekReasoningEffort, base_url, model_id) {
+            ThinkingEffortFamily::DeepSeek
+        } else if is_feature_supported(FeatureId::OpenAiEnableThinking, base_url, model_id) {
+            ThinkingEffortFamily::Budget
+        } else if is_feature_supported(FeatureId::OpenAiReasoningEffort, base_url, model_id) {
+            ThinkingEffortFamily::Level
+        } else {
+            ThinkingEffortFamily::OpenAi
+        };
+    thinking_efforts(reasoning, family)
+}
 
-    let budget_efforts = vec![
-        ThinkingEffort::None,
-        ThinkingEffort::Low,
-        ThinkingEffort::Medium,
-        ThinkingEffort::High,
-    ];
-    let level_efforts = vec![
-        ThinkingEffort::None,
-        ThinkingEffort::Minimal,
-        ThinkingEffort::Low,
-        ThinkingEffort::Medium,
-        ThinkingEffort::High,
-    ];
-    let openai_efforts = vec![
-        ThinkingEffort::None,
-        ThinkingEffort::Minimal,
-        ThinkingEffort::Low,
-        ThinkingEffort::Medium,
-        ThinkingEffort::High,
-        ThinkingEffort::Xhigh,
-    ];
+pub fn openai_responses_thinking_efforts(reasoning: bool) -> Vec<ThinkingEffort> {
+    thinking_efforts(reasoning, ThinkingEffortFamily::OpenAi)
+}
 
-    match protocol {
-        ProviderProtocol::OpenaiResponses => openai_efforts,
-        ProviderProtocol::OpenaiChat => {
-            if is_feature_supported(FeatureId::OpenAiDeepSeekReasoningEffort, base_url, model_id) {
-                vec![
-                    ThinkingEffort::None,
-                    ThinkingEffort::High,
-                    ThinkingEffort::Max,
-                ]
-            } else if is_feature_supported(FeatureId::OpenAiEnableThinking, base_url, model_id) {
-                budget_efforts
-            } else if is_feature_supported(FeatureId::OpenAiReasoningEffort, base_url, model_id) {
-                level_efforts
-            } else {
-                openai_efforts
-            }
-        }
-        ProviderProtocol::Anthropic => budget_efforts,
-        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
-            if is_feature_supported(FeatureId::GeminiThinkingLevel, base_url, model_id) {
-                level_efforts
-            } else {
-                budget_efforts
-            }
-        }
-        ProviderProtocol::Ollama => budget_efforts,
-    }
+pub fn budget_thinking_efforts(reasoning: bool) -> Vec<ThinkingEffort> {
+    thinking_efforts(reasoning, ThinkingEffortFamily::Budget)
+}
+
+pub fn gemini_thinking_efforts(
+    base_url: &str,
+    model_id: &str,
+    reasoning: bool,
+) -> Vec<ThinkingEffort> {
+    let family = if is_feature_supported(FeatureId::GeminiThinkingLevel, base_url, model_id) {
+        ThinkingEffortFamily::Level
+    } else {
+        ThinkingEffortFamily::Budget
+    };
+    thinking_efforts(reasoning, family)
 }
 
 pub fn is_feature_supported(feature: FeatureId, base_url: &str, model_id: &str) -> bool {
@@ -464,144 +473,5 @@ pub fn is_feature_supported(feature: FeatureId, base_url: &str, model_id: &str) 
             let re = Regex::new(r"^claude-(opus|sonnet)-4").expect("static regex");
             re.is_match(&model_id.to_lowercase())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detects_openai_compatible_variants() {
-        assert!(is_feature_supported(
-            FeatureId::OpenAiThinkingBudget,
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "qwen3-32b"
-        ));
-        assert!(is_feature_supported(
-            FeatureId::OpenAiDeepSeekReasoningEffort,
-            "https://example.test/v1",
-            "deepseek-v4"
-        ));
-        assert!(!is_feature_supported(
-            FeatureId::OpenAiThinkingStrategy,
-            "https://api.openai.com/v1",
-            "gpt-4.1"
-        ));
-    }
-
-    #[test]
-    fn infers_native_web_search_capabilities() {
-        assert!(native_web_search_supported(
-            ProviderProtocol::OpenaiResponses,
-            "https://api.openai.com",
-            "gpt-5"
-        ));
-        assert!(native_web_search_supported(
-            ProviderProtocol::OpenaiChat,
-            "https://api.openai.com",
-            "gpt-5-search-api"
-        ));
-        assert!(!native_web_search_supported(
-            ProviderProtocol::OpenaiChat,
-            "https://api.openai.com",
-            "gpt-5"
-        ));
-        assert!(native_web_search_supported(
-            ProviderProtocol::Gemini,
-            "https://generativelanguage.googleapis.com",
-            "models/gemini-2.5-pro"
-        ));
-        assert!(native_web_search_supported(
-            ProviderProtocol::VertexAi,
-            "https://aiplatform.googleapis.com",
-            "publishers/google/models/gemini-2.0-flash"
-        ));
-        assert!(!native_web_search_supported(
-            ProviderProtocol::Ollama,
-            "http://localhost:11434/api",
-            "qwen3"
-        ));
-    }
-
-    #[test]
-    fn infers_reasoning_and_web_for_known_models() {
-        let openai = infer_model_capabilities(
-            ProviderProtocol::OpenaiResponses,
-            "https://api.openai.com",
-            "gpt-5",
-        );
-        assert!(openai.reasoning);
-        assert!(openai.web);
-
-        let qwen = infer_model_capabilities(
-            ProviderProtocol::OpenaiChat,
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "qwen3-235b-a22b",
-        );
-        assert!(qwen.reasoning);
-        assert!(!qwen.web);
-    }
-
-    #[test]
-    fn derives_supported_thinking_efforts_by_protocol_and_model() {
-        assert_eq!(
-            supported_thinking_efforts(
-                ProviderProtocol::OpenaiChat,
-                "https://api.deepseek.com",
-                "deepseek-v4",
-                true,
-            ),
-            vec![
-                ThinkingEffort::None,
-                ThinkingEffort::High,
-                ThinkingEffort::Max
-            ]
-        );
-        assert_eq!(
-            supported_thinking_efforts(
-                ProviderProtocol::Gemini,
-                "https://generativelanguage.googleapis.com",
-                "gemini-3-pro",
-                true,
-            ),
-            vec![
-                ThinkingEffort::None,
-                ThinkingEffort::Minimal,
-                ThinkingEffort::Low,
-                ThinkingEffort::Medium,
-                ThinkingEffort::High
-            ]
-        );
-        assert_eq!(
-            supported_thinking_efforts(
-                ProviderProtocol::Gemini,
-                "https://generativelanguage.googleapis.com",
-                "gemini-2.5-pro",
-                true,
-            ),
-            vec![
-                ThinkingEffort::None,
-                ThinkingEffort::Low,
-                ThinkingEffort::Medium,
-                ThinkingEffort::High
-            ]
-        );
-        assert_eq!(
-            supported_thinking_efforts(
-                ProviderProtocol::OpenaiResponses,
-                "https://api.openai.com",
-                "gpt-5",
-                true,
-            ),
-            vec![
-                ThinkingEffort::None,
-                ThinkingEffort::Minimal,
-                ThinkingEffort::Low,
-                ThinkingEffort::Medium,
-                ThinkingEffort::High,
-                ThinkingEffort::Xhigh
-            ]
-        );
     }
 }

@@ -4,13 +4,50 @@ export type ProviderPurpose =
   | "proofreading"
   | "document-parsing";
 
-export type ProviderProtocol =
-  | "openai-chat"
-  | "openai-responses"
-  | "anthropic"
-  | "gemini"
-  | "vertex-ai"
-  | "ollama";
+export type ProviderProtocol = string;
+
+export type ProtocolStatus = "available" | "unknown";
+
+export interface ProtocolDescriptor {
+  id: ProviderProtocol;
+  displayName: string;
+  defaultBaseUrl: string;
+  wireFamily: string;
+  configKind: "generic" | "vertex-ai" | string;
+  supportsModelListing: boolean;
+  auth: ProtocolAuthDescriptor;
+  configFields: ProtocolConfigField[];
+  helpText: string | null;
+}
+
+export interface ProtocolAuthDescriptor {
+  kind: string;
+  label: string;
+  header: string;
+  helpText: string | null;
+}
+
+export type ProtocolConfigFieldKind = "text" | "number" | "boolean" | "select";
+
+export interface ProtocolConfigOption {
+  value: string;
+  label: string;
+}
+
+export interface ProtocolConfigField {
+  pointer: string;
+  label: string;
+  kind: ProtocolConfigFieldKind;
+  required: boolean;
+  defaultValue: unknown;
+  options: ProtocolConfigOption[];
+  helpText: string | null;
+}
+
+export interface ProtocolEndpointPreview {
+  chat: string;
+  models: string | null;
+}
 
 export type MinerUMode = "standard" | "flash";
 
@@ -52,6 +89,8 @@ export interface ProviderView {
   id: string;
   name: string;
   protocol: ProviderProtocol;
+  protocolStatus: ProtocolStatus;
+  protocolRawId: string | null;
   baseUrl: string;
   useRawBaseUrl: boolean;
   config: ProviderConfig;

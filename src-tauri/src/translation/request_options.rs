@@ -1,10 +1,7 @@
 use serde_json::Value;
 
-use crate::domain::{
-    ModelView, ProviderProtocol, ProviderRuntimeConfig, ThinkingConfig, ThinkingEffort,
-    ThinkingMode,
-};
-use crate::features::{is_feature_supported, native_web_search_supported, FeatureId};
+use crate::domain::{ModelView, ProviderRuntimeConfig, ThinkingConfig, ThinkingEffort};
+use crate::providers::descriptor_for;
 
 use super::TranslationConfigView;
 
@@ -84,7 +81,12 @@ fn resolve_model_web_search(
             model.alias_or_request_name()
         ));
     }
-    if !native_web_search_supported(runtime.protocol, &runtime.base_url, &model.request_name) {
+    let descriptor = descriptor_for(&runtime.protocol)?;
+    if !descriptor
+        .codec
+        .infer_capabilities(&runtime.base_url, &model.request_name)
+        .web
+    {
         return Err(format!(
             "Web search is not supported for provider protocol {} and model \"{}\".",
             runtime.protocol.as_str(),
@@ -117,94 +119,12 @@ fn resolve_model_thinking(
         ));
     }
 
-    let base_url = runtime.base_url.as_str();
-    let model_id = model.request_name.as_str();
-    let mut thinking = ThinkingConfig {
-        mode: ThinkingMode::Enabled,
-        budget_tokens: None,
-        effort: Some(effort),
-        summary: None,
-    };
-
-    match runtime.protocol {
-        ProviderProtocol::OpenaiResponses => {
-            thinking.effort = Some(openai_reasoning_effort(effort));
-        }
-        ProviderProtocol::OpenaiChat => {
-            if is_feature_supported(FeatureId::OpenAiDeepSeekReasoningEffort, base_url, model_id) {
-                thinking.effort = Some(deepseek_reasoning_effort(effort));
-            } else if is_feature_supported(FeatureId::OpenAiEnableThinking, base_url, model_id) {
-                thinking.effort = Some(openai_reasoning_effort(effort));
-                if is_feature_supported(FeatureId::OpenAiThinkingBudget, base_url, model_id) {
-                    thinking.budget_tokens = Some(budget_tokens_for_effort(effort));
-                }
-            } else if is_feature_supported(FeatureId::OpenAiReasoningEffort, base_url, model_id) {
-                thinking.effort = Some(volc_reasoning_effort(effort));
-            } else {
-                thinking.effort = Some(openai_reasoning_effort(effort));
-            }
-        }
-        ProviderProtocol::Anthropic => {
-            thinking.budget_tokens = Some(budget_tokens_for_effort(effort));
-        }
-        ProviderProtocol::Gemini | ProviderProtocol::VertexAi => {
-            if is_feature_supported(FeatureId::GeminiThinkingLevel, base_url, model_id) {
-                thinking.effort = Some(gemini_thinking_level_effort(effort));
-            } else {
-                thinking.budget_tokens = Some(budget_tokens_for_effort(effort));
-            }
-        }
-        ProviderProtocol::Ollama => {
-            thinking.effort = Some(ollama_thinking_effort(effort));
-        }
-    }
-
-    Ok(Some(thinking))
-}
-
-fn openai_reasoning_effort(effort: ThinkingEffort) -> ThinkingEffort {
-    match effort {
-        ThinkingEffort::Max => ThinkingEffort::Xhigh,
-        other => other,
-    }
-}
-
-fn volc_reasoning_effort(effort: ThinkingEffort) -> ThinkingEffort {
-    match effort {
-        ThinkingEffort::Xhigh | ThinkingEffort::Max => ThinkingEffort::High,
-        other => other,
-    }
-}
-
-fn deepseek_reasoning_effort(effort: ThinkingEffort) -> ThinkingEffort {
-    match effort {
-        ThinkingEffort::Xhigh | ThinkingEffort::Max => ThinkingEffort::Max,
-        _ => ThinkingEffort::High,
-    }
-}
-
-fn gemini_thinking_level_effort(effort: ThinkingEffort) -> ThinkingEffort {
-    match effort {
-        ThinkingEffort::Xhigh | ThinkingEffort::Max => ThinkingEffort::High,
-        other => other,
-    }
-}
-
-fn ollama_thinking_effort(effort: ThinkingEffort) -> ThinkingEffort {
-    match effort {
-        ThinkingEffort::Minimal => ThinkingEffort::Low,
-        ThinkingEffort::Xhigh | ThinkingEffort::Max => ThinkingEffort::High,
-        other => other,
-    }
-}
-
-fn budget_tokens_for_effort(effort: ThinkingEffort) -> u32 {
-    match effort {
-        ThinkingEffort::None => 0,
-        ThinkingEffort::Minimal | ThinkingEffort::Low => 1024,
-        ThinkingEffort::Medium => 16_000,
-        ThinkingEffort::High | ThinkingEffort::Xhigh | ThinkingEffort::Max => 32_000,
-    }
+    let descriptor = descriptor_for(&runtime.protocol)?;
+    Ok(Some(descriptor.codec.resolve_thinking(
+        &runtime.base_url,
+        &model.request_name,
+        effort,
+    )))
 }
 
 trait ModelLabel {
@@ -224,16 +144,15 @@ impl ModelLabel for ModelView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ProtocolId;
     use serde_json::json;
 
-    fn runtime(protocol: ProviderProtocol, base_url: &str) -> ProviderRuntimeConfig {
+    fn runtime(protocol: &str, base_url: &str) -> ProviderRuntimeConfig {
         ProviderRuntimeConfig {
-            protocol,
+            protocol: ProtocolId::registered(protocol),
             base_url: base_url.into(),
             use_raw_base_url: false,
             config: json!({}),
-            auth_type: "none".into(),
-            auth_header: "Authorization".into(),
             credential: None,
             custom_headers: Vec::new(),
         }
@@ -288,7 +207,7 @@ mod tests {
     fn none_thinking_sends_no_thinking_config() {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::None),
-            &runtime(ProviderProtocol::OpenaiResponses, "https://api.openai.com"),
+            &runtime("openai-responses", "https://api.openai.com"),
             &model("gpt-5", false),
             json!({}),
         )
@@ -301,7 +220,7 @@ mod tests {
     fn reasoning_requires_model_capability() {
         let error = resolve_translation_request_options(
             &config(ThinkingEffort::Low),
-            &runtime(ProviderProtocol::OpenaiResponses, "https://api.openai.com"),
+            &runtime("openai-responses", "https://api.openai.com"),
             &model("gpt-5", false),
             json!({}),
         )
@@ -320,7 +239,7 @@ mod tests {
         ];
         let error = resolve_translation_request_options(
             &config(ThinkingEffort::Low),
-            &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
+            &runtime("openai-chat", "https://api.deepseek.com"),
             &model,
             json!({}),
         )
@@ -333,7 +252,7 @@ mod tests {
     fn empty_supported_effort_list_keeps_legacy_mapping_compatibility() {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::Low),
-            &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
+            &runtime("openai-chat", "https://api.deepseek.com"),
             &model("deepseek-v4", true),
             json!({}),
         )
@@ -349,7 +268,7 @@ mod tests {
     fn routes_deepseek_effort_to_high_or_max() {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::Low),
-            &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
+            &runtime("openai-chat", "https://api.deepseek.com"),
             &model("deepseek-v4", true),
             json!({}),
         )
@@ -361,7 +280,7 @@ mod tests {
 
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::Xhigh),
-            &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
+            &runtime("openai-chat", "https://api.deepseek.com"),
             &model("deepseek-v4", true),
             json!({}),
         )
@@ -376,10 +295,7 @@ mod tests {
     fn routes_glm_effort_to_deepseek_style_levels() {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::High),
-            &runtime(
-                ProviderProtocol::OpenaiChat,
-                "https://open.bigmodel.cn/api/paas/v4",
-            ),
+            &runtime("openai-chat", "https://open.bigmodel.cn/api/paas/v4"),
             &model("glm-5.2", true),
             json!({}),
         )
@@ -392,10 +308,7 @@ mod tests {
 
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::Max),
-            &runtime(
-                ProviderProtocol::OpenaiChat,
-                "https://open.bigmodel.cn/api/paas/v4",
-            ),
+            &runtime("openai-chat", "https://open.bigmodel.cn/api/paas/v4"),
             &model("glm-5.2", true),
             json!({}),
         )
@@ -412,7 +325,7 @@ mod tests {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::Medium),
             &runtime(
-                ProviderProtocol::OpenaiChat,
+                "openai-chat",
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
             ),
             &model("qwen3-235b-a22b", true),
@@ -433,10 +346,7 @@ mod tests {
     fn custom_parameters_are_disabled_by_default() {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::None),
-            &runtime(
-                ProviderProtocol::Gemini,
-                "https://generativelanguage.googleapis.com",
-            ),
+            &runtime("gemini", "https://generativelanguage.googleapis.com"),
             &model("gemini-2.5-pro", false),
             json!({
                 "temperature": 0.2,
@@ -470,7 +380,7 @@ mod tests {
         });
         let options = resolve_translation_request_options(
             &config_with_custom_parameters(),
-            &runtime(ProviderProtocol::Anthropic, "https://api.anthropic.com"),
+            &runtime("anthropic", "https://api.anthropic.com"),
             &model("claude-sonnet-4", false),
             parameters.clone(),
         )
@@ -483,7 +393,7 @@ mod tests {
     fn custom_parameters_require_json_object_when_enabled() {
         let error = resolve_translation_request_options(
             &config_with_custom_parameters(),
-            &runtime(ProviderProtocol::Anthropic, "https://api.anthropic.com"),
+            &runtime("anthropic", "https://api.anthropic.com"),
             &model("claude-sonnet-4", false),
             json!(["not-object"]),
         )
@@ -496,7 +406,7 @@ mod tests {
     fn custom_parameters_disabled_ignores_invalid_shape() {
         let options = resolve_translation_request_options(
             &config(ThinkingEffort::None),
-            &runtime(ProviderProtocol::Anthropic, "https://api.anthropic.com"),
+            &runtime("anthropic", "https://api.anthropic.com"),
             &model("claude-sonnet-4", false),
             json!({
                 "temperature": 0.1,
@@ -512,7 +422,7 @@ mod tests {
     fn web_search_requires_model_capability() {
         let error = resolve_translation_request_options(
             &config_with_web_search(),
-            &runtime(ProviderProtocol::OpenaiResponses, "https://api.openai.com"),
+            &runtime("openai-responses", "https://api.openai.com"),
             &model("gpt-5", false),
             json!({}),
         )
@@ -525,7 +435,7 @@ mod tests {
     fn web_search_requires_native_provider_support() {
         let error = resolve_translation_request_options(
             &config_with_web_search(),
-            &runtime(ProviderProtocol::OpenaiChat, "https://api.deepseek.com"),
+            &runtime("openai-chat", "https://api.deepseek.com"),
             &web_model("deepseek-chat"),
             json!({}),
         )
@@ -538,10 +448,7 @@ mod tests {
     fn web_search_sets_request_option_for_supported_models() {
         let options = resolve_translation_request_options(
             &config_with_web_search(),
-            &runtime(
-                ProviderProtocol::Gemini,
-                "https://generativelanguage.googleapis.com",
-            ),
+            &runtime("gemini", "https://generativelanguage.googleapis.com"),
             &web_model("gemini-2.5-pro"),
             json!({}),
         )

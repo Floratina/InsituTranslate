@@ -11,4 +11,5 @@ src-tauri/gen/
 *.sqlite3
 *.bak
 assets_references/
-docs/
+docs/*
+!docs/provider-protocols.md

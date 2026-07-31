@@ -8,6 +8,7 @@ mod features;
 mod glossaries;
 mod languages;
 mod pdf_parsing;
+mod providers;
 // Reserved for the glossary extraction pipeline; intentionally not exposed through IPC yet.
 #[allow(dead_code)]
 mod glossary_prompt;
@@ -121,6 +122,8 @@ pub fn run() {
             commands::open_backend_console,
             commands::get_cached_system_fonts,
             commands::refresh_system_fonts_cache,
+            commands::list_protocol_descriptors,
+            commands::preview_protocol_endpoints,
             commands::list_providers,
             commands::list_assistants,
             commands::create_assistant,

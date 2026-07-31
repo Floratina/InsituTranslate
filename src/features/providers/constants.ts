@@ -66,7 +66,7 @@ export const AVATAR_LIBRARY: Array<{ name: string; src: string }> = ([
 
 export const EMPTY_PROVIDER_FORM = {
   name: "",
-  protocol: "openai-chat" as ProviderProtocol,
+  protocol: "" as ProviderProtocol,
   avatar: null,
 };
 

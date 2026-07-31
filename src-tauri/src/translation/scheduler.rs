@@ -9,15 +9,15 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::{
-    finish_reason_is_truncation, ProviderChatError, ProviderChatMeta, RateLimitTelemetry,
-    RuntimeAdapter,
-};
 use crate::db as app_db;
 use crate::diagnostics::BackendLog;
 use crate::document_parsing::restore_chunk_for_map;
 use crate::domain::UnifiedChatRequest;
 use crate::pdf_parsing::PdfParsingMode;
+use crate::providers::{
+    finish_reason_is_truncation, ProviderChatError, ProviderChatMeta, RateLimitTelemetry,
+    RuntimeAdapter,
+};
 use crate::task_prompt::{ContentFormat, DocumentFormat, TaskChunkInput};
 use crate::translation_prompt::{
     build_translation_prompt, TranslationPromptBuildResult, TranslationPromptInput,

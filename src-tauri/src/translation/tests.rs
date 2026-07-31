@@ -3,7 +3,7 @@ use crate::adapters::{
 };
 use crate::db as app_db;
 use crate::domain::{
-    AddModelInput, CreateProviderInput, ProviderProtocol, ProviderPurpose, ProviderRuntimeConfig,
+    AddModelInput, CreateProviderInput, ProtocolId, ProviderPurpose, ProviderRuntimeConfig,
     SetProviderEnabledInput, ThinkingEffort, UpdateAssistantCustomParametersInput,
 };
 use crate::glossary_prompt::GlossaryEntry;
@@ -537,7 +537,7 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
         &provider_pool,
         CreateProviderInput {
             name: "Freeze Provider".into(),
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             purpose: ProviderPurpose::Translation,
             avatar: None,
         },
@@ -559,7 +559,7 @@ async fn create_task_freezes_glossary_config_in_inp_metadata() {
         &provider_pool,
         CreateProviderInput {
             name: "Freeze Glossary Provider".into(),
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             purpose: ProviderPurpose::Glossary,
             avatar: None,
         },
@@ -847,7 +847,7 @@ async fn create_task_rejects_disabled_translation_provider() {
         &provider_pool,
         CreateProviderInput {
             name: "Disabled Translation Provider".into(),
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             purpose: ProviderPurpose::Translation,
             avatar: None,
         },
@@ -921,7 +921,7 @@ async fn auto_glossary_snapshot_is_frozen_and_legacy_backfill_missing_model_requ
         &provider_pool,
         CreateProviderInput {
             name: "Translation Snapshot Provider".into(),
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             purpose: ProviderPurpose::Translation,
             avatar: None,
         },
@@ -943,7 +943,7 @@ async fn auto_glossary_snapshot_is_frozen_and_legacy_backfill_missing_model_requ
         &provider_pool,
         CreateProviderInput {
             name: "Glossary Snapshot Provider".into(),
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             purpose: ProviderPurpose::Glossary,
             avatar: None,
         },
@@ -1090,7 +1090,7 @@ async fn create_task_injects_custom_parameters_only_when_enabled() {
         &provider_pool,
         CreateProviderInput {
             name: "Custom Parameter Provider".into(),
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             purpose: ProviderPurpose::Translation,
             avatar: None,
         },
@@ -1781,12 +1781,10 @@ async fn translate_chunk_retries_transient_429_without_interrupting_task() {
     let adapter = Arc::new(RuntimeAdapter::new(
         Client::new(),
         ProviderRuntimeConfig {
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             base_url: format!("http://{address}/v1"),
             use_raw_base_url: true,
             config: json!({}),
-            auth_type: "bearer".into(),
-            auth_header: "Authorization".into(),
             credential: None,
             custom_headers: Vec::new(),
         },
@@ -1838,12 +1836,10 @@ async fn translate_chunk_interruption_returns_empty_interrupted_outcome() {
     let adapter = Arc::new(RuntimeAdapter::new(
         Client::new(),
         ProviderRuntimeConfig {
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             base_url: "http://127.0.0.1:9/v1".into(),
             use_raw_base_url: true,
             config: json!({}),
-            auth_type: "bearer".into(),
-            auth_header: "Authorization".into(),
             credential: None,
             custom_headers: Vec::new(),
         },
@@ -1912,12 +1908,10 @@ async fn translate_chunk_interrupts_immediately_on_permanent_provider_error() {
     let adapter = Arc::new(RuntimeAdapter::new(
         Client::new(),
         ProviderRuntimeConfig {
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             base_url: format!("http://{address}/v1"),
             use_raw_base_url: true,
             config: json!({}),
-            auth_type: "bearer".into(),
-            auth_header: "Authorization".into(),
             credential: None,
             custom_headers: Vec::new(),
         },
@@ -1989,12 +1983,10 @@ async fn translate_chunk_marks_transient_exhaustion_failed_without_interrupt() {
     let adapter = Arc::new(RuntimeAdapter::new(
         Client::new(),
         ProviderRuntimeConfig {
-            protocol: ProviderProtocol::OpenaiChat,
+            protocol: ProtocolId::registered("openai-chat"),
             base_url: format!("http://{address}/v1"),
             use_raw_base_url: true,
             config: json!({}),
-            auth_type: "bearer".into(),
-            auth_header: "Authorization".into(),
             credential: None,
             custom_headers: Vec::new(),
         },

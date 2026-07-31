@@ -1058,7 +1058,9 @@ mod tests {
         ProviderView {
             id: db::MINERU_PROVIDER_ID.into(),
             name: "MinerU".into(),
-            protocol: crate::domain::ProviderProtocol::OpenaiChat,
+            protocol: crate::domain::ProtocolId::registered("openai-chat"),
+            protocol_status: crate::domain::ProtocolStatus::Available,
+            protocol_raw_id: None,
             base_url: db::MINERU_STANDARD_BASE_URL.into(),
             use_raw_base_url: true,
             config: json!({ "mineru": { "mode": mineru_mode } }),
@@ -1074,7 +1076,7 @@ mod tests {
 
     fn runtime_config(credential: Option<&str>, mineru_mode: &str) -> ProviderRuntimeConfig {
         ProviderRuntimeConfig {
-            protocol: crate::domain::ProviderProtocol::OpenaiChat,
+            protocol: crate::domain::ProtocolId::registered("openai-chat"),
             base_url: db::MINERU_STANDARD_BASE_URL.into(),
             use_raw_base_url: true,
             config: json!({
@@ -1083,8 +1085,6 @@ mod tests {
                     "flashBaseUrl": db::MINERU_FLASH_BASE_URL,
                 },
             }),
-            auth_type: "bearer".into(),
-            auth_header: "Authorization".into(),
             credential: credential.map(str::to_string),
             custom_headers: Vec::new(),
         }

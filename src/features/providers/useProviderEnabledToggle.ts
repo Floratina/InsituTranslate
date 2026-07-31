@@ -30,6 +30,10 @@ export function useProviderEnabledToggle({
 
   const setEnabledOptimistically = useCallback(
     (provider: ProviderView, enabled: boolean): void => {
+      if (provider.protocolStatus === "unknown") {
+        onError(`未知协议 ${provider.protocolRawId ?? "unknown"} 无法启用`);
+        return;
+      }
       const confirmed = confirmedEnabled.current.get(provider.id) ?? provider.enabled;
       setProviders((items) =>
         items.map((item) => (item.id === provider.id ? { ...item, enabled } : item)),

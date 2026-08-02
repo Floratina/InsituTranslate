@@ -10,49 +10,18 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 
+import {
+  pointerValue,
+  validateProviderConfig,
+  withoutPointerValue,
+  withPointerValue,
+} from "./providerConfigSchema";
 import type { ProviderConfig, ProtocolConfigField } from "./types";
 
 interface ProtocolConfigFieldsProps {
   fields: ProtocolConfigField[];
   config: ProviderConfig;
   onChange: (config: ProviderConfig) => void;
-}
-
-function pointerSegments(pointer: string): string[] {
-  return pointer
-    .slice(1)
-    .split("/")
-    .map((segment) => segment.replaceAll("~1", "/").replaceAll("~0", "~"));
-}
-
-function pointerValue(config: ProviderConfig, pointer: string): unknown {
-  let value: unknown = config;
-  for (const segment of pointerSegments(pointer)) {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-    value = (value as Record<string, unknown>)[segment];
-  }
-  return value;
-}
-
-function withPointerValue(
-  config: ProviderConfig,
-  pointer: string,
-  nextValue: unknown,
-): ProviderConfig {
-  const segments = pointerSegments(pointer);
-  const root: Record<string, unknown> = { ...config };
-  let current = root;
-  for (const segment of segments.slice(0, -1)) {
-    const child = current[segment];
-    const next = typeof child === "object" && child !== null && !Array.isArray(child)
-      ? { ...(child as Record<string, unknown>) }
-      : {};
-    current[segment] = next;
-    current = next;
-  }
-  const leaf = segments.at(-1);
-  if (leaf) current[leaf] = nextValue;
-  return root;
 }
 
 function FieldLabel({ field }: { field: ProtocolConfigField }) {
@@ -69,21 +38,26 @@ function FieldLabel({ field }: { field: ProtocolConfigField }) {
 
 export function ProtocolConfigFields({ fields, config, onChange }: ProtocolConfigFieldsProps) {
   if (fields.length === 0) return null;
+  const issues = validateProviderConfig(fields, config);
 
   return (
     <div className="grid gap-2">
       {fields.map((field) => {
-        const value = pointerValue(config, field.pointer) ?? field.defaultValue;
+        const value = pointerValue(config, field.pointer);
+        const issue = issues.find((item) => item.pointer === field.pointer);
         if (field.kind === "boolean") {
           return (
-            <div key={field.pointer} className="flex items-center justify-between gap-3">
-              <FieldLabel field={field} />
-              <Switch
-                checked={value === true}
-                onCheckedChange={(checked) =>
-                  onChange(withPointerValue(config, field.pointer, checked))
-                }
-              />
+            <div key={field.pointer} className="grid gap-1">
+              <div className="flex items-center justify-between gap-3">
+                <FieldLabel field={field} />
+                <Switch
+                  checked={value === true}
+                  onCheckedChange={(checked) =>
+                    onChange(withPointerValue(config, field.pointer, checked))
+                  }
+                />
+              </div>
+              {issue && <div className="text-xs text-destructive">{issue.message}</div>}
             </div>
           );
         }
@@ -108,6 +82,7 @@ export function ProtocolConfigFields({ fields, config, onChange }: ProtocolConfi
                   ))}
                 </SelectContent>
               </Select>
+              {issue && <div className="text-xs text-destructive">{issue.message}</div>}
             </div>
           );
         }
@@ -118,12 +93,17 @@ export function ProtocolConfigFields({ fields, config, onChange }: ProtocolConfi
               type={field.kind === "number" ? "number" : "text"}
               value={typeof value === "string" || typeof value === "number" ? value : ""}
               onChange={(event) => {
+                if (field.kind === "number" && event.target.value === "") {
+                  onChange(withoutPointerValue(config, field.pointer));
+                  return;
+                }
                 const nextValue = field.kind === "number"
                   ? Number(event.target.value)
                   : event.target.value;
                 onChange(withPointerValue(config, field.pointer, nextValue));
               }}
             />
+            {issue && <div className="text-xs text-destructive">{issue.message}</div>}
           </div>
         );
       })}

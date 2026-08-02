@@ -81,7 +81,7 @@ impl ProtocolCodec for OllamaCodec {
     }
 
     fn new_stream_decoder(&self) -> Box<dyn ProtocolStreamDecoder> {
-        Box::new(JsonEventStreamDecoder::new(decode_chat))
+        Box::new(JsonEventStreamDecoder::new(self.id(), decode_chat))
     }
 
     fn infer_capabilities(&self, _base_url: &str, model_id: &str) -> ModelCapabilities {

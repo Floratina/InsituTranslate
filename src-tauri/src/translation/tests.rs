@@ -1,6 +1,3 @@
-use crate::adapters::{
-    ProviderChatError, ProviderChatErrorKind, RateLimitTelemetry, RuntimeAdapter,
-};
 use crate::db as app_db;
 use crate::domain::{
     AddModelInput, CreateProviderInput, ProtocolId, ProviderPurpose, ProviderRuntimeConfig,
@@ -9,6 +6,9 @@ use crate::domain::{
 use crate::glossary_prompt::GlossaryEntry;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
 use crate::pdf_parsing::PdfParsingMode;
+use crate::providers::runtime::{
+    ProviderChatError, ProviderChatErrorKind, RateLimitTelemetry, RuntimeAdapter,
+};
 use crate::task_prompt::{ContentFormat, DocumentFormat};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -1712,6 +1712,7 @@ fn detects_logprobs_parameter_rejection() {
     let error = ProviderChatError {
         status: Some(400),
         message: "Unrecognized request argument supplied: logprobs".into(),
+        compatibility_text: None,
         rate_limits: RateLimitTelemetry::default(),
         kind: ProviderChatErrorKind::HttpStatus,
     };
@@ -1727,6 +1728,7 @@ fn retry_backoff_uses_compound_growth_cap_and_jitter() {
     let error = ProviderChatError {
         status: Some(503),
         message: "HTTP 503: overloaded".into(),
+        compatibility_text: None,
         rate_limits: RateLimitTelemetry::default(),
         kind: ProviderChatErrorKind::HttpStatus,
     };
@@ -1735,6 +1737,7 @@ fn retry_backoff_uses_compound_growth_cap_and_jitter() {
     let retry_after = ProviderChatError {
         status: Some(429),
         message: "HTTP 429: rate limit".into(),
+        compatibility_text: None,
         rate_limits: RateLimitTelemetry {
             retry_after_ms: Some(2_250),
             ..RateLimitTelemetry::default()

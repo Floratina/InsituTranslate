@@ -1,7 +1,12 @@
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+use reqwest::header::HeaderName;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::domain::ProtocolId;
+use crate::providers::config_schema::{parse_default, validate_fields};
 #[cfg(test)]
 use crate::providers::protocols::test_protocol;
 use crate::providers::protocols::{
@@ -100,15 +105,44 @@ static TEST_OPTIONS: &[ConfigOption] = &[
 ];
 
 #[cfg(test)]
-static TEST_CONFIG_FIELDS: &[ConfigField] = &[ConfigField {
-    pointer: "/mode",
-    label: "Mode",
-    kind: ConfigFieldKind::Select,
-    required: true,
-    default_json: Some("\"fast\""),
-    options: TEST_OPTIONS,
-    help_text: Some("Test-only schema field"),
-}];
+static TEST_CONFIG_FIELDS: &[ConfigField] = &[
+    ConfigField {
+        pointer: "/mode",
+        label: "Mode",
+        kind: ConfigFieldKind::Select,
+        required: true,
+        default_json: Some("\"fast\""),
+        options: TEST_OPTIONS,
+        help_text: Some("Test-only schema field"),
+    },
+    ConfigField {
+        pointer: "/label",
+        label: "Label",
+        kind: ConfigFieldKind::Text,
+        required: false,
+        default_json: Some("\"seventh\""),
+        options: &[],
+        help_text: None,
+    },
+    ConfigField {
+        pointer: "/limits/retries",
+        label: "Retries",
+        kind: ConfigFieldKind::Number,
+        required: false,
+        default_json: Some("3"),
+        options: &[],
+        help_text: None,
+    },
+    ConfigField {
+        pointer: "/features/cache",
+        label: "Cache",
+        kind: ConfigFieldKind::Boolean,
+        required: false,
+        default_json: Some("true"),
+        options: &[],
+        help_text: None,
+    },
+];
 
 pub enum ProtocolResolution {
     Known(&'static ProtocolDescriptor),
@@ -287,74 +321,296 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
 ];
 
+static REGISTRY_VALIDATION: OnceLock<Result<(), String>> = OnceLock::new();
+
+pub fn validate_registry() -> Result<(), String> {
+    REGISTRY_VALIDATION
+        .get_or_init(|| validate_descriptors(DESCRIPTORS))
+        .clone()
+}
+
+fn validate_descriptors(descriptors: &[ProtocolDescriptor]) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    for descriptor in descriptors {
+        if descriptor.id.trim().is_empty() {
+            return Err("Provider protocol ID cannot be empty".into());
+        }
+        if descriptor.id == ProtocolId::UNKNOWN_VALUE {
+            return Err("Provider protocol ID 'unknown' is reserved".into());
+        }
+        if !ids.insert(descriptor.id) {
+            return Err(format!("Duplicate provider protocol ID: {}", descriptor.id));
+        }
+        if descriptor.codec.id() != descriptor.id {
+            return Err(format!(
+                "Provider protocol {} uses codec ID {}",
+                descriptor.id,
+                descriptor.codec.id()
+            ));
+        }
+        let url = url::Url::parse(descriptor.default_base_url).map_err(|error| {
+            format!(
+                "Provider protocol {} has invalid default Base URL: {error}",
+                descriptor.id
+            )
+        })?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(format!(
+                "Provider protocol {} default Base URL must use HTTP or HTTPS",
+                descriptor.id
+            ));
+        }
+        if let AuthStrategy::StaticHeader { header, .. } = descriptor.auth.strategy {
+            HeaderName::from_bytes(header.as_bytes()).map_err(|error| {
+                format!(
+                    "Provider protocol {} has invalid authentication header: {error}",
+                    descriptor.id
+                )
+            })?;
+        }
+        validate_fields(descriptor.config_fields)
+            .map_err(|error| format!("Provider protocol {}: {error}", descriptor.id))?;
+    }
+    Ok(())
+}
+
 pub fn descriptor_for(id: &ProtocolId) -> Result<&'static ProtocolDescriptor, String> {
     resolve_input(id)
 }
 
-pub fn descriptor_by_id(id: &str) -> Option<&'static ProtocolDescriptor> {
-    DESCRIPTORS
-        .iter()
-        .find(|descriptor| descriptor.id == id && descriptor.codec.id() == id)
+pub fn descriptor_by_id(id: &str) -> Result<Option<&'static ProtocolDescriptor>, String> {
+    validate_registry()?;
+    Ok(DESCRIPTORS.iter().find(|descriptor| descriptor.id == id))
 }
 
-pub fn resolve_persisted(raw_id: impl Into<String>) -> ProtocolResolution {
+pub fn resolve_persisted(raw_id: impl Into<String>) -> Result<ProtocolResolution, String> {
     let raw_id = raw_id.into();
-    match descriptor_by_id(&raw_id) {
+    Ok(match descriptor_by_id(&raw_id)? {
         Some(descriptor) => ProtocolResolution::Known(descriptor),
         None => ProtocolResolution::Unknown {
             id: ProtocolId::unknown(),
             raw_id,
         },
-    }
+    })
 }
 
 pub fn resolve_input(id: &ProtocolId) -> Result<&'static ProtocolDescriptor, String> {
     if id.is_unknown() {
         return Err("Unknown or unavailable provider protocol: unknown".into());
     }
-    descriptor_by_id(id.as_str())
+    descriptor_by_id(id.as_str())?
         .ok_or_else(|| format!("Unknown or unavailable provider protocol: {}", id.as_str()))
 }
 
-pub fn descriptor_views() -> Vec<ProtocolDescriptorView> {
+pub fn descriptor_views() -> Result<Vec<ProtocolDescriptorView>, String> {
+    validate_registry()?;
     DESCRIPTORS
         .iter()
-        .map(|descriptor| ProtocolDescriptorView {
-            id: descriptor.id.to_string(),
-            display_name: descriptor.display_name.to_string(),
-            default_base_url: descriptor.default_base_url.to_string(),
-            wire_family: descriptor.wire_family.to_string(),
-            config_kind: descriptor.config_kind.to_string(),
-            supports_model_listing: descriptor.supports_model_listing,
-            auth: AuthDescriptorView {
-                kind: descriptor.auth.strategy.legacy_auth_type().to_string(),
-                label: descriptor.auth.label.to_string(),
-                header: descriptor.auth.strategy.header().to_string(),
-                help_text: descriptor.auth.help_text.map(str::to_string),
-            },
-            config_fields: descriptor
-                .config_fields
-                .iter()
-                .map(|field| ConfigFieldView {
-                    pointer: field.pointer.to_string(),
-                    label: field.label.to_string(),
-                    kind: field.kind,
-                    required: field.required,
-                    default_value: field.default_json.map(|value| {
-                        serde_json::from_str(value).expect("registered config field default JSON")
-                    }),
-                    options: field
-                        .options
-                        .iter()
-                        .map(|option| ConfigOptionView {
-                            value: option.value.to_string(),
-                            label: option.label.to_string(),
+        .map(|descriptor| -> Result<ProtocolDescriptorView, String> {
+            Ok(ProtocolDescriptorView {
+                id: descriptor.id.to_string(),
+                display_name: descriptor.display_name.to_string(),
+                default_base_url: descriptor.default_base_url.to_string(),
+                wire_family: descriptor.wire_family.to_string(),
+                config_kind: descriptor.config_kind.to_string(),
+                supports_model_listing: descriptor.supports_model_listing,
+                auth: AuthDescriptorView {
+                    kind: descriptor.auth.strategy.legacy_auth_type().to_string(),
+                    label: descriptor.auth.label.to_string(),
+                    header: descriptor.auth.strategy.header().to_string(),
+                    help_text: descriptor.auth.help_text.map(str::to_string),
+                },
+                config_fields: descriptor
+                    .config_fields
+                    .iter()
+                    .map(|field| {
+                        Ok(ConfigFieldView {
+                            pointer: field.pointer.to_string(),
+                            label: field.label.to_string(),
+                            kind: field.kind,
+                            required: field.required,
+                            default_value: parse_default(field)?,
+                            options: field
+                                .options
+                                .iter()
+                                .map(|option| ConfigOptionView {
+                                    value: option.value.to_string(),
+                                    label: option.label.to_string(),
+                                })
+                                .collect(),
+                            help_text: field.help_text.map(str::to_string),
                         })
-                        .collect(),
-                    help_text: field.help_text.map(str::to_string),
-                })
-                .collect(),
-            help_text: descriptor.help_text.map(str::to_string),
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                help_text: descriptor.help_text.map(str::to_string),
+            })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::protocols::test_protocol;
+
+    static INVALID_POINTER_FIELDS: &[ConfigField] = &[ConfigField {
+        pointer: "/invalid~2pointer",
+        label: "Invalid",
+        kind: ConfigFieldKind::Text,
+        required: false,
+        default_json: None,
+        options: &[],
+        help_text: None,
+    }];
+
+    static INVALID_DEFAULT_FIELDS: &[ConfigField] = &[ConfigField {
+        pointer: "/count",
+        label: "Count",
+        kind: ConfigFieldKind::Number,
+        required: true,
+        default_json: Some("\"not-a-number\""),
+        options: &[],
+        help_text: None,
+    }];
+
+    static MALFORMED_DEFAULT_FIELDS: &[ConfigField] = &[ConfigField {
+        pointer: "/count",
+        label: "Count",
+        kind: ConfigFieldKind::Number,
+        required: true,
+        default_json: Some("{"),
+        options: &[],
+        help_text: None,
+    }];
+
+    static DUPLICATE_SELECT_OPTIONS: &[ConfigOption] = &[
+        ConfigOption {
+            value: "same",
+            label: "First",
+        },
+        ConfigOption {
+            value: "same",
+            label: "Second",
+        },
+    ];
+
+    static INVALID_SELECT_FIELDS: &[ConfigField] = &[ConfigField {
+        pointer: "/mode",
+        label: "Mode",
+        kind: ConfigFieldKind::Select,
+        required: true,
+        default_json: Some("\"missing\""),
+        options: TEST_OPTIONS,
+        help_text: None,
+    }];
+
+    static DUPLICATE_SELECT_FIELDS: &[ConfigField] = &[ConfigField {
+        pointer: "/mode",
+        label: "Mode",
+        kind: ConfigFieldKind::Select,
+        required: true,
+        default_json: Some("\"same\""),
+        options: DUPLICATE_SELECT_OPTIONS,
+        help_text: None,
+    }];
+
+    fn descriptor(id: &'static str, fields: &'static [ConfigField]) -> ProtocolDescriptor {
+        ProtocolDescriptor {
+            id,
+            display_name: "Test",
+            default_base_url: "https://example.test",
+            wire_family: "test",
+            config_kind: "generic",
+            supports_model_listing: true,
+            auth: AuthDescriptor {
+                strategy: AuthStrategy::None,
+                label: "None",
+                help_text: None,
+            },
+            config_fields: fields,
+            help_text: None,
+            codec: &test_protocol::CODEC,
+        }
+    }
+
+    #[test]
+    fn validates_the_registered_descriptor_set() {
+        validate_descriptors(DESCRIPTORS).expect("valid production and test descriptors");
+        let views = descriptor_views().expect("descriptor views");
+        let seventh = views
+            .iter()
+            .find(|view| view.id == "test-seventh")
+            .expect("seventh protocol view");
+        assert_eq!(
+            seventh.config_fields[0].default_value,
+            Some(Value::from("fast"))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_reserved_and_codec_mismatched_ids() {
+        assert!(validate_descriptors(&[
+            descriptor("test-seventh", &[]),
+            descriptor("test-seventh", &[]),
+        ])
+        .expect_err("duplicate ID")
+        .contains("Duplicate"));
+        assert!(validate_descriptors(&[descriptor("unknown", &[])])
+            .expect_err("reserved ID")
+            .contains("reserved"));
+        assert!(validate_descriptors(&[descriptor("mismatched", &[])])
+            .expect_err("codec mismatch")
+            .contains("codec ID"));
+    }
+
+    #[test]
+    fn rejects_invalid_schema_pointers_and_defaults() {
+        assert!(
+            validate_descriptors(&[descriptor("test-seventh", INVALID_POINTER_FIELDS,)])
+                .expect_err("invalid pointer")
+                .contains("invalid escape")
+        );
+        assert!(
+            validate_descriptors(&[descriptor("test-seventh", INVALID_DEFAULT_FIELDS,)])
+                .expect_err("invalid default")
+                .contains("must be a number")
+        );
+        assert!(
+            validate_descriptors(&[descriptor("test-seventh", MALFORMED_DEFAULT_FIELDS,)])
+                .expect_err("malformed default JSON")
+                .contains("invalid default JSON")
+        );
+        assert!(
+            validate_descriptors(&[descriptor("test-seventh", INVALID_SELECT_FIELDS,)])
+                .expect_err("select default outside options")
+                .contains("registered option")
+        );
+        assert!(
+            validate_descriptors(&[descriptor("test-seventh", DUPLICATE_SELECT_FIELDS,)])
+                .expect_err("duplicate select option")
+                .contains("duplicate option")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_urls_and_authentication_headers() {
+        let mut invalid_url = descriptor("test-seventh", &[]);
+        invalid_url.default_base_url = "file:///tmp/provider";
+        assert!(validate_descriptors(&[invalid_url])
+            .expect_err("non-HTTP URL")
+            .contains("HTTP or HTTPS"));
+
+        let mut invalid_header = descriptor("test-seventh", &[]);
+        invalid_header.auth = AuthDescriptor {
+            strategy: AuthStrategy::StaticHeader {
+                header: "bad header",
+                scheme: None,
+            },
+            label: "Bad",
+            help_text: None,
+        };
+        assert!(validate_descriptors(&[invalid_header])
+            .expect_err("invalid authentication header")
+            .contains("authentication header"));
+    }
 }

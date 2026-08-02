@@ -1064,6 +1064,7 @@ mod tests {
             base_url: db::MINERU_STANDARD_BASE_URL.into(),
             use_raw_base_url: true,
             config: json!({ "mineru": { "mode": mineru_mode } }),
+            config_issues: Vec::new(),
             avatar: Some("mineru".into()),
             is_builtin: true,
             enabled,

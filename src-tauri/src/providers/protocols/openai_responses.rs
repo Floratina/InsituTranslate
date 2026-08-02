@@ -97,7 +97,7 @@ impl ProtocolCodec for OpenAiResponsesCodec {
     }
 
     fn new_stream_decoder(&self) -> Box<dyn ProtocolStreamDecoder> {
-        Box::new(JsonEventStreamDecoder::new(decode_chat))
+        Box::new(JsonEventStreamDecoder::new(self.id(), decode_chat))
     }
 
     fn infer_capabilities(&self, _base_url: &str, model_id: &str) -> ModelCapabilities {
@@ -226,7 +226,14 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
     let mut body = merge_custom_parameters(body, &request.custom_parameters)?;
     remove_object_keys(
         &mut body,
-        &["temperature", "top_p", "reasoning", "thinking", "tools"],
+        &[
+            "temperature",
+            "top_p",
+            "reasoning",
+            "thinking",
+            "tools",
+            "web_search_options",
+        ],
     );
     set_optional_field(
         &mut body,

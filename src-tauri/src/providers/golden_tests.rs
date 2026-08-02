@@ -4,7 +4,8 @@ use crate::domain::{
     ProtocolId, ProviderRuntimeConfig, UnifiedChatRequest, UnifiedContent, UnifiedMessage,
 };
 use crate::providers::codec::HttpMethod;
-use crate::providers::registry::descriptor_by_id;
+use crate::providers::config_schema::materialize_defaults;
+use crate::providers::registry::{descriptor_by_id, DESCRIPTORS};
 use crate::providers::ProtocolCodec;
 
 struct ProtocolCase {
@@ -118,26 +119,43 @@ fn cases() -> Vec<ProtocolCase> {
             }),
             finish_reason: "stop",
         },
+        ProtocolCase {
+            id: "test-seventh",
+            model: "test-r",
+            model_url: "/catalog",
+            chat_url: "/conversation",
+            body_key: "engine",
+            models: json!({"models": ["a-model", "z-model"]}),
+            first_model: "a-model",
+            response: json!({"answer": "ok", "stop": "done"}),
+            finish_reason: "done",
+        },
     ]
 }
 
 fn config(id: &str) -> ProviderRuntimeConfig {
-    let descriptor = descriptor_by_id(id).expect("registered protocol");
+    let descriptor = descriptor_by_id(id)
+        .expect("valid registry")
+        .expect("registered protocol");
     ProviderRuntimeConfig {
         protocol: ProtocolId::registered(id),
         base_url: descriptor.default_base_url.into(),
         use_raw_base_url: false,
-        config: if id == "vertex-ai" {
-            json!({
-                "vertexAi": {
-                    "projectId": "project-1",
-                    "location": "global",
-                    "clientEmail": "svc@example.test"
-                }
-            })
-        } else {
-            json!({})
-        },
+        config: materialize_defaults(
+            if id == "vertex-ai" {
+                json!({
+                    "vertexAi": {
+                        "projectId": "project-1",
+                        "location": "global",
+                        "clientEmail": "svc@example.test"
+                    }
+                })
+            } else {
+                json!({})
+            },
+            descriptor.config_fields,
+        )
+        .expect("protocol defaults"),
         credential: (id == "vertex-ai").then(|| "test-private-key".into()),
         custom_headers: Vec::new(),
     }
@@ -166,12 +184,30 @@ fn request(model: &str) -> UnifiedChatRequest {
 fn assert_object_safe(_: &'static dyn ProtocolCodec) {}
 
 #[test]
-fn six_protocol_codecs_match_request_and_response_golden_shapes() {
-    for case in cases() {
-        let descriptor = descriptor_by_id(case.id).expect("descriptor");
+fn every_registered_protocol_matches_request_and_response_golden_shapes() {
+    let cases = cases();
+    let mut case_ids = cases.iter().map(|case| case.id).collect::<Vec<_>>();
+    let mut descriptor_ids = DESCRIPTORS
+        .iter()
+        .map(|descriptor| descriptor.id)
+        .collect::<Vec<_>>();
+    case_ids.sort_unstable();
+    descriptor_ids.sort_unstable();
+    assert_eq!(
+        case_ids, descriptor_ids,
+        "every descriptor needs a golden case"
+    );
+
+    for case in cases {
+        let descriptor = descriptor_by_id(case.id)
+            .expect("valid registry")
+            .expect("descriptor");
         let codec = descriptor.codec;
         assert_object_safe(codec);
         let config = config(case.id);
+        if case.id == "test-seventh" {
+            assert_eq!(config.config["mode"], "fast");
+        }
 
         let model_request = codec.encode_model_list(&config).expect("model request");
         assert_eq!(model_request.method, HttpMethod::Get, "{}", case.id);

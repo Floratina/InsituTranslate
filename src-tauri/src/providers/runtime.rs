@@ -17,6 +17,7 @@ pub trait ProviderAdapter {
     #[allow(dead_code)]
     fn build_chat_request(&self, request: &UnifiedChatRequest) -> Result<(String, Value), String>;
     async fn send_chat(&self, request: &UnifiedChatRequest) -> Result<UnifiedChatResponse, String>;
+    #[allow(dead_code)]
     async fn stream_chat(
         &self,
         request: &UnifiedChatRequest,
@@ -62,6 +63,7 @@ pub struct ProviderChatMeta {
 pub struct ProviderChatError {
     pub status: Option<u16>,
     pub message: String,
+    pub compatibility_text: Option<String>,
     pub rate_limits: RateLimitTelemetry,
     pub kind: ProviderChatErrorKind,
 }
@@ -212,6 +214,7 @@ impl RuntimeAdapter {
         &self,
         encoded: EncodedRequest,
     ) -> Result<JsonResponseMeta, ProviderChatError> {
+        let codec = self.codec().map_err(local_request_error)?;
         let mut request = self
             .client
             .request(reqwest_method(encoded.method), encoded.url)
@@ -226,6 +229,7 @@ impl RuntimeAdapter {
         let response = request.send().await.map_err(|error| ProviderChatError {
             status: None,
             message: error.to_string(),
+            compatibility_text: None,
             rate_limits: RateLimitTelemetry::default(),
             kind: ProviderChatErrorKind::Transport,
         })?;
@@ -234,6 +238,7 @@ impl RuntimeAdapter {
         let text = response.text().await.map_err(|error| ProviderChatError {
             status: Some(status.as_u16()),
             message: error.to_string(),
+            compatibility_text: None,
             rate_limits: rate_limits.clone(),
             kind: ProviderChatErrorKind::Transport,
         })?;
@@ -241,7 +246,8 @@ impl RuntimeAdapter {
             merge_retry_after_from_error_body(&mut rate_limits, &text);
             return Err(ProviderChatError {
                 status: Some(status.as_u16()),
-                message: format!("HTTP {}: {}", status.as_u16(), truncate(&text, 500)),
+                message: codec.decode_error(status.as_u16(), &text),
+                compatibility_text: Some(text),
                 rate_limits,
                 kind: ProviderChatErrorKind::HttpStatus,
             });
@@ -249,6 +255,7 @@ impl RuntimeAdapter {
         let raw = serde_json::from_str(&text).map_err(|error| ProviderChatError {
             status: Some(status.as_u16()),
             message: format!("Invalid JSON response: {error}"),
+            compatibility_text: None,
             rate_limits: rate_limits.clone(),
             kind: ProviderChatErrorKind::InvalidResponse,
         })?;
@@ -307,6 +314,7 @@ impl RuntimeAdapter {
             .map_err(|message| ProviderChatError {
                 status: Some(meta.status),
                 message,
+                compatibility_text: None,
                 rate_limits: meta.rate_limits.clone(),
                 kind: ProviderChatErrorKind::InvalidResponse,
             })?;
@@ -349,6 +357,9 @@ impl ProviderAdapter for RuntimeAdapter {
         &self,
         request: &UnifiedChatRequest,
     ) -> Result<Vec<UnifiedChatResponse>, String> {
+        if !request.stream {
+            return Err("Stream chat requires request.stream to be true".into());
+        }
         let encoded = self.encoded_chat_request(request)?;
         let headers = self.headers(&encoded.headers).await?;
         let body = encoded
@@ -408,6 +419,7 @@ fn local_request_error(message: String) -> ProviderChatError {
     ProviderChatError {
         status: None,
         message,
+        compatibility_text: None,
         rate_limits: RateLimitTelemetry::default(),
         kind: ProviderChatErrorKind::LocalRequest,
     }
@@ -427,7 +439,10 @@ fn negotiation_failure(error: &ProviderChatError) -> NegotiationFailure<'_> {
     NegotiationFailure {
         status: error.status,
         kind,
-        message: &error.message,
+        message: error
+            .compatibility_text
+            .as_deref()
+            .unwrap_or(&error.message),
     }
 }
 
@@ -595,19 +610,19 @@ fn parse_duration_ms(value: &str) -> Option<u64> {
         .map(|value| (value * 1000.0).ceil() as u64)
 }
 
-fn truncate(value: &str, max: usize) -> String {
-    value.chars().take(max).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::mpsc::{self, Receiver};
 
     fn config(id: &str) -> ProviderRuntimeConfig {
-        let descriptor =
-            crate::providers::registry::descriptor_by_id(id).expect("registered protocol");
+        let descriptor = crate::providers::registry::descriptor_by_id(id)
+            .expect("valid registry")
+            .expect("registered protocol");
         ProviderRuntimeConfig {
             protocol: crate::domain::ProtocolId::registered(id),
             base_url: descriptor.default_base_url.into(),
@@ -615,6 +630,72 @@ mod tests {
             config: json!({}),
             credential: None,
             custom_headers: Vec::new(),
+        }
+    }
+
+    fn serve_once(
+        status: u16,
+        extra_headers: &str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let extra_headers = extra_headers.to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .expect("write test response");
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn serve_sequence(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        SocketAddr,
+        Receiver<Vec<String>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (sender, receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept test request");
+                let mut request = [0_u8; 8192];
+                let length = stream.read(&mut request).expect("read test request");
+                requests.push(String::from_utf8_lossy(&request[..length]).into_owned());
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                )
+                .expect("write test response");
+            }
+            sender.send(requests).expect("send captured requests");
+        });
+        (address, receiver, server)
+    }
+
+    fn chat_request(stream: bool) -> UnifiedChatRequest {
+        UnifiedChatRequest {
+            model: "test-model".into(),
+            messages: Vec::new(),
+            web_search: false,
+            thinking: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream,
+            logprobs: false,
+            custom_parameters: json!({}),
         }
     }
 
@@ -682,5 +763,99 @@ mod tests {
 
         let error = adapter.list_models().await.expect_err("unknown protocol");
         assert!(error.contains("Unknown or unavailable provider protocol"));
+    }
+
+    #[tokio::test]
+    async fn non_stream_model_and_chat_errors_use_the_protocol_decoder() {
+        let (base_url, model_server) = serve_once(418, "", r#"{"error":"catalog failed"}"#);
+        let mut model_config = config("test-seventh");
+        model_config.base_url = base_url;
+        let model_error = RuntimeAdapter::new(Client::new(), model_config)
+            .list_models()
+            .await
+            .expect_err("model list error");
+        assert_eq!(model_error, "test-seventh HTTP 418: catalog failed");
+        model_server.join().expect("model server");
+
+        let (base_url, chat_server) = serve_once(
+            422,
+            "x-ratelimit-remaining-requests: 0\r\n",
+            r#"{"error":"chat failed"}"#,
+        );
+        let mut chat_config = config("test-seventh");
+        chat_config.base_url = base_url;
+        let error = RuntimeAdapter::new(Client::new(), chat_config)
+            .send_chat_with_meta(&chat_request(false))
+            .await
+            .expect_err("chat error");
+        assert_eq!(error.status, Some(422));
+        assert_eq!(error.message, "test-seventh HTTP 422: chat failed");
+        assert_eq!(error.rate_limits.request_remaining, Some(0));
+        chat_server.join().expect("chat server");
+    }
+
+    #[tokio::test]
+    async fn compatibility_retry_keeps_raw_error_text_and_replays_once() {
+        let (address, requests, server) = serve_sequence(vec![
+            (
+                400,
+                r#"{"error":{"message":"Unsupported parameter: max_tokens"}}"#,
+            ),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
+        ]);
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("api.xiaomimimo.com", address)
+            .build()
+            .expect("test client");
+        let mut runtime_config = config("openai-chat");
+        runtime_config.base_url = format!("http://api.xiaomimimo.com:{}/v1", address.port());
+        let mut request = chat_request(false);
+        request.model = "mimo-v2-pro".into();
+        request.custom_parameters = json!({"max_tokens": 8});
+
+        let response = RuntimeAdapter::new(client, runtime_config)
+            .send_chat_with_meta(&request)
+            .await
+            .expect("compatibility retry succeeds");
+        assert_eq!(response.response.text, "ok");
+        let captured = requests.recv().expect("captured requests");
+        server.join().expect("compatibility server");
+        assert_eq!(captured.len(), 2);
+        let request_body = |raw: &str| {
+            serde_json::from_str::<Value>(raw.split_once("\r\n\r\n").expect("HTTP request body").1)
+                .expect("JSON request body")
+        };
+        let original = request_body(&captured[0]);
+        let retry = request_body(&captured[1]);
+        assert_eq!(original["max_tokens"], 8);
+        assert!(original.get("max_completion_tokens").is_none());
+        assert_eq!(retry["max_completion_tokens"], 8);
+        assert!(retry.get("max_tokens").is_none());
+
+        let error = ProviderChatError {
+            status: Some(400),
+            message: "protocol-friendly error".into(),
+            compatibility_text: Some("Unsupported parameter: max_tokens".into()),
+            rate_limits: RateLimitTelemetry::default(),
+            kind: ProviderChatErrorKind::HttpStatus,
+        };
+        assert_eq!(
+            negotiation_failure(&error).message,
+            "Unsupported parameter: max_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_requires_a_stream_request() {
+        let adapter = RuntimeAdapter::new(Client::new(), config("test-seventh"));
+        let error = adapter
+            .stream_chat(&chat_request(false))
+            .await
+            .expect_err("non-stream request");
+        assert!(error.contains("request.stream"));
     }
 }

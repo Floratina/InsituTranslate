@@ -18,8 +18,8 @@ use crate::domain::{
     AddModelInput, AssistantView, ConnectivityResult, CopyAssistantInput, CopyProviderInput,
     CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput, ModelView,
     PreviewProtocolEndpointsInput, ProviderPurpose, ProviderRuntimeConfig, ProviderView,
-    RemoteModel, ReorderAssistantsInput, ReorderProvidersInput, SetProviderEnabledInput,
-    UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedMessage,
+    RemoteModel, ReorderAssistantsInput, ReorderProvidersInput, RepairProviderProtocolInput,
+    SetProviderEnabledInput, UnifiedChatRequest, UnifiedContent, UnifiedMessage,
     UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput, UpdateAssistantSettingsInput,
     UpdateModelInput, UpdateProviderConfigInput, UpdateProviderMetadataInput,
     UpdateVertexAiConfigInput,
@@ -172,7 +172,7 @@ pub async fn delete_assistant(state: State<'_, AppState>, id: String) -> Result<
 }
 
 #[tauri::command]
-pub fn list_protocol_descriptors() -> Vec<ProtocolDescriptorView> {
+pub fn list_protocol_descriptors() -> Result<Vec<ProtocolDescriptorView>, String> {
     crate::providers::registry::descriptor_views()
 }
 
@@ -181,11 +181,13 @@ pub fn preview_protocol_endpoints(
     input: PreviewProtocolEndpointsInput,
 ) -> Result<EndpointPreview, String> {
     let descriptor = crate::providers::registry::resolve_input(&input.protocol)?;
+    let config =
+        crate::providers::config_schema::validated_config(input.config, descriptor.config_fields)?;
     let runtime = crate::domain::ProviderRuntimeConfig {
         protocol: input.protocol,
         base_url: input.base_url,
         use_raw_base_url: input.use_raw_base_url,
-        config: input.config,
+        config,
         credential: None,
         custom_headers: Vec::new(),
     };
@@ -246,6 +248,14 @@ pub async fn update_provider_metadata(
     input: UpdateProviderMetadataInput,
 ) -> Result<ProviderView, String> {
     db::update_provider_metadata(&state.pool, input).await
+}
+
+#[tauri::command]
+pub async fn repair_provider_protocol(
+    state: State<'_, AppState>,
+    input: RepairProviderProtocolInput,
+) -> Result<ProviderView, String> {
+    db::repair_provider_protocol(&state.pool, input).await
 }
 
 #[tauri::command]
@@ -403,30 +413,6 @@ pub async fn test_model_connectivity(
         tested_at,
         error,
     })
-}
-
-#[tauri::command]
-pub async fn runtime_chat(
-    state: State<'_, AppState>,
-    provider_id: String,
-    request: UnifiedChatRequest,
-) -> Result<UnifiedChatResponse, String> {
-    let config = db::runtime_config(&state.pool, &provider_id).await?;
-    RuntimeAdapter::new(state.client.clone(), config)
-        .send_chat(&request)
-        .await
-}
-
-#[tauri::command]
-pub async fn runtime_chat_stream(
-    state: State<'_, AppState>,
-    provider_id: String,
-    request: UnifiedChatRequest,
-) -> Result<Vec<UnifiedChatResponse>, String> {
-    let config = db::runtime_config(&state.pool, &provider_id).await?;
-    RuntimeAdapter::new(state.client.clone(), config)
-        .stream_chat(&request)
-        .await
 }
 
 #[tauri::command]

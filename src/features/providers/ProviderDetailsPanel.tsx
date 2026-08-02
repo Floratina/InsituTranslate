@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Braces, KeyRound, Network } from "lucide-react";
+import { Braces, KeyRound, Network, Wrench } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,6 +25,7 @@ import {
 } from "./mineru";
 import { ProviderAvatar } from "./ProviderAvatar";
 import { ProtocolConfigFields } from "./ProtocolConfigFields";
+import { validateProviderConfig } from "./providerConfigSchema";
 import { ProviderModelList } from "./ProviderModelList";
 import { VertexAiConfigPanel } from "./VertexAiConfigPanel";
 import type {
@@ -53,6 +54,7 @@ interface ProviderDetailsPanelProps {
   onOpenModelSettings: (model: ModelView) => void;
   onOpenServiceAccountJson: () => void;
   onOpenPrivateKey: () => void;
+  onOpenProtocolRepair: () => void;
   onUpdateVertexAiConfig: (input: UpdateVertexAiConfigInput) => Promise<void>;
   onError: (message: string) => void;
 }
@@ -118,6 +120,7 @@ export function ProviderDetailsPanel({
   onOpenModelSettings,
   onOpenServiceAccountJson,
   onOpenPrivateKey,
+  onOpenProtocolRepair,
   onUpdateVertexAiConfig,
   onError,
 }: ProviderDetailsPanelProps) {
@@ -176,6 +179,9 @@ export function ProviderDetailsPanel({
   const mineruConfig = getMinerUConfig(draft.config);
   const activeMinerUBaseUrl =
     mineruConfig.mode === "flash" ? mineruConfig.flashBaseUrl : draft.baseUrl;
+  const effectiveConfigIssues = protocolDescriptor
+    ? validateProviderConfig(protocolDescriptor.configFields, draft.config)
+    : provider.configIssues;
 
   return (
     <div
@@ -199,7 +205,7 @@ export function ProviderDetailsPanel({
         <Switch
           className="self-center"
           checked={provider.enabled}
-          disabled={!protocolAvailable}
+          disabled={!protocolAvailable || effectiveConfigIssues.length > 0}
           onCheckedChange={(checked) => onEnabledChange(provider, checked)}
         />
       </div>
@@ -207,8 +213,12 @@ export function ProviderDetailsPanel({
       <ScrollArea className="min-h-0 flex-1">
         <div className="grid gap-3 p-3">
           {!protocolAvailable && (
-            <div className="rounded-[6px] border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
-              此提供商引用了当前版本无法识别的协议。修复协议前不会发送任何网络请求；您仍可在“编辑提供商”中改选已注册协议，或删除这条记录。
+            <div className="flex items-center justify-between gap-3 rounded-[6px] border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+              <span>此提供商引用了当前版本无法识别的协议。修复前不会发送任何网络请求。</span>
+              <Button variant="outline" size="control-sm" onClick={onOpenProtocolRepair}>
+                <Wrench className="size-3.5" />
+                修复协议
+              </Button>
             </div>
           )}
           <section className="grid min-w-0 gap-2 rounded-[6px] border p-3">
@@ -368,7 +378,7 @@ export function ProviderDetailsPanel({
           <ProviderModelList
             models={provider.models}
             testingModelId={testingModelId}
-            disabled={!protocolAvailable}
+            disabled={!protocolAvailable || effectiveConfigIssues.length > 0}
             supportsModelListing={protocolDescriptor?.supportsModelListing ?? false}
             onOpenRemoteModels={onOpenRemoteModels}
             onAddModel={onAddModel}

@@ -61,6 +61,7 @@ import { EMPTY_MODEL_FORM, EMPTY_PROVIDER_FORM } from "@/features/providers/cons
 import { getMinerUConfig, isMinerUProvider } from "@/features/providers/mineru";
 import { ProviderDetailsPanel } from "@/features/providers/ProviderDetailsPanel";
 import { ProviderListItem } from "@/features/providers/ProviderListItem";
+import { validateProviderConfig } from "@/features/providers/providerConfigSchema";
 import { useProviderEnabledToggle } from "@/features/providers/useProviderEnabledToggle";
 import {
   getVertexAiConfig,
@@ -383,6 +384,8 @@ function ProviderSettingsPage() {
   const [deleteTarget, setDeleteTarget] = useState<ProviderView | null>(null);
   const [providerForm, setProviderForm] =
     useState<ProviderForm>(EMPTY_PROVIDER_FORM);
+  const [repairTarget, setRepairTarget] = useState<ProviderView | null>(null);
+  const [repairProtocol, setRepairProtocol] = useState<ProviderProtocol>("");
   const [credentialOpen, setCredentialOpen] = useState<boolean>(false);
   const [credentialValue, setCredentialValue] = useState<string>("");
   const [headersOpen, setHeadersOpen] = useState<boolean>(false);
@@ -436,10 +439,6 @@ function ProviderSettingsPage() {
     () => visibleProviders.find((provider) => provider.id === selectedProviderId) ?? null,
     [selectedProviderId, visibleProviders],
   );
-  const editingProvider = useMemo(
-    () => visibleProviders.find((provider) => provider.id === editingProviderId) ?? null,
-    [editingProviderId, visibleProviders],
-  );
   const selectedProtocolDescriptor = useMemo(
     () => protocolDescriptors.find(
       (descriptor) => descriptor.id === selectedProvider?.protocol,
@@ -449,6 +448,12 @@ function ProviderSettingsPage() {
   const selectedProviderIsMinerU = useMemo(
     () => isMinerUProvider(selectedProvider),
     [selectedProvider],
+  );
+  const providerDraftConfigIssues = useMemo(
+    () => providerDraft && selectedProtocolDescriptor
+      ? validateProviderConfig(selectedProtocolDescriptor.configFields, providerDraft.config)
+      : [],
+    [providerDraft, selectedProtocolDescriptor],
   );
 
   const filteredRemoteModels = useMemo<RemoteModel[]>(() => {
@@ -517,7 +522,8 @@ function ProviderSettingsPage() {
       !isTauriRuntime() ||
       providerDraftBaseline.current === JSON.stringify(providerDraft) ||
       !providerDraft.baseUrl.trim() ||
-      !hasValidDraftUrls(providerDraft)
+      !hasValidDraftUrls(providerDraft) ||
+      providerDraftConfigIssues.length > 0
     ) {
       return;
     }
@@ -532,7 +538,7 @@ function ProviderSettingsPage() {
         window.clearTimeout(autoSaveTimer.current);
       }
     };
-  }, [providerDraft]);
+  }, [providerDraft, providerDraftConfigIssues]);
 
   async function refreshProviders(preferredId?: string, force = false): Promise<void> {
     const resource = appSessionCache.providers(purpose);
@@ -779,7 +785,7 @@ function ProviderSettingsPage() {
       name: provider.name,
       protocol: provider.protocolStatus === "available"
         ? provider.protocol
-        : (protocolDescriptors[0]?.id ?? EMPTY_PROVIDER_FORM.protocol),
+        : (provider.protocolRawId ?? "unknown"),
       avatar: provider.avatar,
     });
     setAddProviderOpen(true);
@@ -793,12 +799,39 @@ function ProviderSettingsPage() {
     setBusy(true);
     try {
       const updated = await invoke<ProviderView>("update_provider_metadata", {
-        input: { id: editingProviderId, ...providerForm },
+        input: {
+          id: editingProviderId,
+          name: providerForm.name,
+          avatar: providerForm.avatar,
+        },
       });
       await refreshProvidersAfterMutation(updated.id);
       setAddProviderOpen(false);
       setEditingProviderId(null);
       flash("提供商已更新");
+    } catch (cause) {
+      setError(getErrorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function openProtocolRepair(provider: ProviderView): void {
+    setRepairTarget(provider);
+    setRepairProtocol(protocolDescriptors[0]?.id ?? "");
+  }
+
+  async function repairProviderProtocol(): Promise<void> {
+    if (!repairTarget) return;
+    setBusy(true);
+    try {
+      const repaired = await invoke<ProviderView>("repair_provider_protocol", {
+        input: { id: repairTarget.id, protocol: repairProtocol },
+      });
+      setRepairTarget(null);
+      setRepairProtocol("");
+      await refreshProvidersAfterMutation(repaired.id);
+      flash("提供商协议已修复，请重新测试后启用");
     } catch (cause) {
       setError(getErrorMessage(cause));
     } finally {
@@ -1134,6 +1167,7 @@ function ProviderSettingsPage() {
                 onOpenModelSettings={(model) => setSettingsModel({ ...model })}
                 onOpenServiceAccountJson={() => setServiceAccountOpen(true)}
                 onOpenPrivateKey={() => void openPrivateKeyEditor()}
+                onOpenProtocolRepair={() => selectedProvider && openProtocolRepair(selectedProvider)}
                 onUpdateVertexAiConfig={updateVertexAiConfig}
                 onError={setError}
               />
@@ -1147,10 +1181,8 @@ function ProviderSettingsPage() {
           <DialogHeader>
             <DialogTitle>{editingProviderId ? "编辑提供商" : "添加提供商"}</DialogTitle>
             <DialogDescription>
-              {editingProvider?.protocolStatus === "unknown"
-                ? `原协议“${editingProvider.protocolRawId ?? "unknown"}”已不可用。请选择一个已注册协议完成修复。`
-                : editingProviderId
-                ? "修改提供商名称、头像与协议。"
+              {editingProviderId
+                ? "修改提供商名称与头像。协议是创建后的固定身份。"
                 : "添加自定义提供商。新增后可在右侧配置 Base URL 与 API Key。"}
             </DialogDescription>
           </DialogHeader>
@@ -1176,26 +1208,33 @@ function ProviderSettingsPage() {
             </DialogField>
             <DialogField>
               <Label>协议</Label>
-              <Select
-                value={providerForm.protocol}
-                onValueChange={(value) =>
-                  setProviderForm({
-                    ...providerForm,
-                    protocol: value,
-                  })
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {protocolDescriptors.map((descriptor) => (
-                    <SelectItem key={descriptor.id} value={descriptor.id}>
-                      {descriptor.displayName}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {editingProviderId ? (
+                <Input
+                  disabled
+                  value={protocolLabel(providerForm.protocol, protocolDescriptors)}
+                />
+              ) : (
+                <Select
+                  value={providerForm.protocol}
+                  onValueChange={(value) =>
+                    setProviderForm({
+                      ...providerForm,
+                      protocol: value,
+                    })
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {protocolDescriptors.map((descriptor) => (
+                      <SelectItem key={descriptor.id} value={descriptor.id}>
+                        {descriptor.displayName}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
             </DialogField>
           </div>
           <DialogFooter>
@@ -1203,13 +1242,58 @@ function ProviderSettingsPage() {
               disabled={
                 busy
                 || !providerForm.name.trim()
-                || !protocolDescriptors.some(
+                || (!editingProviderId && !protocolDescriptors.some(
                   (descriptor) => descriptor.id === providerForm.protocol,
-                )
+                ))
               }
               onClick={() => void saveProviderMetadata()}
             >
               {editingProviderId ? "保存修改" : "添加提供商"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={repairTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setRepairTarget(null);
+            setRepairProtocol("");
+          }
+        }}
+      >
+        <DialogContent open={repairTarget !== null} className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>修复提供商协议</DialogTitle>
+            <DialogDescription>
+              原协议“{repairTarget?.protocolRawId ?? "unknown"}”已不可用。修复后将保留现有配置、模型与凭证，但提供商会保持禁用，模型测试状态会重置。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogField>
+            <Label>新协议</Label>
+            <Select value={repairProtocol} onValueChange={setRepairProtocol}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {protocolDescriptors.map((descriptor) => (
+                  <SelectItem key={descriptor.id} value={descriptor.id}>
+                    {descriptor.displayName}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </DialogField>
+          <DialogFooter>
+            <Button
+              disabled={
+                busy
+                || !protocolDescriptors.some((descriptor) => descriptor.id === repairProtocol)
+              }
+              onClick={() => void repairProviderProtocol()}
+            >
+              修复协议
             </Button>
           </DialogFooter>
         </DialogContent>

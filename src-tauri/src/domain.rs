@@ -31,7 +31,10 @@ impl<'de> Deserialize<'de> for ProtocolId {
         D: Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
-        if crate::providers::registry::descriptor_by_id(&raw).is_some() {
+        if crate::providers::registry::descriptor_by_id(&raw)
+            .map_err(serde::de::Error::custom)?
+            .is_some()
+        {
             Ok(Self::registered(raw))
         } else {
             Ok(Self::unknown())
@@ -174,6 +177,7 @@ pub struct ProviderView {
     pub base_url: String,
     pub use_raw_base_url: bool,
     pub config: Value,
+    pub config_issues: Vec<ProviderConfigIssue>,
     pub avatar: Option<String>,
     pub is_builtin: bool,
     pub enabled: bool,
@@ -181,6 +185,13 @@ pub struct ProviderView {
     pub custom_header_keys: Vec<String>,
     pub purpose: ProviderPurpose,
     pub models: Vec<ModelView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfigIssue {
+    pub pointer: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,8 +265,14 @@ pub struct ImportVertexAiServiceAccountInput {
 pub struct UpdateProviderMetadataInput {
     pub id: String,
     pub name: String,
-    pub protocol: ProtocolId,
     pub avatar: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairProviderProtocolInput {
+    pub id: String,
+    pub protocol: ProtocolId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

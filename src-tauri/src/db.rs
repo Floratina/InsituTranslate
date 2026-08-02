@@ -10,14 +10,15 @@ use crate::domain::{
     AddModelInput, AssistantIconKind, AssistantView, CopyAssistantInput, CopyProviderInput,
     CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput, ModelView,
     ProtocolId, ProtocolStatus, ProviderPurpose, ProviderRuntimeConfig, ProviderView,
-    ReorderAssistantsInput, ReorderProvidersInput, SetProviderEnabledInput,
-    UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput, UpdateAssistantSettingsInput,
-    UpdateModelInput, UpdateProviderConfigInput, UpdateProviderMetadataInput,
-    UpdateVertexAiConfigInput,
+    ReorderAssistantsInput, ReorderProvidersInput, RepairProviderProtocolInput,
+    SetProviderEnabledInput, UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput,
+    UpdateAssistantSettingsInput, UpdateModelInput, UpdateProviderConfigInput,
+    UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
 };
 use crate::providers::capabilities::{
     infer_capabilities, resolve_capabilities, CapabilityId, CapabilityOverrides,
 };
+use crate::providers::config_schema::{config_issues, materialize_defaults, validated_config};
 use crate::providers::registry::{
     descriptor_by_id, resolve_input, resolve_persisted, ProtocolDescriptor, ProtocolResolution,
 };
@@ -44,11 +45,63 @@ pub fn default_vertex_ai_config() -> Value {
     vertex_ai::default_config()
 }
 
-fn default_provider_config(descriptor: &ProtocolDescriptor) -> Value {
-    match descriptor.config_kind {
+fn default_provider_config(descriptor: &ProtocolDescriptor) -> Result<Value, String> {
+    let config = match descriptor.config_kind {
         "vertex-ai" => default_vertex_ai_config(),
         _ => json!({}),
+    };
+    materialize_defaults(config, descriptor.config_fields)
+}
+
+fn provider_config_with_defaults(
+    descriptor: &ProtocolDescriptor,
+    config: Value,
+    mineru: bool,
+) -> Result<Value, String> {
+    let Value::Object(mut object) = config else {
+        return Err("Provider config must be a JSON object".into());
+    };
+    let defaults = if mineru {
+        default_mineru_config()
+    } else {
+        match descriptor.config_kind {
+            "vertex-ai" => default_vertex_ai_config(),
+            _ => json!({}),
+        }
+    };
+    merge_missing_object_values(&mut object, defaults)?;
+    materialize_defaults(Value::Object(object), descriptor.config_fields)
+}
+
+fn merge_missing_object_values(
+    target: &mut serde_json::Map<String, Value>,
+    defaults: Value,
+) -> Result<(), String> {
+    let Value::Object(defaults) = defaults else {
+        return Err("Provider config defaults must be a JSON object".into());
+    };
+    for (key, default) in defaults {
+        match (target.get_mut(&key), default) {
+            (Some(Value::Object(current)), Value::Object(nested)) => {
+                merge_missing_object_values(current, Value::Object(nested))?;
+            }
+            (Some(_), _) => {}
+            (None, default) => {
+                target.insert(key, default);
+            }
+        }
     }
+    Ok(())
+}
+
+fn parse_provider_config(id: &str, raw: &str) -> Result<Value, String> {
+    serde_json::from_str(raw)
+        .map_err(|error| format!("Provider {id} config JSON is invalid: {error}"))
+}
+
+fn parse_header_keys(id: &str, raw: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str(raw)
+        .map_err(|error| format!("Provider {id} header key JSON is invalid: {error}"))
 }
 
 pub fn is_mineru_provider(provider: &ProviderView) -> bool {
@@ -455,8 +508,11 @@ async fn seed_builtin_providers(pool: &SqlitePool) -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())?;
         if exists == 0 {
-            let descriptor = descriptor_by_id(protocol).expect("builtin protocol is registered");
+            let descriptor = descriptor_by_id(protocol)?.ok_or_else(|| {
+                format!("Builtin provider protocol is not registered: {protocol}")
+            })?;
             let (auth_type, auth_header) = authentication_for_protocol(descriptor);
+            let config = provider_config_with_defaults(descriptor, config.clone(), false)?;
             let inserted = sqlx::query(
                 "INSERT INTO providers (id, name, protocol, base_url, auth_type, auth_header, config_json, avatar, is_builtin, enabled, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?) ON CONFLICT(id) DO NOTHING",
             )
@@ -501,7 +557,8 @@ async fn seed_mineru_builtin_provider(pool: &SqlitePool) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let mut inserted_any = false;
     if exists == 0 {
-        let descriptor = descriptor_by_id("openai-chat").expect("MinerU protocol is registered");
+        let descriptor = descriptor_by_id("openai-chat")?
+            .ok_or_else(|| "MinerU protocol is not registered: openai-chat".to_string())?;
         let (auth_type, auth_header) = authentication_for_protocol(descriptor);
         let inserted = sqlx::query(
             "INSERT INTO providers (id, name, protocol, base_url, use_raw_base_url, auth_type, auth_header, config_json, avatar, is_builtin, enabled, sort_order) VALUES (?, 'MinerU', ?, ?, 1, ?, ?, ?, 'mineru', 1, 0, 0) ON CONFLICT(id) DO NOTHING",
@@ -806,7 +863,7 @@ async fn backfill_model_capabilities(pool: &SqlitePool) -> Result<(), String> {
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     for row in rows {
         let raw_protocol: String = row.get("protocol");
-        let ProtocolResolution::Known(descriptor) = resolve_persisted(&raw_protocol) else {
+        let ProtocolResolution::Known(descriptor) = resolve_persisted(&raw_protocol)? else {
             eprintln!(
                 "Skipping model capability backfill for unknown provider protocol: {raw_protocol}"
             );
@@ -870,7 +927,7 @@ async fn migrate_model_capability_overrides(pool: &SqlitePool) -> Result<(), Str
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     for row in rows {
         let raw_protocol: String = row.get("protocol");
-        let ProtocolResolution::Known(descriptor) = resolve_persisted(&raw_protocol) else {
+        let ProtocolResolution::Known(descriptor) = resolve_persisted(&raw_protocol)? else {
             eprintln!(
                 "Skipping model capability override migration for unknown protocol: {raw_protocol}"
             );
@@ -986,7 +1043,7 @@ async fn capability_overrides_for_model(
 }
 
 fn registered_descriptor(raw_id: &str) -> Result<&'static ProtocolDescriptor, String> {
-    match resolve_persisted(raw_id) {
+    match resolve_persisted(raw_id)? {
         ProtocolResolution::Known(descriptor) => Ok(descriptor),
         ProtocolResolution::Unknown { raw_id, .. } => Err(format!(
             "UnknownProtocol: provider protocol \"{raw_id}\" is unknown or no longer available"
@@ -1297,8 +1354,10 @@ async fn provider_from_row(
             .await
             .map_err(|error| error.to_string())?;
     let raw_protocol: String = row.get("protocol");
+    let config_json: String = row.get("config_json");
+    let parsed_config = parse_provider_config(&id, &config_json)?;
     let (protocol, protocol_status, protocol_raw_id, known_protocol) =
-        match resolve_persisted(raw_protocol) {
+        match resolve_persisted(&raw_protocol)? {
             ProtocolResolution::Known(descriptor) => (
                 ProtocolId::registered(descriptor.id),
                 ProtocolStatus::Available,
@@ -1318,6 +1377,16 @@ async fn provider_from_row(
                 )
             }
         };
+    let (config, config_issues) = match known_protocol {
+        Some(descriptor) => {
+            let mineru = id == MINERU_PROVIDER_ID || parsed_config.get("mineru").is_some();
+            let config = provider_config_with_defaults(descriptor, parsed_config, mineru)
+                .map_err(|error| format!("Provider {id} config is invalid: {error}"))?;
+            let issues = config_issues(&config, descriptor.config_fields);
+            (config, issues)
+        }
+        None => (parsed_config, Vec::new()),
+    };
     let base_url: String = row.get("base_url");
     let model_rows =
         sqlx::query("SELECT * FROM models WHERE provider_id = ? ORDER BY sort_order, created_at")
@@ -1339,7 +1408,7 @@ async fn provider_from_row(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let header_keys_json: String = row.get("header_keys_json");
-    let config_json: String = row.get("config_json");
+    let custom_header_keys = parse_header_keys(&id, &header_keys_json)?;
     Ok(ProviderView {
         id,
         name: row.get("name"),
@@ -1348,12 +1417,13 @@ async fn provider_from_row(
         protocol_raw_id,
         base_url,
         use_raw_base_url: row.get::<i64, _>("use_raw_base_url") != 0,
-        config: serde_json::from_str(&config_json).unwrap_or_else(|_| json!({})),
+        config,
+        config_issues,
         avatar: row.get("avatar"),
         is_builtin: row.get::<i64, _>("is_builtin") != 0,
         enabled: row.get::<i64, _>("enabled") != 0,
         credential_mask: row.get("credential_mask"),
-        custom_header_keys: serde_json::from_str(&header_keys_json).unwrap_or_default(),
+        custom_header_keys,
         purpose: ProviderPurpose::parse(&purpose_value)?,
         models,
     })
@@ -1414,6 +1484,7 @@ pub async fn create_provider(
     let id = new_id("provider");
     let credential_ref = format!("provider/{id}/credential");
     let (auth_type, auth_header) = authentication_for_protocol(descriptor);
+    let config = default_provider_config(descriptor)?;
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query(
         "INSERT INTO providers (id, name, protocol, base_url, auth_type, auth_header, config_json, credential_ref, avatar) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1424,7 +1495,7 @@ pub async fn create_provider(
     .bind(descriptor.default_base_url)
     .bind(auth_type)
     .bind(auth_header)
-    .bind(default_provider_config(descriptor).to_string())
+    .bind(config.to_string())
     .bind(&credential_ref)
     .bind(input.avatar)
     .execute(&mut *transaction)
@@ -1456,14 +1527,25 @@ pub async fn update_provider_config(
 ) -> Result<ProviderView, String> {
     let (base_url, use_raw_base_url) =
         normalize_provider_base_url(&input.base_url, input.use_raw_base_url)?;
-    let config_json = normalize_provider_config(input.config)?;
+    let row = sqlx::query("SELECT protocol, config_json FROM providers WHERE id = ?")
+        .bind(&input.id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Provider not found".to_string())?;
+    let descriptor = registered_descriptor(row.get::<String, _>("protocol").as_str())?;
+    let current_config_json: String = row.get("config_json");
+    let current_config = parse_provider_config(&input.id, &current_config_json)?;
+    let mineru = input.id == MINERU_PROVIDER_ID || current_config.get("mineru").is_some();
+    let config_json =
+        normalize_provider_config(input.config.unwrap_or(current_config), descriptor, mineru)?;
     let endpoint_base_url = provider_endpoint_base_url(&base_url);
     if endpoint_base_url.trim().is_empty() {
         return Err("Base URL is required".into());
     }
     url::Url::parse(endpoint_base_url.trim())
         .map_err(|_| "Base URL must be a valid absolute URL")?;
-    sqlx::query("UPDATE providers SET base_url = ?, use_raw_base_url = ?, config_json = COALESCE(?, config_json), updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query("UPDATE providers SET base_url = ?, use_raw_base_url = ?, config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(base_url)
         .bind(use_raw_base_url)
         .bind(config_json)
@@ -1487,13 +1569,11 @@ fn provider_endpoint_base_url(value: &str) -> &str {
     value.split('#').next().unwrap_or(value)
 }
 
-fn normalize_provider_config(config: Option<Value>) -> Result<Option<String>, String> {
-    let Some(value) = config else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(Some(json!({}).to_string()));
-    }
+fn normalize_provider_config(
+    value: Value,
+    descriptor: &ProtocolDescriptor,
+    mineru_provider: bool,
+) -> Result<String, String> {
     let Value::Object(mut object) = value else {
         return Err("Provider config must be a JSON object".into());
     };
@@ -1555,7 +1635,8 @@ fn normalize_provider_config(config: Option<Value>) -> Result<Option<String>, St
         vertex.insert("location".into(), Value::String(location));
         object.insert(vertex_ai::CONFIG_KEY.into(), Value::Object(vertex));
     }
-    Ok(Some(Value::Object(object).to_string()))
+    let config = provider_config_with_defaults(descriptor, Value::Object(object), mineru_provider)?;
+    Ok(validated_config(config, descriptor.config_fields)?.to_string())
 }
 
 pub async fn update_vertex_ai_config(
@@ -1657,11 +1738,10 @@ async fn save_vertex_ai_config(
         return Err("Agent Platform config can only be saved on Agent Platform providers".into());
     }
     let config_json: String = row.get("config_json");
-    let mut object = serde_json::from_str::<Value>(&config_json)
-        .unwrap_or_else(|_| json!({}))
+    let mut object = parse_provider_config(provider_id, &config_json)?
         .as_object()
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| format!("Provider {provider_id} config must be a JSON object"))?;
     let mut vertex = object
         .remove(vertex_ai::CONFIG_KEY)
         .and_then(|value| value.as_object().cloned())
@@ -1682,8 +1762,7 @@ async fn save_vertex_ai_config(
         Value::String(client_email.trim().to_string()),
     );
     object.insert(vertex_ai::CONFIG_KEY.into(), Value::Object(vertex));
-    let normalized = normalize_provider_config(Some(Value::Object(object)))?
-        .unwrap_or_else(|| json!({}).to_string());
+    let normalized = normalize_provider_config(Value::Object(object), descriptor, false)?;
 
     if let Some(private_key) = private_key {
         let reference = format!("provider/{provider_id}/credential");
@@ -1724,16 +1803,72 @@ pub async fn update_provider_metadata(
     if input.name.trim().is_empty() {
         return Err("Provider name is required".into());
     }
+    let result = sqlx::query(
+        "UPDATE providers SET name = ?, avatar = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(input.name.trim())
+    .bind(input.avatar)
+    .bind(&input.id)
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if result.rows_affected() != 1 {
+        return Err("Provider not found".into());
+    }
+    get_provider(pool, &input.id).await
+}
+
+pub async fn repair_provider_protocol(
+    pool: &SqlitePool,
+    input: RepairProviderProtocolInput,
+) -> Result<ProviderView, String> {
     let descriptor = resolve_input(&input.protocol)?;
-    let (auth_type, auth_header) = authentication_for_protocol(descriptor);
-    sqlx::query("UPDATE providers SET name = ?, protocol = ?, auth_type = ?, auth_header = ?, avatar = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(input.name.trim())
-        .bind(descriptor.id)
-        .bind(auth_type)
-        .bind(auth_header)
-        .bind(input.avatar)
+    let row = sqlx::query("SELECT protocol, config_json FROM providers WHERE id = ?")
         .bind(&input.id)
-        .execute(pool)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Provider not found".to_string())?;
+    let raw_protocol: String = row.get("protocol");
+    if !matches!(
+        resolve_persisted(&raw_protocol)?,
+        ProtocolResolution::Unknown { .. }
+    ) {
+        return Err("Only providers with unknown protocols can be repaired".into());
+    }
+    let raw_config: String = row.get("config_json");
+    let config = parse_provider_config(&input.id, &raw_config)?;
+    let mineru = input.id == MINERU_PROVIDER_ID || config.get("mineru").is_some();
+    let config = provider_config_with_defaults(descriptor, config, mineru)?;
+    let (auth_type, auth_header) = authentication_for_protocol(descriptor);
+
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+    sqlx::query(
+        "UPDATE providers
+         SET protocol = ?, auth_type = ?, auth_header = ?, config_json = ?, enabled = 0,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?",
+    )
+    .bind(descriptor.id)
+    .bind(auth_type)
+    .bind(auth_header)
+    .bind(config.to_string())
+    .bind(&input.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    sqlx::query(
+        "UPDATE models
+         SET test_status = 'untested', latency_ms = NULL, tested_at = NULL, test_error = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE provider_id = ?",
+    )
+    .bind(&input.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
         .await
         .map_err(|error| error.to_string())?;
     get_provider(pool, &input.id).await
@@ -1749,13 +1884,24 @@ pub async fn set_provider_enabled(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Provider not found".to_string())?;
-    if matches!(
-        resolve_persisted(&raw_protocol),
-        ProtocolResolution::Unknown { .. }
-    ) {
+    if input.enabled
+        && matches!(
+            resolve_persisted(&raw_protocol)?,
+            ProtocolResolution::Unknown { .. }
+        )
+    {
         return Err(format!(
             "Provider protocol \"{raw_protocol}\" is unknown or no longer available"
         ));
+    }
+    if input.enabled {
+        let provider = get_provider(pool, &input.id).await?;
+        if !provider.config_issues.is_empty() {
+            return Err(format!(
+                "Provider config is invalid: {}",
+                crate::providers::config_schema::format_issues(&provider.config_issues)
+            ));
+        }
     }
     sqlx::query("UPDATE providers SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(input.enabled)
@@ -1840,6 +1986,25 @@ async fn clone_provider(
     exact_name: Option<&str>,
     preserve_builtin: bool,
 ) -> Result<ProviderView, String> {
+    clone_provider_with_id(
+        pool,
+        provider_id,
+        purpose,
+        exact_name,
+        preserve_builtin,
+        new_id("provider"),
+    )
+    .await
+}
+
+async fn clone_provider_with_id(
+    pool: &SqlitePool,
+    provider_id: &str,
+    purpose: ProviderPurpose,
+    exact_name: Option<&str>,
+    preserve_builtin: bool,
+    id: String,
+) -> Result<ProviderView, String> {
     let source = sqlx::query("SELECT * FROM providers WHERE id = ?")
         .bind(provider_id)
         .fetch_optional(pool)
@@ -1848,109 +2013,194 @@ async fn clone_provider(
         .ok_or_else(|| "Provider not found".to_string())?;
     let source_id: String = source.get("id");
     let source_config_json: String = source.get("config_json");
-    if is_mineru_provider_record(&source_id, &source_config_json)
-        && purpose != ProviderPurpose::DocumentParsing
-    {
+    let parsed_source_config = parse_provider_config(&source_id, &source_config_json)?;
+    let source_is_mineru =
+        source_id == MINERU_PROVIDER_ID || parsed_source_config.get("mineru").is_some();
+    if source_is_mineru && purpose != ProviderPurpose::DocumentParsing {
         return Err("MinerU providers can only be copied to document parsing".into());
     }
+    let raw_protocol: String = source.get("protocol");
+    let (copied_config, copied_enabled) = match resolve_persisted(&raw_protocol)? {
+        ProtocolResolution::Known(descriptor) => {
+            let config =
+                provider_config_with_defaults(descriptor, parsed_source_config, source_is_mineru)?;
+            let valid = config_issues(&config, descriptor.config_fields).is_empty();
+            (config, source.get::<i64, _>("enabled") != 0 && valid)
+        }
+        ProtocolResolution::Unknown { .. } => (parsed_source_config, false),
+    };
+    let source_header_keys_json: String = source.get("header_keys_json");
+    let source_header_keys = parse_header_keys(&source_id, &source_header_keys_json)?;
     let source_name: String = source.get("name");
     let name = match exact_name {
         Some(value) => value.to_string(),
         None => next_copy_name(pool, &source_name, purpose).await?,
     };
-    let id = new_id("provider");
     let credential_ref = format!("provider/{id}/credential");
     let headers_ref = format!("provider/{id}/headers");
     let source_credential_ref: Option<String> = source.get("credential_ref");
     let source_headers_ref: Option<String> = source.get("headers_ref");
-    if let Some(secret) = source_credential_ref
+    let source_credential = source_credential_ref
         .as_deref()
-        .and_then(|reference| secrets::read(reference).ok().flatten())
-    {
-        secrets::write(&credential_ref, &secret)?;
-    }
-    if let Some(headers) = source_headers_ref
+        .map(secrets::read)
+        .transpose()?
+        .flatten();
+    let source_headers = source_headers_ref
         .as_deref()
-        .and_then(|reference| secrets::read(reference).ok().flatten())
-    {
-        secrets::write(&headers_ref, &headers)?;
+        .map(secrets::read)
+        .transpose()?
+        .flatten();
+    let source_credential_mask: Option<String> = source.get("credential_mask");
+    if source_credential_mask.is_some() && source_credential.is_none() {
+        return Err(format!(
+            "Provider {source_id} credential metadata exists but the credential is missing"
+        ));
     }
-    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
-    sqlx::query("INSERT INTO providers (id, name, protocol, base_url, use_raw_base_url, auth_type, auth_header, config_json, enabled, credential_ref, credential_mask, headers_ref, header_keys_json, avatar, is_builtin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    if !source_header_keys.is_empty() && source_headers.is_none() {
+        return Err(format!(
+            "Provider {source_id} header metadata exists but the header secret is missing"
+        ));
+    }
+    let copied_config_json = copied_config.to_string();
+    let copied_header_keys_json = serde_json::to_string(&source_header_keys)
+        .map_err(|error| format!("Unable to serialize copied provider header keys: {error}"))?;
+    let copied_credential_mask = source_credential.as_deref().map(secrets::mask);
+    let mut wrote_credential = false;
+    let mut wrote_headers = false;
+    if let Some(secret) = source_credential.as_deref() {
+        secrets::write(&credential_ref, secret)?;
+        wrote_credential = true;
+    }
+    if let Some(headers) = source_headers.as_deref() {
+        if let Err(error) = secrets::write(&headers_ref, headers) {
+            let cleanup = cleanup_copied_provider_secrets(
+                &credential_ref,
+                &headers_ref,
+                wrote_credential,
+                false,
+            );
+            return Err(combine_operation_and_cleanup_error(
+                format!("Unable to copy provider headers: {error}"),
+                cleanup,
+            ));
+        }
+        wrote_headers = true;
+    }
+    let database_result: Result<(), String> = async {
+        let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+        sqlx::query("INSERT INTO providers (id, name, protocol, base_url, use_raw_base_url, auth_type, auth_header, config_json, enabled, credential_ref, credential_mask, headers_ref, header_keys_json, avatar, is_builtin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&id)
-        .bind(name)
-        .bind(source.get::<String, _>("protocol"))
+        .bind(&name)
+        .bind(&raw_protocol)
         .bind(source.get::<String, _>("base_url"))
         .bind(source.get::<i64, _>("use_raw_base_url"))
         .bind(source.get::<String, _>("auth_type"))
         .bind(source.get::<String, _>("auth_header"))
-        .bind(source.get::<String, _>("config_json"))
-        .bind(source.get::<i64, _>("enabled"))
+        .bind(&copied_config_json)
+        .bind(copied_enabled)
         .bind(&credential_ref)
-        .bind(source.get::<Option<String>, _>("credential_mask"))
+        .bind(&copied_credential_mask)
         .bind(&headers_ref)
-        .bind(source.get::<String, _>("header_keys_json"))
+        .bind(&copied_header_keys_json)
         .bind(source.get::<Option<String>, _>("avatar"))
         .bind(if preserve_builtin { source.get::<i64, _>("is_builtin") } else { 0 })
         .execute(&mut *transaction)
         .await
         .map_err(|error| error.to_string())?;
-    if exact_name.is_none() {
-        sqlx::query("UPDATE provider_purposes SET sort_order = sort_order + 1 WHERE purpose = ?")
-            .bind(purpose.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| error.to_string())?;
-        sqlx::query(
-            "INSERT INTO provider_purposes (provider_id, purpose, sort_order) VALUES (?, ?, 0)",
-        )
-        .bind(&id)
-        .bind(purpose.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| error.to_string())?;
-    } else {
-        sqlx::query("INSERT INTO provider_purposes (provider_id, purpose, sort_order) VALUES (?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM provider_purposes WHERE purpose = ?), 0))")
+        if exact_name.is_none() {
+            sqlx::query("UPDATE provider_purposes SET sort_order = sort_order + 1 WHERE purpose = ?")
+                .bind(purpose.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query(
+                "INSERT INTO provider_purposes (provider_id, purpose, sort_order) VALUES (?, ?, 0)",
+            )
             .bind(&id)
             .bind(purpose.as_str())
-            .bind(purpose.as_str())
             .execute(&mut *transaction)
             .await
             .map_err(|error| error.to_string())?;
-    }
-    sqlx::query("INSERT INTO models (id, provider_id, request_name, alias, source, capability_reasoning, capability_web, capability_tools, test_status, sort_order) SELECT 'model_' || lower(hex(randomblob(16))), ?, request_name, alias, source, capability_reasoning, capability_web, capability_tools, 'untested', sort_order FROM models WHERE provider_id = ?")
+        } else {
+            sqlx::query("INSERT INTO provider_purposes (provider_id, purpose, sort_order) VALUES (?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM provider_purposes WHERE purpose = ?), 0))")
+                .bind(&id)
+                .bind(purpose.as_str())
+                .bind(purpose.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        sqlx::query("INSERT INTO models (id, provider_id, request_name, alias, source, capability_reasoning, capability_web, capability_tools, test_status, sort_order) SELECT 'model_' || lower(hex(randomblob(16))), ?, request_name, alias, source, capability_reasoning, capability_web, capability_tools, 'untested', sort_order FROM models WHERE provider_id = ?")
         .bind(&id)
         .bind(provider_id)
         .execute(&mut *transaction)
         .await
         .map_err(|error| error.to_string())?;
-    sqlx::query(
-        "INSERT INTO model_capability_overrides (model_id, capability_id, value_json)
+        sqlx::query(
+            "INSERT INTO model_capability_overrides (model_id, capability_id, value_json)
          SELECT copied.id, overrides.capability_id, overrides.value_json
          FROM models source
          JOIN model_capability_overrides overrides ON overrides.model_id = source.id
          JOIN models copied
            ON copied.provider_id = ? AND copied.request_name = source.request_name
          WHERE source.provider_id = ?",
-    )
-    .bind(&id)
-    .bind(provider_id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|error| error.to_string())?;
-    transaction
-        .commit()
+        )
+        .bind(&id)
+        .bind(provider_id)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| error.to_string())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = database_result {
+        let cleanup = cleanup_copied_provider_secrets(
+            &credential_ref,
+            &headers_ref,
+            wrote_credential,
+            wrote_headers,
+        );
+        return Err(combine_operation_and_cleanup_error(error, cleanup));
+    }
     get_provider(pool, &id).await
 }
 
-fn is_mineru_provider_record(id: &str, config_json: &str) -> bool {
-    id == MINERU_PROVIDER_ID
-        || serde_json::from_str::<Value>(config_json)
-            .ok()
-            .and_then(|value| value.get("mineru").cloned())
-            .is_some()
+fn cleanup_copied_provider_secrets(
+    credential_ref: &str,
+    headers_ref: &str,
+    wrote_credential: bool,
+    wrote_headers: bool,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if wrote_credential {
+        if let Err(error) = secrets::delete(credential_ref) {
+            errors.push(format!("credential cleanup failed: {error}"));
+        }
+    }
+    if wrote_headers {
+        if let Err(error) = secrets::delete(headers_ref) {
+            errors.push(format!("header cleanup failed: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn combine_operation_and_cleanup_error(
+    operation_error: String,
+    cleanup: Result<(), String>,
+) -> String {
+    match cleanup {
+        Ok(()) => operation_error,
+        Err(cleanup_error) => format!("{operation_error}; {cleanup_error}"),
+    }
 }
 
 async fn next_copy_name(
@@ -2185,25 +2435,67 @@ pub async fn runtime_config(pool: &SqlitePool, id: &str) -> Result<ProviderRunti
         Some(reference) => secrets::read(&reference)?,
         None => None,
     };
-    let custom_headers =
-        match headers_ref.and_then(|reference| secrets::read(&reference).ok().flatten()) {
-            Some(json) => {
-                let object: serde_json::Map<String, serde_json::Value> =
-                    serde_json::from_str(&json).map_err(|error| error.to_string())?;
-                object
-                    .into_iter()
-                    .filter_map(|(key, value)| value.as_str().map(|text| (key, text.to_string())))
-                    .collect()
+    let credential_mask: Option<String> = row.get("credential_mask");
+    if credential_mask.is_some() && credential.is_none() {
+        return Err(format!(
+            "Provider {id} credential metadata exists but the credential is missing"
+        ));
+    }
+    let header_keys_json: String = row.get("header_keys_json");
+    let header_keys = parse_header_keys(id, &header_keys_json)?;
+    let headers_secret = match headers_ref {
+        Some(reference) => secrets::read(&reference)?,
+        None => None,
+    };
+    if !header_keys.is_empty() && headers_secret.is_none() {
+        return Err(format!(
+            "Provider {id} header metadata exists but the header secret is missing"
+        ));
+    }
+    let custom_headers = match headers_secret {
+        Some(json) => {
+            let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json)
+                .map_err(|error| format!("Provider {id} header secret JSON is invalid: {error}"))?;
+            let mut headers = Vec::with_capacity(object.len());
+            for (key, value) in object {
+                let value = value.as_str().ok_or_else(|| {
+                    format!("Provider {id} custom header {key} must have a string value")
+                })?;
+                headers.push((key, value.to_string()));
             }
-            None => Vec::new(),
-        };
+            let mut actual_keys = headers
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            actual_keys.sort();
+            let mut recorded_keys = header_keys;
+            recorded_keys.sort();
+            if actual_keys != recorded_keys {
+                return Err(format!(
+                    "Provider {id} custom header metadata does not match its stored secret"
+                ));
+            }
+            headers
+        }
+        None => Vec::new(),
+    };
     let descriptor = registered_descriptor(row.get::<String, _>("protocol").as_str())?;
     let config_json: String = row.get("config_json");
+    let config = parse_provider_config(id, &config_json)?;
+    let mineru = id == MINERU_PROVIDER_ID || config.get("mineru").is_some();
+    let config = provider_config_with_defaults(descriptor, config, mineru)?;
+    let issues = config_issues(&config, descriptor.config_fields);
+    if !issues.is_empty() {
+        return Err(format!(
+            "Provider {id} config is invalid: {}",
+            crate::providers::config_schema::format_issues(&issues)
+        ));
+    }
     Ok(ProviderRuntimeConfig {
         protocol: ProtocolId::registered(descriptor.id),
         base_url: row.get("base_url"),
         use_raw_base_url: row.get::<i64, _>("use_raw_base_url") != 0,
-        config: serde_json::from_str(&config_json).unwrap_or_else(|_| json!({})),
+        config,
         credential,
         custom_headers,
     })
@@ -2236,9 +2528,9 @@ mod tests {
         AddModelInput, AssistantIconKind, CopyAssistantInput, CopyProviderInput,
         CreateAssistantInput, CreateProviderInput, ImportVertexAiServiceAccountInput, ProtocolId,
         ProviderPurpose, ReorderAssistantsInput, ReorderProvidersInput,
-        UpdateAssistantCustomParametersInput, UpdateAssistantPromptInput,
-        UpdateAssistantSettingsInput, UpdateModelInput, UpdateProviderConfigInput,
-        UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
+        RepairProviderProtocolInput, UpdateAssistantCustomParametersInput,
+        UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
+        UpdateProviderConfigInput, UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
     };
 
     #[tokio::test]
@@ -2247,11 +2539,17 @@ mod tests {
             std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
         let pool = connect(&path).await.expect("initial connect");
         let provider_id = new_id("provider");
-        sqlx::query("INSERT INTO providers (id, name, protocol, base_url) VALUES (?, ?, ?, ?)")
+        let credential_ref = format!("test/{provider_id}/credential");
+        let headers_ref = format!("test/{provider_id}/headers");
+        sqlx::query("INSERT INTO providers (id, name, protocol, base_url, config_json, credential_ref, headers_ref, header_keys_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&provider_id)
             .bind("Retired provider")
             .bind("retired-chat-v0")
             .bind("https://retired.invalid")
+            .bind(r#"{"legacy":{"keep":true}}"#)
+            .bind(&credential_ref)
+            .bind(&headers_ref)
+            .bind(r#"["X-Legacy"]"#)
             .execute(&pool)
             .await
             .expect("insert unknown provider");
@@ -2263,10 +2561,11 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert provider purpose");
+        let model_id = new_id("model");
         sqlx::query(
-            "INSERT INTO models (id, provider_id, request_name, alias) VALUES (?, ?, ?, ?)",
+            "INSERT INTO models (id, provider_id, request_name, alias, test_status, latency_ms, tested_at, test_error) VALUES (?, ?, ?, ?, 'success', 42, '2026-08-02', 'old')",
         )
-        .bind(new_id("model"))
+        .bind(&model_id)
         .bind(&provider_id)
         .bind("retired-model")
         .bind("Retired model")
@@ -2295,6 +2594,9 @@ mod tests {
         assert!(provider.protocol.is_unknown());
         assert_eq!(provider.protocol_status, ProtocolStatus::Unknown);
         assert_eq!(provider.protocol_raw_id.as_deref(), Some("retired-chat-v0"));
+        assert!(provider.enabled);
+        assert_eq!(provider.config.pointer("/legacy/keep"), Some(&json!(true)));
+        assert_eq!(provider.custom_header_keys, vec!["X-Legacy"]);
         assert!(provider.models[0].supported_thinking_efforts.is_empty());
         assert!(runtime_config(&pool, &provider_id).await.is_err());
         assert!(set_provider_enabled(
@@ -2307,20 +2609,343 @@ mod tests {
         .await
         .is_err());
 
-        let repaired = update_provider_metadata(
+        update_provider_metadata(
             &pool,
             UpdateProviderMetadataInput {
                 id: provider_id.clone(),
                 name: "Repaired provider".into(),
-                protocol: ProtocolId::registered("openai-chat"),
                 avatar: None,
+            },
+        )
+        .await
+        .expect("update provider metadata");
+        let repaired = repair_provider_protocol(
+            &pool,
+            RepairProviderProtocolInput {
+                id: provider_id.clone(),
+                protocol: ProtocolId::registered("test-seventh"),
             },
         )
         .await
         .expect("repair protocol");
         assert_eq!(repaired.protocol_status, ProtocolStatus::Available);
         assert_eq!(repaired.protocol_raw_id, None);
-        assert_eq!(repaired.protocol.as_str(), "openai-chat");
+        assert_eq!(repaired.protocol.as_str(), "test-seventh");
+        assert!(!repaired.enabled);
+        assert_eq!(repaired.config.pointer("/legacy/keep"), Some(&json!(true)));
+        assert_eq!(repaired.config.pointer("/mode"), Some(&json!("fast")));
+        assert_eq!(repaired.models[0].test_status, "untested");
+        assert_eq!(repaired.models[0].latency_ms, None);
+        assert_eq!(repaired.models[0].tested_at, None);
+        assert_eq!(repaired.models[0].test_error, None);
+        let preserved_refs: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT credential_ref, headers_ref FROM providers WHERE id = ?")
+                .bind(&provider_id)
+                .fetch_one(&pool)
+                .await
+                .expect("preserved secret references");
+        assert_eq!(preserved_refs.0.as_deref(), Some(credential_ref.as_str()));
+        assert_eq!(preserved_refs.1.as_deref(), Some(headers_ref.as_str()));
+        let second_repair = repair_provider_protocol(
+            &pool,
+            RepairProviderProtocolInput {
+                id: provider_id.clone(),
+                protocol: ProtocolId::registered("openai-chat"),
+            },
+        )
+        .await
+        .expect_err("known protocol cannot be changed through repair");
+        assert!(second_repair.contains("unknown protocols"));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_protocol_schema_defaults_flow_through_storage_updates_and_runtime() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let provider = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Schema provider".into(),
+                protocol: ProtocolId::registered("test-seventh"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create test protocol provider");
+        assert!(provider.config_issues.is_empty());
+        assert_eq!(provider.config.pointer("/mode"), Some(&json!("fast")));
+        assert_eq!(provider.config.pointer("/label"), Some(&json!("seventh")));
+        assert_eq!(provider.config.pointer("/limits/retries"), Some(&json!(3)));
+        assert_eq!(
+            provider.config.pointer("/features/cache"),
+            Some(&json!(true))
+        );
+
+        let persisted: Value = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>("SELECT config_json FROM providers WHERE id = ?")
+                .bind(&provider.id)
+                .fetch_one(&pool)
+                .await
+                .expect("persisted config"),
+        )
+        .expect("valid persisted config");
+        assert_eq!(persisted, provider.config);
+
+        sqlx::query("UPDATE providers SET config_json = ? WHERE id = ?")
+            .bind(r#"{"unknown":{"kept":true}}"#)
+            .bind(&provider.id)
+            .execute(&pool)
+            .await
+            .expect("simulate legacy config");
+        let hydrated = get_provider(&pool, &provider.id)
+            .await
+            .expect("hydrate legacy config");
+        assert_eq!(hydrated.config.pointer("/mode"), Some(&json!("fast")));
+        assert_eq!(hydrated.config.pointer("/unknown/kept"), Some(&json!(true)));
+        let raw_after_read: Value = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>("SELECT config_json FROM providers WHERE id = ?")
+                .bind(&provider.id)
+                .fetch_one(&pool)
+                .await
+                .expect("config after read"),
+        )
+        .expect("valid config after read");
+        assert!(raw_after_read.get("mode").is_none());
+        let runtime = runtime_config(&pool, &provider.id)
+            .await
+            .expect("runtime config hydrates defaults");
+        assert_eq!(runtime.config.pointer("/mode"), Some(&json!("fast")));
+
+        let updated = update_provider_config(
+            &pool,
+            UpdateProviderConfigInput {
+                id: provider.id.clone(),
+                base_url: provider.base_url.clone(),
+                use_raw_base_url: false,
+                config: Some(json!({
+                    "mode": "quality",
+                    "label": "custom",
+                    "limits": {"retries": 5},
+                    "features": {"cache": false},
+                    "unknown": {"kept": true}
+                })),
+            },
+        )
+        .await
+        .expect("save valid schema config");
+        assert_eq!(updated.config.pointer("/mode"), Some(&json!("quality")));
+        assert_eq!(updated.config.pointer("/unknown/kept"), Some(&json!(true)));
+
+        for invalid in [
+            json!({"mode": "", "limits": {"retries": 5}, "features": {"cache": false}}),
+            json!({"mode": "other", "limits": {"retries": 5}, "features": {"cache": false}}),
+            json!({"mode": "fast", "limits": {"retries": "5"}, "features": {"cache": false}}),
+            json!({"mode": "fast", "limits": {"retries": 5}, "features": {"cache": "false"}}),
+        ] {
+            assert!(update_provider_config(
+                &pool,
+                UpdateProviderConfigInput {
+                    id: provider.id.clone(),
+                    base_url: provider.base_url.clone(),
+                    use_raw_base_url: false,
+                    config: Some(invalid),
+                },
+            )
+            .await
+            .is_err());
+        }
+        assert!(update_provider_config(
+            &pool,
+            UpdateProviderConfigInput {
+                id: provider.id.clone(),
+                base_url: provider.base_url.clone(),
+                use_raw_base_url: false,
+                config: Some(json!([])),
+            },
+        )
+        .await
+        .is_err());
+
+        set_provider_enabled(
+            &pool,
+            SetProviderEnabledInput {
+                id: provider.id.clone(),
+                enabled: false,
+            },
+        )
+        .await
+        .expect("disable before simulating invalid legacy config");
+        sqlx::query("UPDATE providers SET config_json = ? WHERE id = ?")
+            .bind(r#"{"mode":"","unknown":true}"#)
+            .bind(&provider.id)
+            .execute(&pool)
+            .await
+            .expect("store schema-invalid legacy config");
+        let invalid_provider = get_provider(&pool, &provider.id)
+            .await
+            .expect("invalid provider remains visible");
+        assert_eq!(invalid_provider.config_issues.len(), 1);
+        assert_eq!(invalid_provider.config_issues[0].pointer, "/mode");
+        assert!(set_provider_enabled(
+            &pool,
+            SetProviderEnabledInput {
+                id: provider.id.clone(),
+                enabled: true,
+            },
+        )
+        .await
+        .is_err());
+        assert!(runtime_config(&pool, &provider.id).await.is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn corrupt_provider_json_and_header_metadata_are_reported_with_provider_id() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let provider = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Corrupt metadata".into(),
+                protocol: ProtocolId::registered("test-seventh"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create provider");
+
+        sqlx::query("UPDATE providers SET config_json = '{broken' WHERE id = ?")
+            .bind(&provider.id)
+            .execute(&pool)
+            .await
+            .expect("corrupt config JSON");
+        for error in [
+            get_provider(&pool, &provider.id)
+                .await
+                .expect_err("view must reject corrupt config"),
+            runtime_config(&pool, &provider.id)
+                .await
+                .expect_err("runtime must reject corrupt config"),
+        ] {
+            assert!(error.contains(&provider.id));
+            assert!(error.contains("config JSON"));
+        }
+
+        sqlx::query(
+            "UPDATE providers SET config_json = '{}', header_keys_json = '{broken' WHERE id = ?",
+        )
+        .bind(&provider.id)
+        .execute(&pool)
+        .await
+        .expect("corrupt header metadata");
+        for error in [
+            get_provider(&pool, &provider.id)
+                .await
+                .expect_err("view must reject corrupt header metadata"),
+            runtime_config(&pool, &provider.id)
+                .await
+                .expect_err("runtime must reject corrupt header metadata"),
+        ] {
+            assert!(error.contains(&provider.id));
+            assert!(error.contains("header key JSON"));
+        }
+
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn provider_copy_rejects_missing_secrets_and_cleans_up_after_database_failure() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let source = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Credential source".into(),
+                protocol: ProtocolId::registered("openai-chat"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create source");
+        sqlx::query("UPDATE providers SET credential_mask = 'masked' WHERE id = ?")
+            .bind(&source.id)
+            .execute(&pool)
+            .await
+            .expect("simulate missing source credential");
+        let missing = copy_provider(
+            &pool,
+            CopyProviderInput {
+                provider_id: source.id.clone(),
+                purpose: ProviderPurpose::Glossary,
+            },
+        )
+        .await
+        .expect_err("missing source secret must reject copy");
+        assert!(missing.contains("credential is missing"));
+
+        replace_credential(&pool, &source.id, Some("copy-secret".into()))
+            .await
+            .expect("store unique source credential");
+        replace_headers(
+            &pool,
+            &source.id,
+            Some(json!({"X-Test-Copy": "header-secret"}).to_string()),
+        )
+        .await
+        .expect("store unique source headers");
+        let target_id = new_id("provider-copy-failure-test");
+        let target_credential_ref = format!("provider/{target_id}/credential");
+        let target_headers_ref = format!("provider/{target_id}/headers");
+        sqlx::query(
+            "CREATE TRIGGER fail_provider_copy BEFORE INSERT ON providers BEGIN SELECT RAISE(ABORT, 'forced provider copy failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("create failure trigger");
+        let copy_result = clone_provider_with_id(
+            &pool,
+            &source.id,
+            ProviderPurpose::Glossary,
+            None,
+            false,
+            target_id.clone(),
+        )
+        .await;
+        let target_credential = secrets::read(&target_credential_ref);
+        let target_headers = secrets::read(&target_headers_ref);
+        let source_credential_ref = format!("provider/{}/credential", source.id);
+        let source_headers_ref = format!("provider/{}/headers", source.id);
+        let _ = secrets::delete(&source_credential_ref);
+        let _ = secrets::delete(&source_headers_ref);
+        let _ = secrets::delete(&target_credential_ref);
+        let _ = secrets::delete(&target_headers_ref);
+
+        let error = copy_result.expect_err("database failure must reject copy");
+        assert!(error.contains("forced provider copy failure"));
+        assert_eq!(target_credential.expect("read target credential"), None);
+        assert_eq!(target_headers.expect("read target headers"), None);
+        let target_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(&pool)
+            .await
+            .expect("target row count");
+        assert_eq!(target_count, 0);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -2620,12 +3245,17 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
         let pool = connect(&path).await.expect("connect");
-        let agent_platform = list_providers(&pool, Some(ProviderPurpose::Translation))
-            .await
-            .expect("providers")
-            .into_iter()
-            .find(|provider| provider.id == AGENT_PLATFORM_PROVIDER_ID)
-            .expect("agent platform provider");
+        let agent_platform = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Unique Agent Platform Test".into(),
+                protocol: ProtocolId::registered("vertex-ai"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create unique agent platform provider");
 
         let imported = import_vertex_ai_service_account(
             &pool,
@@ -2860,7 +3490,6 @@ mod tests {
             UpdateProviderMetadataInput {
                 id: builtin.id.clone(),
                 name: "Changed".into(),
-                protocol: ProtocolId::registered("openai-chat"),
                 avatar: None,
             },
         )

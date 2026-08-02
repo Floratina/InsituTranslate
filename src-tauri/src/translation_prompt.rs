@@ -233,11 +233,11 @@ fn format_context_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::{
+    use crate::domain::{UnifiedChatRequest, UnifiedContent};
+    use crate::providers::test_support::{
         build_anthropic_body, build_gemini_body, build_ollama_body, build_openai_chat_body,
         build_openai_responses_body,
     };
-    use crate::domain::{UnifiedChatRequest, UnifiedContent};
     use crate::task_prompt::{ContentFormat, DocumentFormat, TARGET_LANGUAGE_PLACEHOLDER};
     use serde_json::{json, Value};
 

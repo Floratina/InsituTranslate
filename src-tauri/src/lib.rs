@@ -1,4 +1,3 @@
-mod adapters;
 mod commands;
 mod db;
 mod diagnostics;
@@ -34,6 +33,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            providers::registry::validate_registry()
+                .map_err(|error| format!("Invalid provider protocol registry: {error}"))?;
             let app_data = app
                 .path()
                 .app_data_dir()
@@ -139,6 +140,7 @@ pub fn run() {
             commands::import_vertex_ai_service_account,
             commands::get_vertex_ai_private_key,
             commands::update_provider_metadata,
+            commands::repair_provider_protocol,
             commands::set_provider_enabled,
             commands::reorder_providers,
             commands::copy_provider,
@@ -150,8 +152,6 @@ pub fn run() {
             commands::update_model,
             commands::delete_model,
             commands::test_model_connectivity,
-            commands::runtime_chat,
-            commands::runtime_chat_stream,
             commands::create_translation_task,
             commands::start_translation_task_creation,
             commands::cancel_translation_task_creation,

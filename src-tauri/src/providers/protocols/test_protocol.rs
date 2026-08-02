@@ -65,7 +65,7 @@ impl ProtocolCodec for TestProtocolCodec {
     }
 
     fn new_stream_decoder(&self) -> Box<dyn ProtocolStreamDecoder> {
-        Box::new(JsonEventStreamDecoder::new(decode))
+        Box::new(JsonEventStreamDecoder::new(self.id(), decode))
     }
 
     fn infer_capabilities(&self, _base_url: &str, model_id: &str) -> ModelCapabilities {
@@ -107,6 +107,19 @@ impl ProtocolCodec for TestProtocolCodec {
             chat: append_endpoint_suffix(&config.base_url, "conversation"),
             models: Some(append_endpoint_suffix(&config.base_url, "catalog")),
         })
+    }
+
+    fn decode_error(&self, status: u16, body: &str) -> String {
+        let message = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| body.to_string());
+        format!("test-seventh HTTP {status}: {message}")
     }
 }
 

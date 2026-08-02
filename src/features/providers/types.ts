@@ -62,6 +62,11 @@ export interface ProviderConfig {
   [key: string]: unknown;
 }
 
+export interface ProviderConfigIssue {
+  pointer: string;
+  message: string;
+}
+
 export interface VertexAiProviderConfig {
   projectId: string;
   location: string;
@@ -94,6 +99,7 @@ export interface ProviderView {
   baseUrl: string;
   useRawBaseUrl: boolean;
   config: ProviderConfig;
+  configIssues: ProviderConfigIssue[];
   avatar: string | null;
   isBuiltin: boolean;
   enabled: boolean;

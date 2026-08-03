@@ -5,6 +5,7 @@ use crate::domain::{
     ProtocolId, ProviderRuntimeConfig, ThinkingConfig, ThinkingEffort, ThinkingMode,
     UnifiedContent, UnifiedMessage,
 };
+use crate::providers::protocols::anthropic;
 use crate::providers::registry::descriptor_by_id;
 use crate::providers::runtime::{ProviderChatError, ProviderChatErrorKind};
 use crate::providers::test_support::{
@@ -23,6 +24,40 @@ fn protocol_base_url(protocol: &str) -> &'static str {
         "ollama" => "http://localhost:11434/api",
         _ => unreachable!("test protocol"),
     }
+}
+
+fn anthropic_thinking_request(
+    model: &str,
+    effort: ThinkingEffort,
+    budget_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> crate::domain::UnifiedChatRequest {
+    let mut request = prompt_request();
+    request.model = model.into();
+    request.temperature = None;
+    let adaptive = [
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+    ]
+    .contains(&model);
+    request.thinking = Some(ThinkingConfig {
+        mode: if adaptive {
+            ThinkingMode::Auto
+        } else {
+            ThinkingMode::Enabled
+        },
+        budget_tokens,
+        effort: Some(effort),
+        summary: None,
+    });
+    request.max_output_tokens = max_output_tokens;
+    request
 }
 
 fn decode(protocol: &str, raw: Value) -> crate::domain::UnifiedChatResponse {
@@ -62,6 +97,9 @@ fn custom_parameters_cannot_override_protocol_prompt_fields() {
         "ollama",
     ] {
         let mut request = prompt_request();
+        if protocol == "anthropic" {
+            request.model = "claude-sonnet-4-5".into();
+        }
         request.custom_parameters = protected_custom_parameters();
         let (_, body) = adapter(protocol, protocol_base_url(protocol))
             .build_chat_request(&request)
@@ -90,7 +128,7 @@ fn custom_parameters_cannot_override_protocol_prompt_fields() {
                 assert!(body.get("tools").is_none());
             }
             "anthropic" => {
-                assert_eq!(body["model"], "stable-model");
+                assert_eq!(body["model"], "claude-sonnet-4-5");
                 assert_eq!(body.pointer("/system/0/text"), Some(&json!(SYSTEM_TEXT)));
                 assert_eq!(
                     body.pointer("/messages/0/content/0/text"),
@@ -188,7 +226,6 @@ fn structured_sampling_thinking_and_search_override_custom_attempts() {
     for protocol in [
         "openai-chat",
         "openai-responses",
-        "anthropic",
         "gemini",
         "vertex-ai",
         "ollama",
@@ -197,7 +234,6 @@ fn structured_sampling_thinking_and_search_override_custom_attempts() {
         request.model = match protocol {
             "openai-chat" => "gpt-5-search-api",
             "openai-responses" => "gpt-5",
-            "anthropic" => "claude-sonnet-4",
             "gemini" | "vertex-ai" => "gemini-2.5-pro",
             "ollama" => "qwen3",
             _ => unreachable!(),
@@ -243,15 +279,6 @@ fn structured_sampling_thinking_and_search_override_custom_attempts() {
                 assert_eq!(body["top_p"], 0.75);
                 assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("low")));
                 assert_eq!(body.pointer("/tools/0/type"), Some(&json!("web_search")));
-            }
-            "anthropic" => {
-                assert_eq!(body["temperature"], 0.25);
-                assert_eq!(body["top_p"], 0.75);
-                assert_eq!(body.pointer("/thinking/type"), Some(&json!("enabled")));
-                assert_eq!(
-                    body.pointer("/tools/0/type"),
-                    Some(&json!("web_search_20250305"))
-                );
             }
             "gemini" | "vertex-ai" => {
                 assert_eq!(
@@ -355,6 +382,8 @@ fn logprobs_requests_obey_protocol_and_provider_capabilities() {
         gemini.pointer("/generationConfig/responseLogprobs"),
         Some(&json!(true))
     );
+    request.model = "claude-sonnet-4-20250514".into();
+    request.thinking = None;
     assert!(build_anthropic_body(&request).get("logprobs").is_none());
 }
 
@@ -532,6 +561,8 @@ fn response_decoders_preserve_reasoning_thoughts_usage_and_logprobs() {
 #[test]
 fn anthropic_roles_and_openai_history_thinking_keep_legacy_behavior() {
     let mut anthropic_request = request();
+    anthropic_request.model = "claude-sonnet-4-20250514".into();
+    anthropic_request.thinking = None;
     anthropic_request.messages.insert(
         0,
         UnifiedMessage {
@@ -561,6 +592,535 @@ fn anthropic_roles_and_openai_history_thinking_keep_legacy_behavior() {
     assert!(!messages
         .iter()
         .any(|message| message.get("content") == Some(&json!("hidden plan"))));
+}
+
+#[test]
+fn anthropic_model_profiles_drive_capabilities_and_thinking_dialects() {
+    let codec = descriptor_by_id("anthropic")
+        .expect("valid registry")
+        .expect("Anthropic descriptor")
+        .codec;
+
+    let manual = codec.infer_capabilities("https://api.anthropic.com", "claude-sonnet-4-5");
+    assert!(manual.reasoning);
+    assert_eq!(
+        manual.thinking_efforts,
+        vec![
+            ThinkingEffort::None,
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+        ]
+    );
+
+    let opus_47 = codec.infer_capabilities("https://api.anthropic.com", "claude-opus-4-7");
+    assert!(opus_47.reasoning);
+    assert!(opus_47.thinking_efforts.contains(&ThinkingEffort::Xhigh));
+    assert!(opus_47.thinking_efforts.contains(&ThinkingEffort::Max));
+    assert!(!opus_47.thinking_efforts.contains(&ThinkingEffort::Minimal));
+
+    let unknown = codec.infer_capabilities("https://api.anthropic.com", "claude-opus-4-9");
+    assert!(!unknown.reasoning);
+    assert_eq!(unknown.thinking_efforts, vec![ThinkingEffort::None]);
+
+    let manual_mapping = codec
+        .resolve_thinking(
+            "https://api.anthropic.com",
+            "claude-opus-4-5",
+            ThinkingEffort::Medium,
+        )
+        .expect("manual effort mapping");
+    assert_eq!(manual_mapping.mode, ThinkingMode::Enabled);
+    assert_eq!(manual_mapping.budget_tokens, Some(16_000));
+    let adaptive_mapping = codec
+        .resolve_thinking(
+            "https://api.anthropic.com",
+            "claude-sonnet-4-6",
+            ThinkingEffort::Max,
+        )
+        .expect("adaptive effort mapping");
+    assert_eq!(adaptive_mapping.mode, ThinkingMode::Auto);
+    assert_eq!(adaptive_mapping.budget_tokens, None);
+
+    let manual = anthropic::build_body(&anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        None,
+    ))
+    .expect("manual thinking request");
+    assert_eq!(
+        manual["thinking"],
+        json!({"type": "enabled", "budget_tokens": 2048})
+    );
+    assert_eq!(manual["max_tokens"], 6144);
+    assert!(manual.pointer("/output_config/effort").is_none());
+
+    let manual_high = anthropic::build_body(&anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::High,
+        Some(32_000),
+        None,
+    ))
+    .expect("manual high thinking request");
+    assert_eq!(manual_high["thinking"]["budget_tokens"], 32_000);
+    assert_eq!(manual_high["max_tokens"], 36_096);
+
+    let opus_45 = anthropic::build_body(&anthropic_thinking_request(
+        "claude-opus-4-5",
+        ThinkingEffort::Medium,
+        Some(4096),
+        Some(8192),
+    ))
+    .expect("Opus 4.5 thinking request");
+    assert_eq!(opus_45.pointer("/thinking/type"), Some(&json!("enabled")));
+    assert_eq!(
+        opus_45.pointer("/output_config/effort"),
+        Some(&json!("medium"))
+    );
+
+    let adaptive = anthropic::build_body(&anthropic_thinking_request(
+        "claude-sonnet-4-6",
+        ThinkingEffort::Max,
+        None,
+        Some(64_000),
+    ))
+    .expect("adaptive thinking request");
+    assert_eq!(adaptive["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(
+        adaptive.pointer("/output_config/effort"),
+        Some(&json!("max"))
+    );
+
+    let opus_47 = anthropic::build_body(&anthropic_thinking_request(
+        "claude-opus-4-7",
+        ThinkingEffort::Xhigh,
+        None,
+        Some(64_000),
+    ))
+    .expect("Opus 4.7 adaptive thinking request");
+    assert_eq!(opus_47["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(
+        opus_47.pointer("/output_config/effort"),
+        Some(&json!("xhigh"))
+    );
+}
+
+#[test]
+fn anthropic_structured_values_override_custom_thinking_and_output_fields() {
+    let mut request = anthropic_thinking_request(
+        "claude-opus-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(8192),
+    );
+    request.top_p = Some(0.95);
+    request.web_search = true;
+    request.custom_parameters = json!({
+        "max_tokens": 2048,
+        "temperature": 0.5,
+        "top_p": 0.2,
+        "thinking": {"type": "disabled"},
+        "output_config": {"effort": "high", "format": {"type": "json_schema"}},
+        "tools": []
+    });
+
+    let body = anthropic::build_body(&request).expect("valid structured request");
+    assert_eq!(body["max_tokens"], 8192);
+    assert!(body.get("temperature").is_none());
+    assert_eq!(body["top_p"], 0.95);
+    assert_eq!(body.pointer("/thinking/type"), Some(&json!("enabled")));
+    assert_eq!(body.pointer("/output_config/effort"), Some(&json!("low")));
+    assert_eq!(
+        body.pointer("/output_config/format/type"),
+        Some(&json!("json_schema"))
+    );
+    assert_eq!(
+        body.pointer("/tools/0/type"),
+        Some(&json!("web_search_20250305"))
+    );
+}
+
+#[test]
+fn anthropic_output_limit_precedence_uses_structured_then_custom_then_automatic() {
+    let automatic = anthropic::build_body(&anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        None,
+    ))
+    .expect("automatic budget");
+    assert_eq!(automatic["max_tokens"], 6144);
+
+    let mut custom =
+        anthropic_thinking_request("claude-sonnet-4-5", ThinkingEffort::Low, Some(2048), None);
+    custom.custom_parameters = json!({"max_tokens": 7000});
+    assert_eq!(
+        anthropic::build_body(&custom).expect("custom budget")["max_tokens"],
+        7000
+    );
+
+    custom.max_output_tokens = Some(6500);
+    assert_eq!(
+        anthropic::build_body(&custom).expect("structured budget")["max_tokens"],
+        6500
+    );
+
+    custom.max_output_tokens = None;
+    custom.custom_parameters = json!({"max_tokens": 6143});
+    assert!(anthropic::build_body(&custom)
+        .expect_err("custom budget below required output")
+        .contains("require at least 6144"));
+}
+
+#[test]
+fn anthropic_rejects_unknown_thinking_and_invalid_token_plans() {
+    let unknown = anthropic_thinking_request(
+        "third-party-claude",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(8192),
+    );
+    let error = anthropic::build_body(&unknown).expect_err("unknown thinking model");
+    assert!(error.contains("unrecognized model"));
+    assert!(error.contains("disable thinking"));
+
+    let too_small = anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(1000),
+        Some(8192),
+    );
+    assert!(anthropic::build_body(&too_small)
+        .expect_err("small budget")
+        .contains("at least 1024"));
+
+    let no_visible_output = anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(2048),
+    );
+    assert!(anthropic::build_body(&no_visible_output)
+        .expect_err("budget must leave output room")
+        .contains("must be smaller than max_tokens"));
+
+    let mut custom_conflict =
+        anthropic_thinking_request("claude-sonnet-4-5", ThinkingEffort::Low, Some(2048), None);
+    custom_conflict.custom_parameters = json!({"max_tokens": 2048});
+    assert!(anthropic::build_body(&custom_conflict)
+        .expect_err("custom max conflict")
+        .contains("must be smaller than max_tokens"));
+
+    let mut invalid_custom_max = prompt_request();
+    invalid_custom_max.model = "claude-sonnet-4-5".into();
+    invalid_custom_max.custom_parameters = json!({"max_tokens": "8192"});
+    assert!(anthropic::build_body(&invalid_custom_max)
+        .expect_err("custom max type")
+        .contains("must be a positive integer"));
+
+    let adaptive_budget = anthropic_thinking_request(
+        "claude-sonnet-4-6",
+        ThinkingEffort::High,
+        Some(2048),
+        Some(8192),
+    );
+    assert!(anthropic::build_body(&adaptive_budget)
+        .expect_err("adaptive budget")
+        .contains("does not accept budget_tokens"));
+
+    let ceiling = anthropic_thinking_request(
+        "claude-haiku-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(64_001),
+    );
+    assert!(anthropic::build_body(&ceiling)
+        .expect_err("known output ceiling")
+        .contains("64000-token output limit"));
+
+    let mut manual_wrong_mode = anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(8192),
+    );
+    manual_wrong_mode.thinking.as_mut().expect("thinking").mode = ThinkingMode::Auto;
+    assert!(anthropic::build_body(&manual_wrong_mode)
+        .expect_err("manual wrong mode")
+        .contains("ThinkingMode::Enabled"));
+
+    let mut adaptive_wrong_mode = anthropic_thinking_request(
+        "claude-sonnet-4-6",
+        ThinkingEffort::High,
+        None,
+        Some(36_096),
+    );
+    adaptive_wrong_mode
+        .thinking
+        .as_mut()
+        .expect("thinking")
+        .mode = ThinkingMode::Enabled;
+    assert!(anthropic::build_body(&adaptive_wrong_mode)
+        .expect_err("adaptive wrong mode")
+        .contains("ThinkingMode::Auto"));
+}
+
+#[test]
+fn anthropic_rejects_sampling_combinations_the_api_does_not_support() {
+    let mut manual_temperature = anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(8192),
+    );
+    manual_temperature.temperature = Some(0.2);
+    assert!(anthropic::build_body(&manual_temperature)
+        .expect_err("manual thinking temperature")
+        .contains("incompatible with temperature"));
+
+    let mut manual_top_p = anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(8192),
+    );
+    manual_top_p.top_p = Some(0.94);
+    assert!(anthropic::build_body(&manual_top_p)
+        .expect_err("manual thinking top_p")
+        .contains("0.95 through 1"));
+
+    let mut manual_top_k = anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(8192),
+    );
+    manual_top_k.custom_parameters = json!({"top_k": 20});
+    assert!(anthropic::build_body(&manual_top_k)
+        .expect_err("manual thinking top_k")
+        .contains("incompatible with top_k"));
+
+    let mut haiku = prompt_request();
+    haiku.model = "claude-haiku-4-5".into();
+    haiku.temperature = Some(0.2);
+    haiku.top_p = Some(0.9);
+    assert!(anthropic::build_body(&haiku)
+        .expect_err("Haiku sampling combination")
+        .contains("cannot use temperature and top_p together"));
+
+    let mut opus_47 =
+        anthropic_thinking_request("claude-opus-4-7", ThinkingEffort::Xhigh, None, Some(64_000));
+    opus_47.temperature = Some(0.2);
+    assert!(anthropic::build_body(&opus_47)
+        .expect_err("4.7 sampling")
+        .contains("does not accept non-default"));
+
+    let mut sonnet_46_without_thinking = prompt_request();
+    sonnet_46_without_thinking.model = "claude-sonnet-4-6".into();
+    sonnet_46_without_thinking.temperature = Some(0.2);
+    assert!(anthropic::build_body(&sonnet_46_without_thinking).is_ok());
+
+    let mut opus_47_default_sampling = prompt_request();
+    opus_47_default_sampling.model = "claude-opus-4-7".into();
+    opus_47_default_sampling.temperature = Some(1.0);
+    opus_47_default_sampling.top_p = Some(1.0);
+    assert!(anthropic::build_body(&opus_47_default_sampling).is_ok());
+
+    let mut invalid_temperature = prompt_request();
+    invalid_temperature.model = "claude-sonnet-4-5".into();
+    invalid_temperature.temperature = Some(1.1);
+    assert!(anthropic::build_body(&invalid_temperature)
+        .expect_err("temperature range")
+        .contains("from 0 through 1"));
+}
+
+#[test]
+fn anthropic_preflight_and_body_validate_only_effective_sampling_fields() {
+    let codec = descriptor_by_id("anthropic")
+        .expect("valid registry")
+        .expect("Anthropic descriptor")
+        .codec;
+    let mut request = anthropic_thinking_request(
+        "claude-sonnet-4-5",
+        ThinkingEffort::Low,
+        Some(2048),
+        Some(8192),
+    );
+    request.custom_parameters = json!({
+        "temperature": 0.2,
+        "top_p": 0.2
+    });
+
+    codec
+        .validate_chat_options(
+            "https://api.anthropic.com",
+            &request.model,
+            request.thinking.as_ref(),
+            request.temperature,
+            request.top_p,
+            &request.custom_parameters,
+        )
+        .expect("protected custom sampling fields do not affect preflight");
+    let body = anthropic::build_body(&request).expect("protected custom sampling fields");
+    assert!(body.get("temperature").is_none());
+    assert!(body.get("top_p").is_none());
+
+    request.custom_parameters = json!({
+        "temperature": 0.2,
+        "top_p": 0.2,
+        "top_k": 20
+    });
+    let preflight_error = codec
+        .validate_chat_options(
+            "https://api.anthropic.com",
+            &request.model,
+            request.thinking.as_ref(),
+            request.temperature,
+            request.top_p,
+            &request.custom_parameters,
+        )
+        .expect_err("effective custom top_k must fail preflight");
+    let body_error = anthropic::build_body(&request).expect_err("effective custom top_k must fail");
+    assert_eq!(preflight_error, body_error);
+    assert!(preflight_error.contains("top_k"));
+}
+
+#[test]
+fn claude_five_default_and_required_thinking_follow_the_exact_profile() {
+    let codec = descriptor_by_id("anthropic")
+        .expect("valid registry")
+        .expect("Anthropic descriptor")
+        .codec;
+    let fable = codec.infer_capabilities("https://api.anthropic.com", "claude-fable-5");
+    assert!(fable.thinking_required);
+    assert_eq!(fable.default_thinking_effort, Some(ThinkingEffort::High));
+    assert!(!fable.thinking_efforts.contains(&ThinkingEffort::None));
+
+    let opus = codec.infer_capabilities("https://api.anthropic.com", "claude-opus-5");
+    assert!(!opus.thinking_required);
+    assert_eq!(opus.default_thinking_effort, Some(ThinkingEffort::High));
+    assert!(opus.thinking_efforts.contains(&ThinkingEffort::None));
+
+    let mut omitted = prompt_request();
+    omitted.model = "claude-fable-5".into();
+    omitted.temperature = None;
+    let omitted_body = anthropic::build_body(&omitted).expect("always-on omitted thinking");
+    assert!(omitted_body.get("thinking").is_none());
+    assert_eq!(omitted_body["max_tokens"], 36_096);
+
+    let mut always_on_disabled = omitted.clone();
+    always_on_disabled.thinking = Some(ThinkingConfig {
+        mode: ThinkingMode::Disabled,
+        budget_tokens: None,
+        effort: Some(ThinkingEffort::None),
+        summary: None,
+    });
+    assert!(anthropic::build_body(&always_on_disabled)
+        .expect_err("always-on disabled")
+        .contains("always on"));
+
+    let mut opus_disabled = omitted.clone();
+    opus_disabled.model = "claude-opus-5".into();
+    opus_disabled.thinking = Some(ThinkingConfig {
+        mode: ThinkingMode::Disabled,
+        budget_tokens: None,
+        effort: Some(ThinkingEffort::High),
+        summary: None,
+    });
+    assert_eq!(
+        anthropic::build_body(&opus_disabled).expect("Opus 5 high disabled")["thinking"],
+        json!({"type": "disabled"})
+    );
+
+    opus_disabled.thinking.as_mut().expect("thinking").effort = Some(ThinkingEffort::Max);
+    assert!(anthropic::build_body(&opus_disabled)
+        .expect_err("Opus 5 max disabled")
+        .contains("cannot disable thinking"));
+
+    let mut sonnet_disabled = opus_disabled;
+    sonnet_disabled.model = "claude-sonnet-5".into();
+    sonnet_disabled.thinking.as_mut().expect("thinking").effort = Some(ThinkingEffort::None);
+    assert_eq!(
+        anthropic::build_body(&sonnet_disabled).expect("Sonnet 5 disabled")["thinking"],
+        json!({"type": "disabled"})
+    );
+
+    let mut default_temperature = omitted;
+    default_temperature.temperature = Some(1.0);
+    assert!(anthropic::build_body(&default_temperature).is_ok());
+}
+
+#[test]
+fn anthropic_preserves_signature_only_thinking_blocks() {
+    let response = decode(
+        "anthropic",
+        json!({
+            "content": [{"type": "thinking", "thinking": "", "signature": "sig"}],
+            "stop_reason": "end_turn"
+        }),
+    );
+    assert_eq!(response.reasoning, "");
+    assert!(matches!(
+        response.thinking.as_slice(),
+        [UnifiedContent::Thinking { text, signature: Some(signature), encrypted_data: None }]
+            if text.is_empty() && signature == "sig"
+    ));
+}
+
+#[test]
+fn anthropic_role_errors_are_not_converted_to_empty_messages() {
+    let mut assistant_first = prompt_request();
+    assistant_first.model = "claude-sonnet-4-5".into();
+    assistant_first.messages = vec![UnifiedMessage {
+        role: "assistant".into(),
+        content: vec![UnifiedContent::Text {
+            text: "answer".into(),
+        }],
+    }];
+    assert!(anthropic::build_body(&assistant_first)
+        .expect_err("assistant first")
+        .contains("must have the user role"));
+
+    let mut system_only = prompt_request();
+    system_only.model = "claude-sonnet-4-5".into();
+    system_only.messages.truncate(1);
+    assert!(anthropic::build_body(&system_only)
+        .expect_err("system only")
+        .contains("must have the user role"));
+
+    let mut empty = prompt_request();
+    empty.model = "claude-sonnet-4-5".into();
+    empty.messages.clear();
+    assert!(anthropic::build_body(&empty)
+        .expect_err("empty messages")
+        .contains("must have the user role"));
+
+    let mut unknown_role = prompt_request();
+    unknown_role.model = "claude-sonnet-4-5".into();
+    unknown_role.messages = vec![UnifiedMessage {
+        role: "tool".into(),
+        content: vec![UnifiedContent::Text {
+            text: "tool output".into(),
+        }],
+    }];
+    assert!(anthropic::build_body(&unknown_role)
+        .expect_err("unknown role")
+        .contains("only support user and assistant roles"));
+
+    let mut empty_content = prompt_request();
+    empty_content.model = "claude-sonnet-4-5".into();
+    empty_content.messages[1].content.clear();
+    assert!(anthropic::build_body(&empty_content)
+        .expect_err("empty message content")
+        .contains("at least one content block"));
+
+    let mut empty_system = prompt_request();
+    empty_system.model = "claude-sonnet-4-5".into();
+    empty_system.messages[0].content.clear();
+    assert!(anthropic::build_body(&empty_system)
+        .expect_err("empty system content")
+        .contains("system messages must contain at least one content block"));
 }
 
 #[test]

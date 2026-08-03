@@ -4,13 +4,20 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Method};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
-use crate::domain::{ProviderRuntimeConfig, RemoteModel, UnifiedChatRequest, UnifiedChatResponse};
+use crate::document_parsing::count_tokens;
+use crate::domain::{
+    ProviderRuntimeConfig, RemoteModel, UnifiedChatRequest, UnifiedChatResponse, UnifiedUsage,
+    UnifiedUsageProvenance,
+};
 use crate::providers::negotiation::{
     plan_retry, write_audit, NegotiationFailure, NegotiationFailureKind,
 };
 use crate::providers::registry::{descriptor_for, AuthStrategy};
-use crate::providers::{EncodedRequest, HeaderDirective, HeaderMode, HttpMethod, ProtocolCodec};
+use crate::providers::{
+    CompletionBudget, EncodedRequest, HeaderDirective, HeaderMode, HttpMethod, ProtocolCodec,
+};
 
 pub trait ProviderAdapter {
     async fn list_models(&self) -> Result<Vec<RemoteModel>, String>;
@@ -59,6 +66,67 @@ pub struct ProviderChatMeta {
     pub finish_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatAttemptKind {
+    Primary,
+    LogprobsFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatAttemptContext {
+    pub kind: ChatAttemptKind,
+    pub logical_attempt: u32,
+    pub compatibility_retry: bool,
+}
+
+impl ChatAttemptContext {
+    pub fn compatibility_retry(self) -> Self {
+        Self {
+            compatibility_retry: true,
+            ..self
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestCost {
+    pub estimated_input_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedChatRequest {
+    pub request: UnifiedChatRequest,
+    pub encoded: EncodedRequest,
+    pub completion_budget: CompletionBudget,
+    pub cost: RequestCost,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatAttemptOutcome {
+    pub status: Option<u16>,
+    pub rate_limits: RateLimitTelemetry,
+    pub actual_total_tokens: Option<u64>,
+}
+
+pub trait ChatAttemptGate: Send + Sync {
+    type Reservation: Send;
+
+    async fn acquire(
+        &self,
+        context: ChatAttemptContext,
+        cost: RequestCost,
+        cancellation: &CancellationToken,
+    ) -> Result<Self::Reservation, String>;
+
+    async fn settle(
+        &self,
+        reservation: Self::Reservation,
+        outcome: ChatAttemptOutcome,
+    ) -> Result<(), String>;
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderChatError {
     pub status: Option<u16>,
@@ -77,6 +145,10 @@ pub enum ProviderChatErrorKind {
 }
 
 impl ProviderChatError {
+    pub fn local(message: impl Into<String>) -> Self {
+        local_request_error(message.into())
+    }
+
     pub fn is_rate_limited(&self) -> bool {
         self.status == Some(429)
     }
@@ -129,6 +201,12 @@ struct JsonResponseMeta {
     rate_limits: RateLimitTelemetry,
 }
 
+struct GatedJsonResponseMeta<R> {
+    meta: JsonResponseMeta,
+    reservation: R,
+    cost: RequestCost,
+}
+
 impl RuntimeAdapter {
     pub fn new(client: Client, config: ProviderRuntimeConfig) -> Self {
         Self { client, config }
@@ -138,11 +216,97 @@ impl RuntimeAdapter {
         Ok(descriptor_for(&self.config.protocol)?.codec)
     }
 
+    pub fn validate_and_plan_chat_request(
+        &self,
+        request: &UnifiedChatRequest,
+        visible_output_tokens: u32,
+    ) -> Result<CompletionBudget, String> {
+        let codec = self.codec()?;
+        codec.validate_chat_options(
+            &self.config.base_url,
+            &request.model,
+            request.thinking.as_ref(),
+            request.temperature,
+            request.top_p,
+            &request.custom_parameters,
+        )?;
+        codec.plan_completion_budget(
+            &self.config.base_url,
+            &request.model,
+            request.thinking.as_ref(),
+            request.max_output_tokens,
+            &request.custom_parameters,
+            visible_output_tokens,
+        )
+    }
+
+    pub fn prepare_chat_request(
+        &self,
+        request: &UnifiedChatRequest,
+        visible_output_tokens: u32,
+    ) -> Result<PreparedChatRequest, String> {
+        let completion_budget =
+            self.validate_and_plan_chat_request(request, visible_output_tokens)?;
+        let mut normalized_request = request.clone();
+        normalized_request.max_output_tokens = completion_budget.wire_max_output_tokens;
+        normalized_request.custom_parameters = completion_budget.custom_parameters.clone();
+        let encoded = self.encoded_chat_request(&normalized_request)?;
+        let cost = request_cost(&encoded, completion_budget.total_output_tokens)?;
+        Ok(PreparedChatRequest {
+            request: normalized_request,
+            encoded,
+            completion_budget,
+            cost,
+        })
+    }
+
+    pub fn output_truncation_error(
+        &self,
+        request: &UnifiedChatRequest,
+        finish_reason: &str,
+    ) -> String {
+        let max_output_tokens = request
+            .max_output_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "provider-default".to_string());
+        let thinking = request.thinking.as_ref().map_or_else(
+            || "omitted/provider-default".to_string(),
+            |thinking| {
+                format!(
+                    "mode={:?}, effort={:?}, budget_tokens={:?}",
+                    thinking.mode, thinking.effort, thinking.budget_tokens
+                )
+            },
+        );
+        format!(
+            "OUTPUT_TRUNCATED: protocol={} model=\"{}\" finish_reason={} max_output_tokens={} thinking={}",
+            self.config.protocol.as_str(),
+            request.model,
+            finish_reason,
+            max_output_tokens,
+            thinking
+        )
+    }
+
     async fn headers(&self, directives: &[HeaderDirective]) -> Result<HeaderMap, String> {
         let descriptor = descriptor_for(&self.config.protocol)?;
         let auth_strategy = descriptor.auth.strategy;
+        let vertex_token = if auth_strategy == AuthStrategy::VertexServiceAccount {
+            Some(crate::vertex_ai::access_token(&self.client, &self.config).await?)
+        } else {
+            None
+        };
+        self.build_headers(directives, vertex_token.as_deref())
+    }
+
+    fn build_headers(
+        &self,
+        directives: &[HeaderDirective],
+        vertex_token: Option<&str>,
+    ) -> Result<HeaderMap, String> {
+        let descriptor = descriptor_for(&self.config.protocol)?;
+        let auth_strategy = descriptor.auth.strategy;
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let AuthStrategy::StaticHeader { header, scheme } = auth_strategy {
             if let Some(credential) = self
                 .config
@@ -176,7 +340,9 @@ impl RuntimeAdapter {
             );
         }
         if auth_strategy == AuthStrategy::VertexServiceAccount {
-            let token = crate::vertex_ai::access_token(&self.client, &self.config).await?;
+            let token = vertex_token.ok_or_else(|| {
+                "Agent Platform OAuth token is required to construct request headers".to_string()
+            })?;
             headers.insert(
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {token}"))
@@ -192,6 +358,7 @@ impl RuntimeAdapter {
                 headers.insert(name, value);
             }
         }
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(headers)
     }
 
@@ -263,6 +430,282 @@ impl RuntimeAdapter {
             raw,
             status: status.as_u16(),
             rate_limits,
+        })
+    }
+
+    async fn request_json_with_gate<G: ChatAttemptGate>(
+        &self,
+        encoded: EncodedRequest,
+        cost: RequestCost,
+        model_id: &str,
+        gate: &G,
+        context: ChatAttemptContext,
+        cancellation: &CancellationToken,
+    ) -> Result<GatedJsonResponseMeta<G::Reservation>, ProviderChatError> {
+        let codec = self.codec().map_err(local_request_error)?;
+        let mut request = self
+            .client
+            .request(reqwest_method(encoded.method), encoded.url)
+            .headers(
+                self.headers(&encoded.headers)
+                    .await
+                    .map_err(local_request_error)?,
+            );
+        if let Some(value) = encoded.body {
+            request = request.json(&value);
+        }
+        let reservation = gate
+            .acquire(context, cost, cancellation)
+            .await
+            .map_err(|error| {
+                local_request_error(format!(
+                    "protocol={} model=\"{}\" estimated_input_tokens={} completion_tokens={} reserved_total_tokens={}: {error}",
+                    self.config.protocol.as_str(),
+                    model_id,
+                    cost.estimated_input_tokens,
+                    cost.completion_tokens,
+                    cost.total_tokens,
+                ))
+            })?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let mut chat_error = ProviderChatError {
+                    status: None,
+                    message: error.to_string(),
+                    compatibility_text: None,
+                    rate_limits: RateLimitTelemetry::default(),
+                    kind: ProviderChatErrorKind::Transport,
+                };
+                append_settlement_error(
+                    &mut chat_error,
+                    gate.settle(
+                        reservation,
+                        ChatAttemptOutcome {
+                            status: None,
+                            rate_limits: RateLimitTelemetry::default(),
+                            actual_total_tokens: None,
+                        },
+                    )
+                    .await,
+                );
+                return Err(chat_error);
+            }
+        };
+        let status = response.status();
+        let mut rate_limits = rate_limits_from_headers(response.headers());
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                let mut chat_error = ProviderChatError {
+                    status: Some(status.as_u16()),
+                    message: error.to_string(),
+                    compatibility_text: None,
+                    rate_limits: rate_limits.clone(),
+                    kind: ProviderChatErrorKind::Transport,
+                };
+                append_settlement_error(
+                    &mut chat_error,
+                    gate.settle(
+                        reservation,
+                        ChatAttemptOutcome {
+                            status: Some(status.as_u16()),
+                            rate_limits,
+                            actual_total_tokens: None,
+                        },
+                    )
+                    .await,
+                );
+                return Err(chat_error);
+            }
+        };
+        if !status.is_success() {
+            merge_retry_after_from_error_body(&mut rate_limits, &text);
+            let mut chat_error = ProviderChatError {
+                status: Some(status.as_u16()),
+                message: codec.decode_error(status.as_u16(), &text),
+                compatibility_text: Some(text),
+                rate_limits: rate_limits.clone(),
+                kind: ProviderChatErrorKind::HttpStatus,
+            };
+            append_settlement_error(
+                &mut chat_error,
+                gate.settle(
+                    reservation,
+                    ChatAttemptOutcome {
+                        status: Some(status.as_u16()),
+                        rate_limits,
+                        actual_total_tokens: None,
+                    },
+                )
+                .await,
+            );
+            return Err(chat_error);
+        }
+        let raw = match serde_json::from_str(&text) {
+            Ok(raw) => raw,
+            Err(error) => {
+                let mut chat_error = ProviderChatError {
+                    status: Some(status.as_u16()),
+                    message: format!("Invalid JSON response: {error}"),
+                    compatibility_text: None,
+                    rate_limits: rate_limits.clone(),
+                    kind: ProviderChatErrorKind::InvalidResponse,
+                };
+                append_settlement_error(
+                    &mut chat_error,
+                    gate.settle(
+                        reservation,
+                        ChatAttemptOutcome {
+                            status: Some(status.as_u16()),
+                            rate_limits,
+                            actual_total_tokens: None,
+                        },
+                    )
+                    .await,
+                );
+                return Err(chat_error);
+            }
+        };
+        Ok(GatedJsonResponseMeta {
+            meta: JsonResponseMeta {
+                raw,
+                status: status.as_u16(),
+                rate_limits,
+            },
+            reservation,
+            cost,
+        })
+    }
+
+    pub async fn send_prepared_chat_with_gate<G: ChatAttemptGate>(
+        &self,
+        prepared: &PreparedChatRequest,
+        gate: &G,
+        context: ChatAttemptContext,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderChatMeta, ProviderChatError> {
+        let gated = match self
+            .request_json_with_gate(
+                prepared.encoded.clone(),
+                prepared.cost,
+                &prepared.request.model,
+                gate,
+                context,
+                cancellation,
+            )
+            .await
+        {
+            Ok(meta) => meta,
+            Err(original_error) => {
+                let descriptor =
+                    descriptor_for(&self.config.protocol).map_err(local_request_error)?;
+                let Some(mut plan) = plan_retry(
+                    Some(descriptor.wire_family),
+                    &self.config.base_url,
+                    &prepared.request.model,
+                    &prepared.encoded,
+                    negotiation_failure(&original_error),
+                    0,
+                    !prepared.request.stream,
+                ) else {
+                    return Err(original_error);
+                };
+                let retry_cost = request_cost(
+                    &plan.request,
+                    prepared.completion_budget.total_output_tokens,
+                )
+                .map_err(local_request_error)?;
+                match self
+                    .request_json_with_gate(
+                        plan.request,
+                        retry_cost,
+                        &prepared.request.model,
+                        gate,
+                        context.compatibility_retry(),
+                        cancellation,
+                    )
+                    .await
+                {
+                    Ok(meta) => {
+                        plan.audit.record_success(meta.meta.status);
+                        write_audit(&plan.audit);
+                        meta
+                    }
+                    Err(mut retry_error) => {
+                        plan.audit.record_failure(retry_error.status);
+                        write_audit(&plan.audit);
+                        retry_error.message = format!(
+                            "Compatibility retry {} failed: {}; original error: {}",
+                            plan.audit.rule_id, retry_error.message, original_error.message
+                        );
+                        return Err(retry_error);
+                    }
+                }
+            }
+        };
+
+        let codec = self.codec().map_err(local_request_error)?;
+        let finish_reason = codec.finish_reason(&gated.meta.raw);
+        let mut response = match codec.decode_chat(gated.meta.raw) {
+            Ok(response) => response,
+            Err(message) => {
+                let mut error = ProviderChatError {
+                    status: Some(gated.meta.status),
+                    message,
+                    compatibility_text: None,
+                    rate_limits: gated.meta.rate_limits.clone(),
+                    kind: ProviderChatErrorKind::InvalidResponse,
+                };
+                append_settlement_error(
+                    &mut error,
+                    gate.settle(
+                        gated.reservation,
+                        ChatAttemptOutcome {
+                            status: Some(gated.meta.status),
+                            rate_limits: gated.meta.rate_limits,
+                            actual_total_tokens: None,
+                        },
+                    )
+                    .await,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(message) =
+            finalize_response_usage(&mut response, gated.cost.estimated_input_tokens)
+        {
+            let mut error = local_request_error(message);
+            append_settlement_error(
+                &mut error,
+                gate.settle(
+                    gated.reservation,
+                    ChatAttemptOutcome {
+                        status: Some(gated.meta.status),
+                        rate_limits: gated.meta.rate_limits,
+                        actual_total_tokens: None,
+                    },
+                )
+                .await,
+            );
+            return Err(error);
+        }
+        let actual_total_tokens = response.usage.as_ref().map(|usage| usage.total_tokens);
+        gate.settle(
+            gated.reservation,
+            ChatAttemptOutcome {
+                status: Some(gated.meta.status),
+                rate_limits: gated.meta.rate_limits.clone(),
+                actual_total_tokens,
+            },
+        )
+        .await
+        .map_err(local_request_error)?;
+        Ok(ProviderChatMeta {
+            response,
+            status: gated.meta.status,
+            rate_limits: gated.meta.rate_limits,
+            finish_reason,
         })
     }
 
@@ -387,6 +830,104 @@ impl ProviderAdapter for RuntimeAdapter {
         output.extend(decoder.finish()?);
         Ok(output)
     }
+}
+
+fn request_cost(encoded: &EncodedRequest, completion_tokens: u32) -> Result<RequestCost, String> {
+    let body = encoded
+        .body
+        .as_ref()
+        .ok_or_else(|| "Chat request body is missing".to_string())?;
+    let serialized = serde_json::to_string(body)
+        .map_err(|error| format!("Failed to serialize the final chat request body: {error}"))?;
+    let estimated_input_tokens = u64::try_from(count_tokens(&serialized))
+        .map_err(|_| "Estimated chat input token count exceeds u64".to_string())?;
+    let completion_tokens = u64::from(completion_tokens);
+    let total_tokens = estimated_input_tokens
+        .checked_add(completion_tokens)
+        .ok_or_else(|| "Estimated chat request token count overflows u64".to_string())?;
+    Ok(RequestCost {
+        estimated_input_tokens,
+        completion_tokens,
+        total_tokens,
+    })
+}
+
+fn append_settlement_error(error: &mut ProviderChatError, settlement: Result<(), String>) {
+    if let Err(settlement) = settlement {
+        error.message = format!(
+            "{}; request quota settlement failed: {settlement}",
+            error.message
+        );
+    }
+}
+
+fn finalize_response_usage(
+    response: &mut UnifiedChatResponse,
+    estimated_input_tokens: u64,
+) -> Result<(), String> {
+    let visible_estimate = u64::try_from(count_tokens(&response.text))
+        .map_err(|_| "Estimated visible output token count exceeds u64".to_string())?;
+    let thinking_estimate = u64::try_from(count_tokens(&response.reasoning))
+        .map_err(|_| "Estimated thinking token count exceeds u64".to_string())?;
+
+    match response.usage.as_mut() {
+        Some(usage) => {
+            if !usage.provenance.input_tokens_reported {
+                usage.input_tokens = estimated_input_tokens;
+            }
+            if usage.provenance.output_includes_unreported_thinking {
+                let aggregate = usage.output_tokens;
+                if thinking_estimate == 0 {
+                    usage.output_tokens = aggregate;
+                    usage.thinking_tokens = 0;
+                } else {
+                    let estimated_total = visible_estimate
+                        .checked_add(thinking_estimate)
+                        .ok_or_else(|| {
+                            "Estimated response token count overflows u64".to_string()
+                        })?;
+                    let thinking = if estimated_total == 0 {
+                        0
+                    } else {
+                        u64::try_from(
+                            (u128::from(aggregate) * u128::from(thinking_estimate))
+                                / u128::from(estimated_total),
+                        )
+                        .map_err(|_| "Estimated thinking token split exceeds u64".to_string())?
+                    };
+                    usage.thinking_tokens = thinking.min(aggregate);
+                    usage.output_tokens = aggregate - usage.thinking_tokens;
+                }
+            } else {
+                if !usage.provenance.output_tokens_reported {
+                    usage.output_tokens = visible_estimate;
+                }
+                if !usage.provenance.thinking_tokens_reported {
+                    usage.thinking_tokens = thinking_estimate;
+                }
+            }
+            usage.total_tokens = usage
+                .input_tokens
+                .checked_add(usage.output_tokens)
+                .and_then(|total| total.checked_add(usage.thinking_tokens))
+                .ok_or_else(|| "Normalized response usage overflows u64".to_string())?;
+        }
+        None => {
+            let total_tokens = estimated_input_tokens
+                .checked_add(visible_estimate)
+                .and_then(|total| total.checked_add(thinking_estimate))
+                .ok_or_else(|| "Estimated response usage overflows u64".to_string())?;
+            response.usage = Some(UnifiedUsage {
+                input_tokens: estimated_input_tokens,
+                output_tokens: visible_estimate,
+                cached_tokens: 0,
+                thinking_tokens: thinking_estimate,
+                total_tokens,
+                provenance: UnifiedUsageProvenance::default(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn finish_reason_is_truncation(reason: Option<&str>) -> bool {
@@ -618,6 +1159,65 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GateEvent {
+        Acquired {
+            context: ChatAttemptContext,
+            cost: RequestCost,
+        },
+        Settled {
+            status: Option<u16>,
+            actual_total_tokens: Option<u64>,
+        },
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingGate {
+        events: Arc<StdMutex<Vec<GateEvent>>>,
+    }
+
+    impl RecordingGate {
+        fn events(&self) -> Vec<GateEvent> {
+            self.events.lock().expect("recording gate lock").clone()
+        }
+    }
+
+    impl ChatAttemptGate for RecordingGate {
+        type Reservation = ();
+
+        async fn acquire(
+            &self,
+            context: ChatAttemptContext,
+            cost: RequestCost,
+            cancellation: &CancellationToken,
+        ) -> Result<Self::Reservation, String> {
+            if cancellation.is_cancelled() {
+                return Err("cancelled before reservation".into());
+            }
+            self.events
+                .lock()
+                .expect("recording gate lock")
+                .push(GateEvent::Acquired { context, cost });
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            _reservation: Self::Reservation,
+            outcome: ChatAttemptOutcome,
+        ) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("recording gate lock")
+                .push(GateEvent::Settled {
+                    status: outcome.status,
+                    actual_total_tokens: outcome.actual_total_tokens,
+                });
+            Ok(())
+        }
+    }
 
     fn config(id: &str) -> ProviderRuntimeConfig {
         let descriptor = crate::providers::registry::descriptor_by_id(id)
@@ -731,6 +1331,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truncation_finish_reasons_are_case_insensitive_and_explicit() {
+        for reason in [
+            "length",
+            "max_tokens",
+            "MAX_TOKENS",
+            "max_output_tokens",
+            "max_tokens_reached",
+            "model_context_window_exceeded",
+            "incomplete",
+        ] {
+            assert!(finish_reason_is_truncation(Some(reason)), "{reason}");
+        }
+        assert!(!finish_reason_is_truncation(Some("stop")));
+        assert!(!finish_reason_is_truncation(None));
+    }
+
+    #[test]
+    fn truncation_diagnostics_distinguish_omitted_and_disabled_thinking() {
+        let adapter = RuntimeAdapter::new(Client::new(), config("anthropic"));
+        let mut request = chat_request(false);
+        request.model = "claude-fable-5".into();
+        request.max_output_tokens = Some(128_000);
+
+        let implicit = adapter.output_truncation_error(&request, "max_tokens");
+        assert!(implicit.contains("thinking=omitted/provider-default"));
+
+        request.thinking = Some(crate::domain::ThinkingConfig {
+            mode: crate::domain::ThinkingMode::Disabled,
+            effort: Some(crate::domain::ThinkingEffort::None),
+            budget_tokens: None,
+            summary: None,
+        });
+        let disabled = adapter.output_truncation_error(&request, "max_tokens");
+        assert!(disabled.contains("mode=Disabled"));
+        assert!(!disabled.contains("omitted/provider-default"));
+    }
+
     #[tokio::test]
     async fn header_priority_preserves_custom_values_for_if_absent_directives() {
         let mut config = config("anthropic");
@@ -751,6 +1389,47 @@ mod tests {
 
         assert_eq!(headers["x-api-key"], "custom-key");
         assert_eq!(headers["anthropic-version"], "custom-version");
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+    }
+
+    #[test]
+    fn header_order_preserves_custom_auth_and_forces_json_content_type_last() {
+        let mut config = config("openai-chat");
+        config.credential = Some("default-key".into());
+        config.custom_headers = vec![
+            ("Authorization".into(), "Custom credential".into()),
+            ("Content-Type".into(), "text/plain".into()),
+        ];
+        let adapter = RuntimeAdapter::new(Client::new(), config);
+        let headers = adapter
+            .build_headers(
+                &[HeaderDirective {
+                    name: "content-type".into(),
+                    value: "application/problem+json".into(),
+                    mode: HeaderMode::Replace,
+                }],
+                None,
+            )
+            .expect("headers");
+
+        assert_eq!(headers[AUTHORIZATION], "Custom credential");
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+    }
+
+    #[test]
+    fn vertex_oauth_has_priority_over_custom_authorization() {
+        let mut config = config("vertex-ai");
+        config.custom_headers = vec![
+            ("Authorization".into(), "Custom credential".into()),
+            ("X-Trace".into(), "trace-value".into()),
+        ];
+        let adapter = RuntimeAdapter::new(Client::new(), config);
+        let headers = adapter
+            .build_headers(&[], Some("oauth-token"))
+            .expect("vertex headers");
+
+        assert_eq!(headers[AUTHORIZATION], "Bearer oauth-token");
+        assert_eq!(headers["x-trace"], "trace-value");
         assert_eq!(headers[CONTENT_TYPE], "application/json");
     }
 
@@ -847,6 +1526,234 @@ mod tests {
             negotiation_failure(&error).message,
             "Unsupported parameter: max_tokens"
         );
+    }
+
+    #[tokio::test]
+    async fn gated_test_protocol_send_acquires_and_settles_once() {
+        let (base_url, server) = serve_once(200, "", r#"{"answer":"ok","stop":"done"}"#);
+        let mut runtime_config = config("test-seventh");
+        runtime_config.base_url = base_url;
+        let adapter = RuntimeAdapter::new(Client::new(), runtime_config);
+        let prepared = adapter
+            .prepare_chat_request(&chat_request(false), 256)
+            .expect("prepared test protocol request");
+        let gate = RecordingGate::default();
+        let context = ChatAttemptContext {
+            kind: ChatAttemptKind::Primary,
+            logical_attempt: 3,
+            compatibility_retry: false,
+        };
+
+        let meta = adapter
+            .send_prepared_chat_with_gate(&prepared, &gate, context, &CancellationToken::new())
+            .await
+            .expect("gated test protocol response");
+        server.join().expect("test protocol server");
+
+        assert_eq!(meta.response.text, "ok");
+        let actual_total = meta
+            .response
+            .usage
+            .as_ref()
+            .expect("estimated usage")
+            .total_tokens;
+        assert_eq!(
+            gate.events(),
+            vec![
+                GateEvent::Acquired {
+                    context,
+                    cost: prepared.cost,
+                },
+                GateEvent::Settled {
+                    status: Some(200),
+                    actual_total_tokens: Some(actual_total),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_cost_uses_the_final_compact_body_and_counts_completion_once() {
+        let adapter = RuntimeAdapter::new(Client::new(), config("anthropic"));
+        let mut request = chat_request(false);
+        request.model = "claude-sonnet-4-6".into();
+        request.web_search = true;
+        request.messages = vec![crate::domain::UnifiedMessage {
+            role: "user".into(),
+            content: vec![crate::domain::UnifiedContent::Text {
+                text: "内嵌提示词 + Assistant prompt + 背景与术语表".into(),
+            }],
+        }];
+        request.custom_parameters = json!({
+            "max_tokens": 8192,
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"translatedText": {"type": "string"}}
+                    }
+                }
+            }
+        });
+
+        let prepared = adapter
+            .prepare_chat_request(&request, 4_096)
+            .expect("prepared request");
+        let body = prepared.encoded.body.as_ref().expect("request body");
+        let compact = serde_json::to_string(body).expect("compact final body");
+        let estimated_input_tokens =
+            u64::try_from(count_tokens(&compact)).expect("input estimate fits u64");
+
+        assert_eq!(prepared.cost.estimated_input_tokens, estimated_input_tokens);
+        assert_eq!(prepared.cost.completion_tokens, 8_192);
+        assert_eq!(
+            prepared.cost.total_tokens,
+            estimated_input_tokens + prepared.cost.completion_tokens
+        );
+        assert_eq!(body["max_tokens"], 8_192);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.pointer("/output_config/format/schema").is_some());
+        assert!(body.get("tools").is_some());
+        assert!(prepared
+            .request
+            .custom_parameters
+            .get("max_tokens")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn gated_compatibility_retry_reestimates_and_reserves_each_wire_send() {
+        let (address, requests, server) = serve_sequence(vec![
+            (
+                400,
+                r#"{"error":{"message":"Unsupported parameter: max_tokens"}}"#,
+            ),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2}}"#,
+            ),
+        ]);
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("api.xiaomimimo.com", address)
+            .build()
+            .expect("test client");
+        let mut runtime_config = config("openai-chat");
+        runtime_config.base_url = format!("http://api.xiaomimimo.com:{}/v1", address.port());
+        let adapter = RuntimeAdapter::new(client, runtime_config);
+        let mut request = chat_request(false);
+        request.model = "mimo-v2-pro".into();
+        request.custom_parameters = json!({"max_tokens": 8});
+        let completion_budget = adapter
+            .validate_and_plan_chat_request(&request, 4)
+            .expect("completion budget");
+        let encoded = adapter
+            .encoded_chat_request(&request)
+            .expect("legacy-shaped initial request");
+        let cost = request_cost(&encoded, completion_budget.total_output_tokens)
+            .expect("initial request cost");
+        let prepared = PreparedChatRequest {
+            request,
+            encoded,
+            completion_budget,
+            cost,
+        };
+        let gate = RecordingGate::default();
+        let context = ChatAttemptContext {
+            kind: ChatAttemptKind::Primary,
+            logical_attempt: 1,
+            compatibility_retry: false,
+        };
+
+        adapter
+            .send_prepared_chat_with_gate(&prepared, &gate, context, &CancellationToken::new())
+            .await
+            .expect("compatibility retry succeeds");
+        let captured = requests.recv().expect("captured requests");
+        server.join().expect("compatibility server");
+        let bodies = captured
+            .iter()
+            .map(|raw| {
+                serde_json::from_str::<Value>(
+                    raw.split_once("\r\n\r\n").expect("HTTP request body").1,
+                )
+                .expect("JSON request body")
+            })
+            .collect::<Vec<_>>();
+        let events = gate.events();
+        let acquires = events
+            .iter()
+            .filter_map(|event| match event {
+                GateEvent::Acquired { context, cost } => Some((*context, *cost)),
+                GateEvent::Settled { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(acquires.len(), 2);
+        assert!(!acquires[0].0.compatibility_retry);
+        assert!(acquires[1].0.compatibility_retry);
+        for ((_, cost), body) in acquires.iter().zip(&bodies) {
+            let encoded_tokens = u64::try_from(count_tokens(
+                &serde_json::to_string(body).expect("compact request body"),
+            ))
+            .expect("token estimate fits u64");
+            assert_eq!(cost.estimated_input_tokens, encoded_tokens);
+            assert_eq!(cost.completion_tokens, 8);
+            assert_eq!(cost.total_tokens, encoded_tokens + 8);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GateEvent::Settled { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_http_errors_keep_the_reservation_and_pre_send_cancellation_does_not() {
+        let (base_url, server) = serve_once(503, "", r#"{"error":"busy"}"#);
+        let mut runtime_config = config("test-seventh");
+        runtime_config.base_url = base_url;
+        let adapter = RuntimeAdapter::new(Client::new(), runtime_config);
+        let prepared = adapter
+            .prepare_chat_request(&chat_request(false), 128)
+            .expect("prepared request");
+        let gate = RecordingGate::default();
+        let context = ChatAttemptContext {
+            kind: ChatAttemptKind::Primary,
+            logical_attempt: 1,
+            compatibility_retry: false,
+        };
+        let error = adapter
+            .send_prepared_chat_with_gate(&prepared, &gate, context, &CancellationToken::new())
+            .await
+            .expect_err("HTTP error");
+        server.join().expect("error server");
+        assert_eq!(error.status, Some(503));
+        assert_eq!(
+            gate.events(),
+            vec![
+                GateEvent::Acquired {
+                    context,
+                    cost: prepared.cost,
+                },
+                GateEvent::Settled {
+                    status: Some(503),
+                    actual_total_tokens: None,
+                },
+            ]
+        );
+
+        let cancelled_gate = RecordingGate::default();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = adapter
+            .send_prepared_chat_with_gate(&prepared, &cancelled_gate, context, &cancellation)
+            .await
+            .expect_err("pre-send cancellation");
+        assert_eq!(error.kind, ProviderChatErrorKind::LocalRequest);
+        assert!(cancelled_gate.events().is_empty());
     }
 
     #[tokio::test]

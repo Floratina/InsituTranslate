@@ -4,6 +4,9 @@ use crate::domain::{
     ProviderRuntimeConfig, RemoteModel, ThinkingConfig, ThinkingEffort, ThinkingMode,
     ThinkingSummary, UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedMessage,
 };
+use crate::providers::budget::{
+    normalize_completion_budget, CompletionBudgetAlias, OPENAI_RESPONSES_ALIASES,
+};
 use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
     openai_endpoint, EncodedRequest, EndpointPreview, HttpMethod, JsonEventStreamDecoder,
@@ -58,6 +61,10 @@ impl ProtocolCodec for OpenAiResponsesCodec {
         "openai-responses"
     }
 
+    fn completion_budget_aliases(&self) -> &'static [CompletionBudgetAlias] {
+        OPENAI_RESPONSES_ALIASES
+    }
+
     fn encode_model_list(&self, config: &ProviderRuntimeConfig) -> Result<EncodedRequest, String> {
         Ok(EncodedRequest {
             method: HttpMethod::Get,
@@ -106,6 +113,8 @@ impl ProtocolCodec for OpenAiResponsesCodec {
             reasoning: inferred.reasoning,
             web: inferred.web,
             thinking_efforts: self.supported_thinking_efforts("", model_id, inferred.reasoning),
+            thinking_required: false,
+            default_thinking_effort: None,
         }
     }
 
@@ -123,10 +132,10 @@ impl ProtocolCodec for OpenAiResponsesCodec {
         _base_url: &str,
         _model_id: &str,
         effort: ThinkingEffort,
-    ) -> ThinkingConfig {
+    ) -> Result<ThinkingConfig, String> {
         let mut config = thinking::base_config(effort);
         config.effort = Some(thinking::openai_effort(effort));
-        config
+        Ok(config)
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {
@@ -184,10 +193,11 @@ fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
         }
     }
     text.push_str(raw.get("delta").and_then(Value::as_str).unwrap_or_default());
-    let usage = raw
+    let usage_value = raw
         .get("response")
-        .and_then(|response| usage_from_openai(response.get("usage")))
-        .or_else(|| usage_from_openai(raw.get("usage")));
+        .and_then(|response| response.get("usage"))
+        .or_else(|| raw.get("usage"));
+    let usage = usage_from_openai(usage_value)?;
     let mut logprobs = Vec::new();
     collect_logprob_arrays(raw.pointer("/output"), &mut logprobs);
     if logprobs.is_empty() {
@@ -199,14 +209,17 @@ fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
 }
 
 pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result<Value, String> {
+    let completion_budget = normalize_completion_budget(
+        request.max_output_tokens,
+        &request.custom_parameters,
+        OPENAI_RESPONSES_ALIASES,
+    )?;
+    let max_output_tokens = completion_budget.resolved_max_output_tokens(None);
     let mut body = json!({
         "model": request.model,
         "input": responses_input(&request.messages),
         "stream": request.stream
     });
-    if let Some(tokens) = request.max_output_tokens {
-        body["max_output_tokens"] = json!(tokens);
-    }
     set_optional_field(
         &mut body,
         "temperature",
@@ -223,7 +236,7 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
         enable_openai_response_logprobs(&mut body);
     }
 
-    let mut body = merge_custom_parameters(body, &request.custom_parameters)?;
+    let mut body = merge_custom_parameters(body, completion_budget.custom_parameters())?;
     remove_object_keys(
         &mut body,
         &[
@@ -251,6 +264,10 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
         enable_openai_response_logprobs(&mut body);
     } else {
         disable_openai_response_logprobs(&mut body);
+    }
+    remove_object_keys(&mut body, &["max_output_tokens"]);
+    if let Some(tokens) = max_output_tokens {
+        body["max_output_tokens"] = json!(tokens);
     }
     Ok(body)
 }

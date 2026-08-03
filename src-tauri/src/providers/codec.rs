@@ -4,6 +4,10 @@ use crate::domain::{
     ProviderRuntimeConfig, RemoteModel, ThinkingConfig, ThinkingEffort, UnifiedChatRequest,
     UnifiedChatResponse,
 };
+use crate::providers::budget::{
+    completion_budget, normalize_completion_budget, thinking_token_reserve, CompletionBudget,
+    CompletionBudgetAlias, CompletionLimitScope, ALL_COMPLETION_BUDGET_ALIASES,
+};
 use crate::providers::capabilities::ModelCapabilities;
 
 #[allow(dead_code)]
@@ -74,7 +78,72 @@ pub trait ProtocolCodec: Send + Sync {
         base_url: &str,
         model_id: &str,
         effort: ThinkingEffort,
-    ) -> ThinkingConfig;
+    ) -> Result<ThinkingConfig, String>;
+    fn completion_budget_aliases(&self) -> &'static [CompletionBudgetAlias] {
+        ALL_COMPLETION_BUDGET_ALIASES
+    }
+    fn completion_limit_scope(&self) -> CompletionLimitScope {
+        CompletionLimitScope::TotalOutput
+    }
+    fn validate_chat_options(
+        &self,
+        _base_url: &str,
+        _model_id: &str,
+        _thinking: Option<&ThinkingConfig>,
+        _temperature: Option<f64>,
+        _top_p: Option<f64>,
+        _custom_parameters: &Value,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn plan_max_output_tokens(
+        &self,
+        _base_url: &str,
+        _model_id: &str,
+        _thinking: Option<&ThinkingConfig>,
+        structured_max_output_tokens: Option<u32>,
+        _custom_parameters: &Value,
+        _visible_output_tokens: u32,
+    ) -> Result<Option<u32>, String> {
+        normalize_completion_budget(
+            structured_max_output_tokens,
+            _custom_parameters,
+            self.completion_budget_aliases(),
+        )
+        .map(|budget| budget.resolved_max_output_tokens(None))
+    }
+    fn plan_completion_budget(
+        &self,
+        base_url: &str,
+        model_id: &str,
+        thinking: Option<&ThinkingConfig>,
+        structured_max_output_tokens: Option<u32>,
+        custom_parameters: &Value,
+        visible_output_tokens: u32,
+    ) -> Result<CompletionBudget, String> {
+        let normalized = normalize_completion_budget(
+            structured_max_output_tokens,
+            custom_parameters,
+            self.completion_budget_aliases(),
+        )?;
+        let planned_wire_max = self.plan_max_output_tokens(
+            base_url,
+            model_id,
+            thinking,
+            normalized.explicit_max_output_tokens(),
+            normalized.custom_parameters(),
+            visible_output_tokens,
+        )?;
+        completion_budget(
+            normalized,
+            visible_output_tokens,
+            thinking_token_reserve(thinking),
+            planned_wire_max,
+            self.completion_limit_scope(),
+            self.id(),
+            model_id,
+        )
+    }
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String>;
 
     fn decode_error(&self, status: u16, body: &str) -> String {

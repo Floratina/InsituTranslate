@@ -204,6 +204,8 @@ pub struct ModelView {
     pub source: String,
     pub capability_reasoning: bool,
     pub supported_thinking_efforts: Vec<ThinkingEffort>,
+    pub thinking_required: bool,
+    pub default_thinking_effort: Option<ThinkingEffort>,
     pub capability_web: bool,
     pub test_status: String,
     pub latency_ms: Option<i64>,
@@ -431,6 +433,21 @@ pub struct UnifiedUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub thinking_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(skip)]
+    pub(crate) provenance: UnifiedUsageProvenance,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UnifiedUsageProvenance {
+    pub input_tokens_reported: bool,
+    pub output_tokens_reported: bool,
+    #[allow(dead_code)]
+    pub cached_tokens_reported: bool,
+    pub thinking_tokens_reported: bool,
+    pub output_includes_unreported_thinking: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

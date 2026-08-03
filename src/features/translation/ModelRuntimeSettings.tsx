@@ -60,9 +60,16 @@ export function supportedThinkingEffortsForModel(model: ModelView | null): Think
   if (model.supportedThinkingEfforts.length === 0) {
     return THINKING_EFFORT_OPTIONS.map((option) => option.value);
   }
-  return model.supportedThinkingEfforts.includes("none")
-    ? model.supportedThinkingEfforts
-    : ["none", ...model.supportedThinkingEfforts];
+  return model.supportedThinkingEfforts;
+}
+
+function effectiveThinkingEffort(
+  value: ThinkingEffort,
+  model: ModelView | null,
+  supportedThinkingEfforts: ThinkingEffort[],
+): ThinkingEffort {
+  if (supportedThinkingEfforts.includes(value)) return value;
+  return model?.defaultThinkingEffort ?? supportedThinkingEfforts[0] ?? "none";
 }
 
 function normalizeCapabilities(
@@ -73,9 +80,11 @@ function normalizeCapabilities(
   const supportedThinkingEfforts = supportedThinkingEffortsForModel(model);
   return {
     ...value,
-    thinkingEffort: supportedThinkingEfforts.includes(value.thinkingEffort)
-      ? value.thinkingEffort
-      : "none",
+    thinkingEffort: effectiveThinkingEffort(
+      value.thinkingEffort,
+      model,
+      supportedThinkingEfforts,
+    ),
     useWebSearch: model.capabilityWeb ? value.useWebSearch : false,
   };
 }
@@ -256,9 +265,11 @@ export function ModelRuntimeSettings({
 
       <FieldBlock label="思考强度">
         <Select
-          value={supportedThinkingEfforts.includes(value.thinkingEffort)
-            ? value.thinkingEffort
-            : "none"}
+          value={effectiveThinkingEffort(
+            value.thinkingEffort,
+            selectedModel,
+            supportedThinkingEfforts,
+          )}
           onValueChange={(thinkingEffort) => onChange({
             ...value,
             thinkingEffort: thinkingEffort as ThinkingEffort,

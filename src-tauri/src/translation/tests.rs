@@ -1,7 +1,8 @@
 use crate::db as app_db;
 use crate::domain::{
-    AddModelInput, CreateProviderInput, ProtocolId, ProviderPurpose, ProviderRuntimeConfig,
-    SetProviderEnabledInput, ThinkingEffort, UpdateAssistantCustomParametersInput,
+    AddModelInput, AssistantIconKind, CreateAssistantInput, CreateProviderInput, ProtocolId,
+    ProviderPurpose, ProviderRuntimeConfig, SetProviderEnabledInput, ThinkingEffort,
+    UpdateAssistantCustomParametersInput, UpdateAssistantSettingsInput,
 };
 use crate::glossary_prompt::GlossaryEntry;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
@@ -21,16 +22,18 @@ use super::context::{
 use super::db::{
     apply_chunk_outcome, apply_staged_task_execution_snapshot, connect_inp, connect_sqlite,
     effective_task_progress, effective_translation_concurrency, export_file_name,
-    get_task_from_index, normalize_tags, normalize_task_filters,
+    get_task_from_index, normalize_tags, normalize_task_filters, parse_task_json_object,
     preprocessing_config_snapshot_json, publish_staged_translation_task, release_assets_for_export,
-    rendered_task_document, serialize_tags, source_extension, task_execution_config,
-    task_failure_thresholds, task_glossary_config, translated_source_text, validate_execution_mode,
-    validate_failure_percentage, validate_inp_file, validate_parsed_task_source, ParsedTaskSource,
+    rendered_task_document, serialize_tags, source_extension, task_assistant_custom_parameters,
+    task_execution_config, task_failure_thresholds, task_glossary_config,
+    task_glossary_generation_snapshot, translated_source_text, validate_execution_mode,
+    validate_failure_percentage, validate_inp_file, validate_parsed_task_source,
+    validate_translation_config_runtime, ParsedTaskSource,
 };
 use super::failure_threshold_exceeded;
 use super::glossary::glossary_threshold_failure_reason;
 use super::glossary::TaskGlossaryMatcher;
-use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy};
+use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter};
 use super::request_options::TranslationRequestOptions;
 use super::scheduler::{
     logprobs_parameter_rejected, retry_base_delay_ms, retry_delay_with_jitter_ms,
@@ -254,6 +257,7 @@ use crate::document_parsing::types::{BlockRef, PlaceholderMap};
 use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
@@ -383,6 +387,112 @@ async fn write_test_inp(path: &Path, task_id: &str, name: &str) -> Result<(), St
 
     pool.close().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn persisted_task_json_snapshots_are_strict_and_report_task_id() {
+    let root = temp_root("strict-task-snapshots");
+    tokio::fs::create_dir_all(&root)
+        .await
+        .expect("create test root");
+    let inp_path = root.join("strict.inp");
+    let task_id = "task-strict-snapshots";
+    write_test_inp(&inp_path, task_id, "Strict snapshots")
+        .await
+        .expect("create task fixture");
+    let pool = connect_inp(&inp_path).await.expect("open task fixture");
+    let config_pool = connect_config_db(&root).await.expect("config database");
+
+    for raw in ["{broken", "[]", "null", ""] {
+        sqlx::query("UPDATE metadata SET assistant_custom_parameters_json = ?")
+            .bind(raw)
+            .execute(&pool)
+            .await
+            .expect("store assistant snapshot");
+        let error = task_assistant_custom_parameters(&pool)
+            .await
+            .expect_err("invalid assistant snapshot");
+        assert!(error.contains(task_id), "{error}");
+        assert!(error.contains("assistant custom parameters"), "{error}");
+    }
+    sqlx::query("UPDATE metadata SET assistant_custom_parameters_json = '{}'")
+        .execute(&pool)
+        .await
+        .expect("restore assistant snapshot");
+    assert_eq!(
+        task_assistant_custom_parameters(&pool)
+            .await
+            .expect("valid assistant snapshot"),
+        json!({})
+    );
+
+    for raw in ["{broken", "[]", "null"] {
+        sqlx::query("UPDATE metadata SET config_snapshot_json = ?")
+            .bind(raw)
+            .execute(&pool)
+            .await
+            .expect("store config snapshot");
+        for error in [
+            task_execution_config(&pool, &config_pool)
+                .await
+                .expect_err("invalid execution snapshot"),
+            task_failure_thresholds(&pool)
+                .await
+                .expect_err("invalid threshold snapshot"),
+        ] {
+            assert!(error.contains(task_id), "{error}");
+            assert!(error.contains("config snapshot"), "{error}");
+        }
+    }
+    sqlx::query("UPDATE metadata SET config_snapshot_json = '{}'")
+        .execute(&pool)
+        .await
+        .expect("restore legacy config snapshot");
+    task_execution_config(&pool, &config_pool)
+        .await
+        .expect("legacy object uses config fallback");
+
+    for raw in ["{broken", "[]", "null"] {
+        sqlx::query("UPDATE metadata SET glossary_generation_snapshot_json = ?")
+            .bind(raw)
+            .execute(&pool)
+            .await
+            .expect("store glossary snapshot");
+        let error = task_glossary_generation_snapshot(&pool)
+            .await
+            .expect_err("invalid glossary snapshot");
+        assert!(error.contains(task_id), "{error}");
+        assert!(error.contains("glossary generation snapshot"), "{error}");
+    }
+    sqlx::query("UPDATE metadata SET glossary_generation_snapshot_json = '   '")
+        .execute(&pool)
+        .await
+        .expect("store absent glossary snapshot");
+    assert!(task_glossary_generation_snapshot(&pool)
+        .await
+        .expect("blank optional glossary snapshot")
+        .is_none());
+
+    for raw in ["{broken", "[]", "null"] {
+        let error = parse_task_json_object(task_id, "preprocessing config snapshot", raw)
+            .expect_err("invalid preprocessing snapshot");
+        assert!(error.contains(task_id), "{error}");
+        assert!(error.contains("preprocessing config snapshot"), "{error}");
+    }
+
+    sqlx::query("UPDATE metadata SET assistant_custom_parameters_json = '[]'")
+        .execute(&pool)
+        .await
+        .expect("store damaged import snapshot");
+    pool.close().await;
+    assert_eq!(
+        validate_inp_file(&inp_path)
+            .await
+            .expect_err("read-only import maps snapshot damage"),
+        INP_FILE_DAMAGED
+    );
+    config_pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn test_glossary_entry(src: &str, dst: &str) -> GlossaryEntry {
@@ -520,6 +630,239 @@ fn preprocessing_snapshot_contains_only_chunking_inputs() {
     assert_eq!(object.len(), 2);
     assert_eq!(snapshot["chunkTokenLimit"], 800);
     assert_eq!(snapshot["pdfParsingMode"], "local-first");
+}
+
+#[tokio::test]
+async fn translation_and_glossary_snapshot_preflight_reject_anthropic_sampling_before_network_io() {
+    let root = temp_root("anthropic-preflight");
+    tokio::fs::create_dir_all(&root).await.expect("create root");
+    let provider_pool = app_db::connect(&root.join("providers.sqlite"))
+        .await
+        .expect("provider db");
+
+    let translation_provider = app_db::create_provider(
+        &provider_pool,
+        CreateProviderInput {
+            name: "Anthropic translation".into(),
+            protocol: ProtocolId::registered("anthropic"),
+            purpose: ProviderPurpose::Translation,
+            avatar: None,
+        },
+    )
+    .await
+    .expect("translation provider");
+    let translation_model = app_db::add_model(
+        &provider_pool,
+        AddModelInput {
+            provider_id: translation_provider.id.clone(),
+            request_name: "claude-sonnet-4-6".into(),
+            alias: String::new(),
+            source: "manual".into(),
+        },
+    )
+    .await
+    .expect("translation model");
+    let translation_assistant = app_db::create_assistant(
+        &provider_pool,
+        CreateAssistantInput {
+            purpose: ProviderPurpose::Translation,
+        },
+    )
+    .await
+    .expect("translation assistant");
+    app_db::update_assistant_settings(
+        &provider_pool,
+        UpdateAssistantSettingsInput {
+            id: translation_assistant.id.clone(),
+            name: "Invalid Anthropic sampling".into(),
+            icon_kind: AssistantIconKind::Lucide,
+            icon_value: "bot".into(),
+            temperature_enabled: true,
+            temperature: 0.2,
+            top_p_enabled: false,
+            top_p: 1.0,
+        },
+    )
+    .await
+    .expect("assistant sampling");
+
+    let translation_config = TranslationConfigView {
+        provider_id: translation_provider.id.clone(),
+        model_id: translation_model.id.clone(),
+        assistant_id: translation_assistant.id.clone(),
+        thinking_effort: ThinkingEffort::High,
+        chunk_token_limit: 800,
+        enable_translation: true,
+        ..TranslationConfigView::default()
+    };
+    let error = validate_translation_config_runtime(&provider_pool, &translation_config)
+        .await
+        .expect_err("translation sampling preflight");
+    assert!(error.contains("claude-sonnet-4-6"));
+    assert!(error.contains("temperature"));
+
+    let config_pool = connect_config_db(&root).await.expect("config db");
+    update_translation_config(
+        &config_pool,
+        UpdateTranslationConfigInput {
+            source_language: "English".into(),
+            custom_source_language: String::new(),
+            target_language: "Simplified Chinese".into(),
+            custom_target_language: String::new(),
+            provider_id: translation_provider.id.clone(),
+            model_id: translation_model.id.clone(),
+            assistant_id: translation_assistant.id.clone(),
+            enable_translation: true,
+            chunk_token_limit: 800,
+            max_concurrency: 3,
+            max_retries: 2,
+            max_failure_percentage: 20,
+            rate_limit_strategy: RateLimitStrategy::Dynamic,
+            max_requests_per_minute: 120,
+            max_tokens_per_minute: 60_000,
+            context_handling_mode: ContextHandlingMode::Off,
+            use_global_background: false,
+            use_glossary: false,
+            glossary_mode: GlossaryMode::Auto,
+            glossary_id: None,
+            glossary_generation_config: GlossaryGenerationConfig::default(),
+            thinking_effort: ThinkingEffort::High,
+            use_web_search: false,
+            use_custom_parameters: false,
+            confidence_mode: ConfidenceMode::Off,
+            pdf_parsing_mode: PdfParsingMode::LocalFirst,
+        },
+    )
+    .await
+    .expect("persist task settings");
+    let task_error = create_translation_task(
+        &provider_pool,
+        &Client::new(),
+        &config_pool,
+        &root,
+        CreateTranslationTaskInput {
+            file_path: root
+                .join("missing-but-never-read.txt")
+                .to_string_lossy()
+                .to_string(),
+            source_language: "en".into(),
+            target_language: "zh-CN".into(),
+            tags: Vec::new(),
+            provider_id: translation_provider.id.clone(),
+            model_id: translation_model.id.clone(),
+            assistant_id: Some(translation_assistant.id.clone()),
+            enable_translation: true,
+            use_glossary: false,
+            glossary_mode: GlossaryMode::Auto,
+            glossary_id: None,
+            glossary_generation_config: GlossaryGenerationConfig::default(),
+        },
+    )
+    .await
+    .expect_err("task creation preflight must reject sampling before reading the source");
+    assert!(task_error.contains("claude-sonnet-4-6"));
+    assert!(task_error.contains("temperature"));
+    assert!(!task_error.contains("Unable to read source document"));
+
+    app_db::update_assistant_settings(
+        &provider_pool,
+        UpdateAssistantSettingsInput {
+            id: translation_assistant.id.clone(),
+            name: "Manual TPM preflight".into(),
+            icon_kind: AssistantIconKind::Lucide,
+            icon_value: "bot".into(),
+            temperature_enabled: false,
+            temperature: 1.0,
+            top_p_enabled: false,
+            top_p: 1.0,
+        },
+    )
+    .await
+    .expect("disable incompatible sampling");
+    let manual_tpm_config = TranslationConfigView {
+        rate_limit_strategy: RateLimitStrategy::Manual,
+        max_tokens_per_minute: 1_000,
+        ..translation_config.clone()
+    };
+    let tpm_error = validate_translation_config_runtime(&provider_pool, &manual_tpm_config)
+        .await
+        .expect_err("manual TPM preflight");
+    assert!(tpm_error.contains("protocol=anthropic"));
+    assert!(tpm_error.contains("claude-sonnet-4-6"));
+    assert!(tpm_error.contains("estimated_input_tokens=800"));
+    assert!(tpm_error.contains("completion_tokens="));
+    assert!(tpm_error.contains("manual TPM limit (1000 tokens)"));
+
+    let glossary_provider = app_db::create_provider(
+        &provider_pool,
+        CreateProviderInput {
+            name: "Anthropic glossary".into(),
+            protocol: ProtocolId::registered("anthropic"),
+            purpose: ProviderPurpose::Glossary,
+            avatar: None,
+        },
+    )
+    .await
+    .expect("glossary provider");
+    let glossary_model = app_db::add_model(
+        &provider_pool,
+        AddModelInput {
+            provider_id: glossary_provider.id.clone(),
+            request_name: "claude-sonnet-4-6".into(),
+            alias: String::new(),
+            source: "manual".into(),
+        },
+    )
+    .await
+    .expect("glossary model");
+    let glossary_assistant = app_db::create_assistant(
+        &provider_pool,
+        CreateAssistantInput {
+            purpose: ProviderPurpose::Glossary,
+        },
+    )
+    .await
+    .expect("glossary assistant");
+    app_db::update_assistant_settings(
+        &provider_pool,
+        UpdateAssistantSettingsInput {
+            id: glossary_assistant.id.clone(),
+            name: "Invalid glossary sampling".into(),
+            icon_kind: AssistantIconKind::Lucide,
+            icon_value: "bot".into(),
+            temperature_enabled: true,
+            temperature: 0.2,
+            top_p_enabled: false,
+            top_p: 1.0,
+        },
+    )
+    .await
+    .expect("glossary sampling");
+    let glossary_config = TranslationConfigView {
+        enable_translation: false,
+        use_glossary: true,
+        glossary_mode: GlossaryMode::Auto,
+        chunk_token_limit: 800,
+        glossary_generation_config: GlossaryGenerationConfig {
+            provider_id: glossary_provider.id,
+            model_id: glossary_model.id,
+            assistant_id: Some(glossary_assistant.id),
+            thinking_effort: ThinkingEffort::High,
+            use_web_search: false,
+            use_custom_parameters: false,
+            max_failure_percentage: 20,
+        },
+        ..TranslationConfigView::default()
+    };
+    let error = validate_translation_config_runtime(&provider_pool, &glossary_config)
+        .await
+        .expect_err("glossary snapshot sampling preflight");
+    assert!(error.contains("claude-sonnet-4-6"));
+    assert!(error.contains("temperature"));
+
+    provider_pool.close().await;
+    config_pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1832,6 +2175,178 @@ async fn translate_chunk_retries_transient_429_without_interrupting_task() {
     assert!(!outcome.interrupt_task);
     assert_eq!(outcome.retry_count, 1);
     assert_eq!(outcome.translated_text, "你好");
+}
+
+#[tokio::test]
+async fn translate_chunk_rejects_truncated_partial_text_without_retrying() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let address = listener.local_addr().expect("mock address");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept mock request");
+        server_count.fetch_add(1, Ordering::SeqCst);
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let body = r#"{"choices":[{"message":{"content":"部分译文"},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":8}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write mock response");
+    });
+    let adapter = Arc::new(RuntimeAdapter::new(
+        Client::new(),
+        ProviderRuntimeConfig {
+            protocol: ProtocolId::registered("openai-chat"),
+            base_url: format!("http://{address}/v1"),
+            use_raw_base_url: true,
+            config: json!({}),
+            credential: None,
+            custom_headers: Vec::new(),
+        },
+    ));
+    let outcome = translate_chunk(
+        adapter,
+        "test-model".into(),
+        "zh-CN".into(),
+        None,
+        TranslationRequestOptions {
+            custom_parameters: json!({}),
+            web_search: false,
+            thinking: None,
+        },
+        None,
+        None,
+        None,
+        None,
+        Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
+        DocumentFormat::Txt,
+        ContentFormat::PlainText,
+        ChunkRecord {
+            id: "chunk-truncated".into(),
+            sequence: 0,
+            preprocessed_text: "Hello".into(),
+            source_text: "Hello".into(),
+            map_json: "{}".into(),
+        },
+        5,
+        ConfidenceMode::Off,
+        Arc::new(HeaderQuotaPolicy::new(true)),
+        Arc::new(AdaptiveLimiter::new(2, true)),
+        None,
+        None,
+        TranslationInterrupt::new(),
+        None,
+    )
+    .await;
+    server.join().expect("mock server joins");
+
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.status, TranslationChunkStatus::Interrupted);
+    assert_eq!(outcome.retry_count, 0);
+    assert_eq!(outcome.after_translate_text, "");
+    assert_eq!(outcome.translated_text, "");
+    assert!(outcome
+        .error_message
+        .as_deref()
+        .is_some_and(|message| message.contains("OUTPUT_TRUNCATED") && message.contains("length")));
+}
+
+#[tokio::test]
+async fn translate_logprobs_fallback_reserves_each_physical_send() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let address = listener.local_addr().expect("mock address");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let server = std::thread::spawn(move || {
+        let responses = [
+            (
+                "400 Bad Request",
+                r#"{"error":{"message":"Unsupported parameter: logprobs"}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+            ),
+        ];
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            server_count.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 8192];
+            let length = stream.read(&mut request).expect("read mock request");
+            let request = String::from_utf8_lossy(&request[..length]);
+            let body_json: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").expect("HTTP request body").1)
+                    .expect("JSON request body");
+            if status.starts_with("400") {
+                assert_eq!(body_json.get("logprobs"), Some(&Value::Bool(true)));
+            } else {
+                assert!(body_json.get("logprobs").is_none());
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write mock response");
+        }
+    });
+    let adapter = Arc::new(RuntimeAdapter::new(
+        Client::new(),
+        ProviderRuntimeConfig {
+            protocol: ProtocolId::registered("openai-chat"),
+            base_url: format!("http://{address}/v1"),
+            use_raw_base_url: true,
+            config: json!({}),
+            credential: None,
+            custom_headers: Vec::new(),
+        },
+    ));
+    let manual_limiter = Arc::new(ManualRateLimiter::new(10, 100_000));
+    let outcome = translate_chunk(
+        adapter,
+        "test-model".into(),
+        "zh-CN".into(),
+        None,
+        TranslationRequestOptions {
+            custom_parameters: json!({}),
+            web_search: false,
+            thinking: None,
+        },
+        None,
+        None,
+        None,
+        None,
+        Arc::new(TaskGlossaryMatcher::new(Vec::new()).expect("empty glossary")),
+        DocumentFormat::Txt,
+        ContentFormat::PlainText,
+        ChunkRecord {
+            id: "chunk-logprobs-fallback".into(),
+            sequence: 0,
+            preprocessed_text: "Hello".into(),
+            source_text: "Hello".into(),
+            map_json: "{}".into(),
+        },
+        0,
+        ConfidenceMode::ConfidenceIndex,
+        Arc::new(HeaderQuotaPolicy::new(true)),
+        Arc::new(AdaptiveLimiter::new(2, true)),
+        Some(manual_limiter.clone()),
+        None,
+        TranslationInterrupt::new(),
+        None,
+    )
+    .await;
+    server.join().expect("mock server joins");
+
+    assert_eq!(outcome.status, TranslationChunkStatus::Success);
+    assert_eq!(outcome.translated_text, "你好");
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    assert!(manual_limiter.status().await.contains("requests 2/10"));
 }
 
 #[tokio::test]

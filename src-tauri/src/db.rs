@@ -1,7 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use reqwest::header::{HeaderName, HeaderValue};
+use serde::de::{Error as DeError, MapAccess, Visitor};
+use serde::Deserializer as _;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -102,6 +106,125 @@ fn parse_provider_config(id: &str, raw: &str) -> Result<Value, String> {
 fn parse_header_keys(id: &str, raw: &str) -> Result<Vec<String>, String> {
     serde_json::from_str(raw)
         .map_err(|error| format!("Provider {id} header key JSON is invalid: {error}"))
+}
+
+#[derive(Debug)]
+struct ValidatedHeaders {
+    keys: Vec<String>,
+    values: Vec<(String, String)>,
+}
+
+struct HeaderObjectVisitor;
+
+impl<'de> Visitor<'de> for HeaderObjectVisitor {
+    type Value = ValidatedHeaders;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object whose header values are strings")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen = HashSet::new();
+        let mut values = Vec::new();
+        while let Some((name, value)) = map.next_entry::<String, Value>()? {
+            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                A::Error::custom(format!("Header {name} has an invalid name: {error}"))
+            })?;
+            let normalized = header_name.as_str().to_string();
+            if !seen.insert(normalized.clone()) {
+                return Err(A::Error::custom(format!(
+                    "Header {name} duplicates another header name (case-insensitive)"
+                )));
+            }
+            if FORBIDDEN_CUSTOM_HEADERS.contains(&normalized.as_str()) {
+                return Err(A::Error::custom(format!(
+                    "Header {name} cannot be overridden"
+                )));
+            }
+            let value = value.as_str().ok_or_else(|| {
+                A::Error::custom(format!("Header {name} must have a string value"))
+            })?;
+            HeaderValue::from_str(value).map_err(|error| {
+                A::Error::custom(format!("Header {name} has an invalid value: {error}"))
+            })?;
+            values.push((name, value.to_string()));
+        }
+        let mut keys = values
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        Ok(ValidatedHeaders { keys, values })
+    }
+}
+
+const FORBIDDEN_CUSTOM_HEADERS: &[&str] = &[
+    "content-type",
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+fn parse_and_validate_headers_json(raw: &str) -> Result<ValidatedHeaders, String> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let headers = deserializer
+        .deserialize_map(HeaderObjectVisitor)
+        .map_err(|error| format!("Headers must be a JSON object: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| format!("Headers must contain exactly one JSON object: {error}"))?;
+    Ok(headers)
+}
+
+#[derive(Debug)]
+struct SecretMutation {
+    reference: String,
+    previous: Option<String>,
+}
+
+impl SecretMutation {
+    fn apply(reference: String, replacement: Option<&str>) -> Result<Self, String> {
+        let previous = secrets::read(&reference)?;
+        match replacement {
+            Some(value) => secrets::write(&reference, value)?,
+            None => secrets::delete(&reference)?,
+        }
+        Ok(Self {
+            reference,
+            previous,
+        })
+    }
+
+    fn restore(&self) -> Result<(), String> {
+        match self.previous.as_deref() {
+            Some(value) => secrets::write(&self.reference, value),
+            None => secrets::delete(&self.reference),
+        }
+    }
+}
+
+fn secret_database_error(
+    provider_id: &str,
+    database_error: String,
+    mutation: &SecretMutation,
+) -> String {
+    match mutation.restore() {
+        Ok(()) => format!("Provider {provider_id} database update failed: {database_error}"),
+        Err(restore_error) => format!(
+            "Provider {provider_id} database update failed: {database_error}; secret restoration failed: {restore_error}"
+        ),
+    }
 }
 
 pub fn is_mineru_provider(provider: &ProviderView) -> bool {
@@ -1082,9 +1205,17 @@ pub async fn get_assistant(pool: &SqlitePool, id: &str) -> Result<AssistantView,
 }
 
 fn assistant_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AssistantView, String> {
+    let id: String = row.get("id");
     let custom_parameters_json: String = row.get("custom_parameters_json");
+    let custom_parameters: Value = serde_json::from_str(&custom_parameters_json)
+        .map_err(|error| format!("Assistant {id} custom parameters JSON is invalid: {error}"))?;
+    if !custom_parameters.is_object() {
+        return Err(format!(
+            "Assistant {id} custom parameters must be a JSON object"
+        ));
+    }
     Ok(AssistantView {
-        id: row.get("id"),
+        id,
         name: row.get("name"),
         icon_kind: AssistantIconKind::parse(row.get::<String, _>("icon_kind").as_str())?,
         icon_value: row.get("icon_value"),
@@ -1094,8 +1225,7 @@ fn assistant_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AssistantView, St
         temperature: row.get("temperature"),
         top_p_enabled: row.get::<i64, _>("top_p_enabled") != 0,
         top_p: row.get("top_p"),
-        custom_parameters: serde_json::from_str(&custom_parameters_json)
-            .unwrap_or_else(|_| json!({})),
+        custom_parameters,
     })
 }
 
@@ -1240,6 +1370,7 @@ pub async fn copy_assistant(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Assistant not found".to_string())?;
+    assistant_from_row(&source)?;
     let name = next_assistant_copy_name(
         pool,
         source.get::<String, _>("name").as_str(),
@@ -1436,7 +1567,13 @@ fn model_from_row(
     overrides: Option<&CapabilityOverrides>,
 ) -> Result<ModelView, String> {
     let request_name: String = row.get("request_name");
-    let (capability_reasoning, capability_web, supported_thinking_efforts) = match descriptor {
+    let (
+        capability_reasoning,
+        capability_web,
+        supported_thinking_efforts,
+        thinking_required,
+        default_thinking_effort,
+    ) = match descriptor {
         Some(descriptor) => {
             let empty_overrides = CapabilityOverrides::default();
             let capabilities = resolve_capabilities(
@@ -1449,12 +1586,16 @@ fn model_from_row(
                 capabilities.reasoning,
                 capabilities.web,
                 capabilities.thinking_efforts,
+                capabilities.thinking_required,
+                capabilities.default_thinking_effort,
             )
         }
         None => (
             row.get::<i64, _>("capability_reasoning") != 0,
             row.get::<i64, _>("capability_web") != 0,
             Vec::new(),
+            false,
+            None,
         ),
     };
     Ok(ModelView {
@@ -1465,6 +1606,8 @@ fn model_from_row(
         source: row.get("source"),
         capability_reasoning,
         supported_thinking_efforts,
+        thinking_required,
+        default_thinking_effort,
         capability_web,
         test_status: row.get("test_status"),
         latency_ms: row.get("latency_ms"),
@@ -1727,12 +1870,13 @@ async fn save_vertex_ai_config(
     client_email: String,
     private_key: Option<String>,
 ) -> Result<ProviderView, String> {
-    let row = sqlx::query("SELECT protocol, config_json FROM providers WHERE id = ?")
-        .bind(provider_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Provider not found".to_string())?;
+    let row =
+        sqlx::query("SELECT protocol, config_json, credential_ref FROM providers WHERE id = ?")
+            .bind(provider_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Provider not found".to_string())?;
     let descriptor = registered_descriptor(row.get::<String, _>("protocol").as_str())?;
     if descriptor.config_kind != "vertex-ai" {
         return Err("Agent Platform config can only be saved on Agent Platform providers".into());
@@ -1765,17 +1909,19 @@ async fn save_vertex_ai_config(
     let normalized = normalize_provider_config(Value::Object(object), descriptor, false)?;
 
     if let Some(private_key) = private_key {
-        let reference = format!("provider/{provider_id}/credential");
+        let reference = row
+            .get::<Option<String>, _>("credential_ref")
+            .unwrap_or_else(|| format!("provider/{provider_id}/credential"));
         let trimmed = private_key.trim();
-        let mask = if trimmed.is_empty() {
-            secrets::delete(&reference)?;
+        let formatted = if trimmed.is_empty() {
             None
         } else {
-            let formatted = vertex_ai::format_private_key(trimmed)?;
-            secrets::write(&reference, &formatted)?;
-            Some(secrets::mask(&formatted))
+            Some(vertex_ai::format_private_key(trimmed)?)
         };
-        sqlx::query("UPDATE providers SET config_json = ?, credential_ref = ?, credential_mask = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        let mask = formatted.as_deref().map(secrets::mask);
+        let mutation = SecretMutation::apply(reference.clone(), formatted.as_deref())?;
+        let database_result: Result<(), String> = async {
+            let result = sqlx::query("UPDATE providers SET config_json = ?, credential_ref = ?, credential_mask = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(normalized)
             .bind(reference)
             .bind(mask)
@@ -1783,8 +1929,17 @@ async fn save_vertex_ai_config(
             .execute(pool)
             .await
             .map_err(|error| error.to_string())?;
+            if result.rows_affected() != 1 {
+                return Err("expected exactly one updated provider row".into());
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = database_result {
+            return Err(secret_database_error(provider_id, error, &mutation));
+        }
     } else {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE providers SET config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(normalized)
@@ -1792,6 +1947,11 @@ async fn save_vertex_ai_config(
         .execute(pool)
         .await
         .map_err(|error| error.to_string())?;
+        if result.rows_affected() != 1 {
+            return Err(format!(
+                "Provider {provider_id} database update failed: expected exactly one updated provider row"
+            ));
+        }
     }
     get_provider(pool, provider_id).await
 }
@@ -2230,21 +2390,35 @@ pub async fn replace_credential(
     provider_id: &str,
     credential: Option<String>,
 ) -> Result<ProviderView, String> {
-    let reference = format!("provider/{provider_id}/credential");
-    let mask = if let Some(value) = credential.as_deref().filter(|value| !value.is_empty()) {
-        secrets::write(&reference, value)?;
-        Some(secrets::mask(value))
-    } else {
-        secrets::delete(&reference)?;
-        None
-    };
-    sqlx::query("UPDATE providers SET credential_ref = ?, credential_mask = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    let row = sqlx::query("SELECT credential_ref FROM providers WHERE id = ?")
+        .bind(provider_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Provider {provider_id} not found"))?;
+    let reference = row
+        .get::<Option<String>, _>("credential_ref")
+        .unwrap_or_else(|| format!("provider/{provider_id}/credential"));
+    let replacement = credential.as_deref().filter(|value| !value.is_empty());
+    let mask = replacement.map(secrets::mask);
+    let mutation = SecretMutation::apply(reference.clone(), replacement)?;
+    let database_result: Result<(), String> = async {
+        let result = sqlx::query("UPDATE providers SET credential_ref = ?, credential_mask = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(reference)
         .bind(mask)
         .bind(provider_id)
         .execute(pool)
         .await
         .map_err(|error| error.to_string())?;
+        if result.rows_affected() != 1 {
+            return Err("expected exactly one updated provider row".into());
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = database_result {
+        return Err(secret_database_error(provider_id, error, &mutation));
+    }
     get_provider(pool, provider_id).await
 }
 
@@ -2253,38 +2427,51 @@ pub async fn replace_headers(
     provider_id: &str,
     headers_json: Option<String>,
 ) -> Result<ProviderView, String> {
-    let reference = format!("provider/{provider_id}/headers");
-    let keys = if let Some(json) = headers_json
+    let row = sqlx::query("SELECT headers_ref FROM providers WHERE id = ?")
+        .bind(provider_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Provider {provider_id} not found"))?;
+    let reference = row
+        .get::<Option<String>, _>("headers_ref")
+        .unwrap_or_else(|| format!("provider/{provider_id}/headers"));
+    let raw = headers_json
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json)
-            .map_err(|error| format!("Headers must be a JSON object: {error}"))?;
-        let blocked = ["host", "content-length", "transfer-encoding", "connection"];
-        let mut keys = Vec::new();
-        for (key, value) in &object {
-            if blocked.contains(&key.to_lowercase().as_str()) {
-                return Err(format!("Header {key} cannot be overridden"));
-            }
-            if !value.is_string() {
-                return Err(format!("Header {key} must have a string value"));
-            }
-            keys.push(key.clone());
-        }
-        keys.sort();
-        secrets::write(&reference, json)?;
-        keys
+        .filter(|value| !value.trim().is_empty());
+    let validated = if let Some(raw) = raw {
+        parse_and_validate_headers_json(raw)?
     } else {
-        secrets::delete(&reference)?;
-        Vec::new()
+        ValidatedHeaders {
+            keys: Vec::new(),
+            values: Vec::new(),
+        }
     };
-    sqlx::query("UPDATE providers SET headers_ref = ?, header_keys_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    let replacement = if validated.values.is_empty() {
+        None
+    } else {
+        raw
+    };
+    let header_keys_json =
+        serde_json::to_string(&validated.keys).map_err(|error| error.to_string())?;
+    let mutation = SecretMutation::apply(reference.clone(), replacement)?;
+    let database_result: Result<(), String> = async {
+        let result = sqlx::query("UPDATE providers SET headers_ref = ?, header_keys_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(reference)
-        .bind(serde_json::to_string(&keys).map_err(|error| error.to_string())?)
+        .bind(header_keys_json)
         .bind(provider_id)
         .execute(pool)
         .await
         .map_err(|error| error.to_string())?;
+        if result.rows_affected() != 1 {
+            return Err("expected exactly one updated provider row".into());
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = database_result {
+        return Err(secret_database_error(provider_id, error, &mutation));
+    }
     get_provider(pool, provider_id).await
 }
 
@@ -2343,6 +2530,11 @@ pub async fn update_model(pool: &SqlitePool, input: UpdateModelInput) -> Result<
     let base_url: String = model.get("base_url");
     let request_name: String = model.get("request_name");
     let inferred = infer_capabilities(descriptor.codec, &base_url, &request_name);
+    if inferred.thinking_required && !input.capability_reasoning {
+        return Err(format!(
+            "Model \"{request_name}\" requires thinking and cannot disable reasoning capability"
+        ));
+    }
 
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query("UPDATE models SET alias = ?, capability_reasoning = ?, capability_web = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
@@ -2454,20 +2646,9 @@ pub async fn runtime_config(pool: &SqlitePool, id: &str) -> Result<ProviderRunti
     }
     let custom_headers = match headers_secret {
         Some(json) => {
-            let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json)
-                .map_err(|error| format!("Provider {id} header secret JSON is invalid: {error}"))?;
-            let mut headers = Vec::with_capacity(object.len());
-            for (key, value) in object {
-                let value = value.as_str().ok_or_else(|| {
-                    format!("Provider {id} custom header {key} must have a string value")
-                })?;
-                headers.push((key, value.to_string()));
-            }
-            let mut actual_keys = headers
-                .iter()
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            actual_keys.sort();
+            let validated = parse_and_validate_headers_json(&json)
+                .map_err(|error| format!("Provider {id} custom headers are invalid: {error}"))?;
+            let actual_keys = validated.keys;
             let mut recorded_keys = header_keys;
             recorded_keys.sort();
             if actual_keys != recorded_keys {
@@ -2475,7 +2656,7 @@ pub async fn runtime_config(pool: &SqlitePool, id: &str) -> Result<ProviderRunti
                     "Provider {id} custom header metadata does not match its stored secret"
                 ));
             }
-            headers
+            validated.values
         }
         None => Vec::new(),
     };
@@ -2532,6 +2713,91 @@ mod tests {
         UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
         UpdateProviderConfigInput, UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
     };
+
+    #[test]
+    fn custom_header_json_uses_http_validation_and_rejects_unsafe_fields() {
+        let valid = parse_and_validate_headers_json(
+            r#"{"Authorization":"Custom token","anthropic-version":"custom-version","X-Trace":"value"}"#,
+        )
+        .expect("valid custom headers");
+        assert_eq!(
+            valid.keys,
+            vec!["Authorization", "X-Trace", "anthropic-version"]
+        );
+        assert!(valid
+            .values
+            .contains(&("Authorization".into(), "Custom token".into())));
+
+        for raw in [
+            r#"{"bad header":"value"}"#,
+            r#"{"X-Test":"line\r\nbreak"}"#,
+            r#"{"X-Test":1}"#,
+            r#"{"X-Test":"one","X-Test":"two"}"#,
+            r#"{"X-Test":"one","x-test":"two"}"#,
+            r#"[]"#,
+        ] {
+            assert!(
+                parse_and_validate_headers_json(raw).is_err(),
+                "must reject {raw}"
+            );
+        }
+
+        for name in FORBIDDEN_CUSTOM_HEADERS {
+            let raw = format!(
+                "{{{}:\"value\"}}",
+                serde_json::to_string(name).expect("header name JSON")
+            );
+            let error = parse_and_validate_headers_json(&raw).expect_err("forbidden header");
+            assert!(error.contains(name), "{name}: {error}");
+            assert!(error.contains("cannot be overridden"));
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_custom_parameter_corruption_is_not_downgraded() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let assistant = create_assistant(
+            &pool,
+            CreateAssistantInput {
+                purpose: ProviderPurpose::Translation,
+            },
+        )
+        .await
+        .expect("create assistant");
+
+        for raw in ["{broken", "[]", "null"] {
+            sqlx::query("UPDATE assistants SET custom_parameters_json = ? WHERE id = ?")
+                .bind(raw)
+                .bind(&assistant.id)
+                .execute(&pool)
+                .await
+                .expect("store corrupt assistant parameters");
+            let error = get_assistant(&pool, &assistant.id)
+                .await
+                .expect_err("corrupt assistant parameters");
+            assert!(error.contains(&assistant.id), "{error}");
+            assert!(error.contains("custom parameters"), "{error}");
+        }
+
+        sqlx::query("UPDATE assistants SET custom_parameters_json = ? WHERE id = ?")
+            .bind(r#"{"nested":{"keep":true}}"#)
+            .bind(&assistant.id)
+            .execute(&pool)
+            .await
+            .expect("restore valid assistant parameters");
+        assert_eq!(
+            get_assistant(&pool, &assistant.id)
+                .await
+                .expect("valid assistant")
+                .custom_parameters,
+            json!({"nested": {"keep": true}})
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn unknown_protocol_rows_survive_startup_and_can_be_repaired() {
@@ -2865,6 +3131,239 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[tokio::test]
+    async fn runtime_rejects_persisted_forbidden_headers_with_provider_context() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let provider = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Legacy unsafe headers".into(),
+                protocol: ProtocolId::registered("openai-chat"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create provider");
+        let reference = format!("test/{}/legacy-headers", provider.id);
+        secrets::write(&reference, r#"{"Content-Type":"text/plain"}"#)
+            .expect("write isolated legacy header secret");
+        sqlx::query("UPDATE providers SET headers_ref = ?, header_keys_json = ? WHERE id = ?")
+            .bind(&reference)
+            .bind(r#"["Content-Type"]"#)
+            .bind(&provider.id)
+            .execute(&pool)
+            .await
+            .expect("store legacy header metadata");
+
+        let error = runtime_config(&pool, &provider.id)
+            .await
+            .expect_err("forbidden persisted header");
+        let _ = secrets::delete(&reference);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+
+        assert!(error.contains(&provider.id), "{error}");
+        assert!(error.contains("Content-Type"), "{error}");
+        assert!(error.contains("cannot be overridden"), "{error}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn provider_secret_mutations_restore_old_values_after_database_failure() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let provider = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Secret rollback".into(),
+                protocol: ProtocolId::registered("openai-chat"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create provider");
+        replace_credential(&pool, &provider.id, Some("old-credential".into()))
+            .await
+            .expect("store old credential");
+        let old_headers_json = r#"{"X-Rollback":"old-header"}"#;
+        replace_headers(&pool, &provider.id, Some(old_headers_json.into()))
+            .await
+            .expect("store old headers");
+
+        let vertex = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Vertex secret rollback".into(),
+                protocol: ProtocolId::registered("vertex-ai"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create vertex provider");
+        update_vertex_ai_config(
+            &pool,
+            UpdateVertexAiConfigInput {
+                provider_id: vertex.id.clone(),
+                project_id: "project-old".into(),
+                location: "global".into(),
+                client_email: "old@example.invalid".into(),
+                private_key: Some("old-private-key".into()),
+            },
+        )
+        .await
+        .expect("store old vertex key");
+
+        let no_prior_secret = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "No prior secret rollback".into(),
+                protocol: ProtocolId::registered("openai-chat"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("create provider without prior secret");
+        sqlx::query(
+            "UPDATE providers SET credential_ref = NULL, credential_mask = NULL WHERE id = ?",
+        )
+        .bind(&no_prior_secret.id)
+        .execute(&pool)
+        .await
+        .expect("clear legacy credential reference");
+
+        let credential_ref = format!("provider/{}/credential", provider.id);
+        let headers_ref = format!("provider/{}/headers", provider.id);
+        let vertex_ref = format!("provider/{}/credential", vertex.id);
+        let old_vertex_key = secrets::read(&vertex_ref)
+            .expect("read old vertex key")
+            .expect("old vertex key exists");
+        sqlx::query(
+            "CREATE TRIGGER fail_provider_secret_update BEFORE UPDATE ON providers BEGIN SELECT RAISE(ABORT, 'forced provider secret update failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("create failure trigger");
+
+        let credential_write =
+            replace_credential(&pool, &provider.id, Some("new-credential".into())).await;
+        let credential_after_write = secrets::read(&credential_ref);
+        let credential_clear = replace_credential(&pool, &provider.id, None).await;
+        let credential_after_clear = secrets::read(&credential_ref);
+        let header_write = replace_headers(
+            &pool,
+            &provider.id,
+            Some(r#"{"X-Rollback":"new-header"}"#.into()),
+        )
+        .await;
+        let headers_after_write = secrets::read(&headers_ref);
+        let header_clear = replace_headers(&pool, &provider.id, Some("{}".into())).await;
+        let headers_after_clear = secrets::read(&headers_ref);
+        let vertex_write = update_vertex_ai_config(
+            &pool,
+            UpdateVertexAiConfigInput {
+                provider_id: vertex.id.clone(),
+                project_id: "project-new".into(),
+                location: "us-central1".into(),
+                client_email: "new@example.invalid".into(),
+                private_key: Some("new-private-key".into()),
+            },
+        )
+        .await;
+        let vertex_after_write = secrets::read(&vertex_ref);
+        let vertex_clear = update_vertex_ai_config(
+            &pool,
+            UpdateVertexAiConfigInput {
+                provider_id: vertex.id.clone(),
+                project_id: "project-new".into(),
+                location: "us-central1".into(),
+                client_email: "new@example.invalid".into(),
+                private_key: Some(String::new()),
+            },
+        )
+        .await;
+        let vertex_after_clear = secrets::read(&vertex_ref);
+        let no_prior_write = replace_credential(
+            &pool,
+            &no_prior_secret.id,
+            Some("must-not-be-orphaned".into()),
+        )
+        .await;
+        let no_prior_ref = format!("provider/{}/credential", no_prior_secret.id);
+        let no_prior_after_write = secrets::read(&no_prior_ref);
+
+        sqlx::query("DROP TRIGGER fail_provider_secret_update")
+            .execute(&pool)
+            .await
+            .expect("drop failure trigger");
+        let cleared_headers = replace_headers(&pool, &provider.id, Some("{}".into()))
+            .await
+            .expect("empty header object clears headers");
+        let headers_after_successful_clear = secrets::read(&headers_ref);
+        let _ = secrets::delete(&credential_ref);
+        let _ = secrets::delete(&headers_ref);
+        let _ = secrets::delete(&vertex_ref);
+        let _ = secrets::delete(&no_prior_ref);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+
+        for result in [
+            credential_write.map(|_| ()),
+            credential_clear.map(|_| ()),
+            header_write.map(|_| ()),
+            header_clear.map(|_| ()),
+            vertex_write.map(|_| ()),
+            vertex_clear.map(|_| ()),
+            no_prior_write.map(|_| ()),
+        ] {
+            let error = result.expect_err("triggered database failure");
+            assert!(
+                error.contains("forced provider secret update failure"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            credential_after_write.expect("read credential after failed write"),
+            Some("old-credential".into())
+        );
+        assert_eq!(
+            credential_after_clear.expect("read credential after failed clear"),
+            Some("old-credential".into())
+        );
+        assert_eq!(
+            headers_after_write.expect("read headers after failed write"),
+            Some(old_headers_json.into())
+        );
+        assert_eq!(
+            headers_after_clear.expect("read headers after failed clear"),
+            Some(old_headers_json.into())
+        );
+        assert_eq!(
+            vertex_after_write.expect("read vertex key after failed write"),
+            Some(old_vertex_key.clone())
+        );
+        assert_eq!(
+            vertex_after_clear.expect("read vertex key after failed clear"),
+            Some(old_vertex_key)
+        );
+        assert_eq!(
+            no_prior_after_write.expect("read missing prior secret after failed write"),
+            None
+        );
+        assert!(cleared_headers.custom_header_keys.is_empty());
+        assert_eq!(
+            headers_after_successful_clear.expect("read successfully cleared headers"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
     async fn provider_copy_rejects_missing_secrets_and_cleans_up_after_database_failure() {
         let path =
             std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
@@ -2997,6 +3496,59 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 0);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn required_thinking_model_cannot_disable_reasoning_capability() {
+        let path =
+            std::env::temp_dir().join(format!("insitu-translate-{}.sqlite3", new_id("test")));
+        let pool = connect(&path).await.expect("connect");
+        let provider = create_provider(
+            &pool,
+            CreateProviderInput {
+                name: "Claude 5 Test".into(),
+                protocol: ProtocolId::registered("anthropic"),
+                purpose: ProviderPurpose::Translation,
+                avatar: None,
+            },
+        )
+        .await
+        .expect("provider");
+        let model = add_model(
+            &pool,
+            AddModelInput {
+                provider_id: provider.id,
+                request_name: "claude-fable-5".into(),
+                alias: String::new(),
+                source: "manual".into(),
+            },
+        )
+        .await
+        .expect("model");
+        assert!(model.capability_reasoning);
+        assert!(model.thinking_required);
+
+        let error = update_model(
+            &pool,
+            UpdateModelInput {
+                id: model.id.clone(),
+                alias: "Still required".into(),
+                capability_reasoning: false,
+                capability_web: model.capability_web,
+            },
+        )
+        .await
+        .expect_err("required thinking cannot be disabled");
+        assert!(error.contains("requires thinking"));
+        assert!(
+            get_model(&pool, &model.id)
+                .await
+                .expect("model after rejected update")
+                .capability_reasoning
+        );
+
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }

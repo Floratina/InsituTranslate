@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod capabilities;
 pub mod codec;
 pub mod compatibility;
@@ -18,11 +19,13 @@ mod golden_tests;
 #[cfg(test)]
 mod behavior_tests;
 
+pub use budget::CompletionBudget;
 pub use codec::{
     EncodedRequest, EndpointPreview, HeaderDirective, HeaderMode, HttpMethod, ProtocolCodec,
 };
 pub use registry::descriptor_for;
 pub use runtime::{
-    finish_reason_is_truncation, ProviderAdapter, ProviderChatError, ProviderChatMeta,
-    RateLimitTelemetry, RuntimeAdapter,
+    finish_reason_is_truncation, ChatAttemptContext, ChatAttemptGate, ChatAttemptKind,
+    ChatAttemptOutcome, PreparedChatRequest, ProviderAdapter, ProviderChatError, ProviderChatMeta,
+    RateLimitTelemetry, RequestCost, RuntimeAdapter,
 };

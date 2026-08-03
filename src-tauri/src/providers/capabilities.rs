@@ -69,6 +69,8 @@ pub struct ModelCapabilities {
     pub reasoning: bool,
     pub web: bool,
     pub thinking_efforts: Vec<ThinkingEffort>,
+    pub thinking_required: bool,
+    pub default_thinking_effort: Option<ThinkingEffort>,
 }
 
 pub fn infer_capabilities(
@@ -86,9 +88,13 @@ pub fn resolve_capabilities(
     overrides: &CapabilityOverrides,
 ) -> Result<ModelCapabilities, String> {
     let inferred = infer_capabilities(codec, base_url, model_id);
-    let reasoning = overrides
-        .boolean(CapabilityId::REASONING)?
-        .unwrap_or(inferred.reasoning);
+    let reasoning_override = overrides.boolean(CapabilityId::REASONING)?;
+    if inferred.thinking_required && reasoning_override == Some(false) {
+        return Err(format!(
+            "Model \"{model_id}\" requires thinking and cannot disable reasoning capability"
+        ));
+    }
+    let reasoning = reasoning_override.unwrap_or(inferred.reasoning);
     let web = overrides
         .boolean(CapabilityId::WEB)?
         .unwrap_or(inferred.web);
@@ -97,9 +103,16 @@ pub fn resolve_capabilities(
         None if reasoning == inferred.reasoning => inferred.thinking_efforts,
         None => codec.supported_thinking_efforts(base_url, model_id, reasoning),
     };
+    if inferred.thinking_required && thinking_efforts.contains(&ThinkingEffort::None) {
+        return Err(format!(
+            "Model \"{model_id}\" requires thinking and cannot support effort None"
+        ));
+    }
     Ok(ModelCapabilities {
         reasoning,
         web,
         thinking_efforts,
+        thinking_required: inferred.thinking_required,
+        default_thinking_effort: inferred.default_thinking_effort,
     })
 }

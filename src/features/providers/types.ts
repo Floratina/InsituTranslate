@@ -83,6 +83,8 @@ export interface ModelView {
   supportedThinkingEfforts: Array<
     "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
   >;
+  thinkingRequired: boolean;
+  defaultThinkingEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
   capabilityWeb: boolean;
   testStatus: string;
   latencyMs: number | null;

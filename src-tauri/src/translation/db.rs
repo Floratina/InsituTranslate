@@ -27,7 +27,10 @@ use super::context::{
     display_name_from_path, estimate_tokens, global_background_from_texts, next_inp_path,
     sanitize_file_stem, unix_timestamp, unix_timestamp_millis,
 };
-use super::request_options::{resolve_model_request_options, ModelRequestSettings};
+use super::request_options::{
+    resolve_model_request_options, validate_and_plan_model_request, visible_output_token_reserve,
+    ModelRequestOptions, ModelRequestSettings,
+};
 use super::types::{
     ChunkOutcome, ChunkRecord, GlossaryGenerationSnapshot, ProgressDetail, ProgressStep,
     TaskFailureThresholdSnapshot, TaskGlossaryConfig, TaskRuntimeActionRequired,
@@ -670,7 +673,8 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
         let snapshot_json = row
             .try_get::<Option<String>, _>("glossary_generation_snapshot_json")
             .unwrap_or(None);
-        parse_glossary_generation_snapshot_json(snapshot_json)
+        let task_id = row.get::<String, _>("task_id");
+        parse_glossary_generation_snapshot_json(&task_id, snapshot_json)
             .map_err(|_| INP_FILE_DAMAGED.to_string())?;
         let action_json = row
             .try_get::<Option<String>, _>("runtime_action_required_json")
@@ -681,6 +685,9 @@ async fn validate_inp_schema(pool: &SqlitePool) -> Result<(), String> {
     if schema_version >= 12 {
         require_columns(pool, "metadata", &["enable_translation"]).await?;
     }
+    task_assistant_custom_parameters(pool)
+        .await
+        .map_err(|_| INP_FILE_DAMAGED.to_string())?;
     task_failure_thresholds(pool)
         .await
         .map_err(|_| INP_FILE_DAMAGED.to_string())?;
@@ -1335,6 +1342,7 @@ pub async fn validate_translation_config_runtime(
     config: &TranslationConfigView,
 ) -> Result<(), String> {
     validate_translation_config(config)?;
+    let manual_tpm_limit = manual_tpm_limit(config);
     if config.enable_translation {
         let selection = resolve_translation_runtime_selection(
             provider_pool,
@@ -1343,25 +1351,30 @@ pub async fn validate_translation_config_runtime(
             Some(&config.assistant_id),
         )
         .await?;
-        let runtime = app_db::runtime_config(provider_pool, &selection.provider.id).await?;
-        resolve_model_request_options(
+        resolve_and_validate_model_request(
+            provider_pool,
+            &selection.provider,
+            &selection.model,
+            selection.assistant.as_ref(),
             &ModelRequestSettings {
                 thinking_effort: config.thinking_effort,
                 use_web_search: config.use_web_search,
                 use_custom_parameters: config.use_custom_parameters,
             },
-            &runtime,
-            &selection.model,
-            selection
-                .assistant
-                .as_ref()
-                .map(|value| value.custom_parameters.clone())
-                .unwrap_or_else(|| json!({})),
-        )?;
+            config.chunk_token_limit.max(0) as u64,
+            visible_output_token_reserve(config.chunk_token_limit.max(0) as u64),
+            manual_tpm_limit,
+        )
+        .await?;
     }
     if config.use_glossary && config.glossary_mode == GlossaryMode::Auto {
-        build_glossary_generation_snapshot(provider_pool, &config.glossary_generation_config)
-            .await?;
+        build_glossary_generation_snapshot(
+            provider_pool,
+            &config.glossary_generation_config,
+            config.chunk_token_limit,
+            manual_tpm_limit,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1370,6 +1383,74 @@ struct TranslationRuntimeSelection {
     provider: ProviderView,
     model: ModelView,
     assistant: Option<AssistantView>,
+}
+
+struct ResolvedModelRequest {
+    options: ModelRequestOptions,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+}
+
+fn manual_tpm_limit(config: &TranslationConfigView) -> Option<u64> {
+    (config.rate_limit_strategy == RateLimitStrategy::Manual)
+        .then_some(config.max_tokens_per_minute.max(0) as u64)
+}
+
+async fn resolve_and_validate_model_request(
+    provider_pool: &SqlitePool,
+    provider: &ProviderView,
+    model: &ModelView,
+    assistant: Option<&AssistantView>,
+    settings: &ModelRequestSettings,
+    estimated_input_tokens: u64,
+    visible_output_tokens: u32,
+    manual_tpm_limit: Option<u64>,
+) -> Result<ResolvedModelRequest, String> {
+    let runtime = app_db::runtime_config(provider_pool, &provider.id).await?;
+    let options = resolve_model_request_options(
+        settings,
+        &runtime,
+        model,
+        assistant
+            .map(|value| value.custom_parameters.clone())
+            .unwrap_or_else(|| json!({})),
+    )?;
+    let temperature = assistant
+        .filter(|value| value.temperature_enabled)
+        .map(|value| value.temperature);
+    let top_p = assistant
+        .filter(|value| value.top_p_enabled)
+        .map(|value| value.top_p);
+    let completion_budget = validate_and_plan_model_request(
+        &runtime,
+        model,
+        &options,
+        temperature,
+        top_p,
+        visible_output_tokens,
+    )?;
+    if let Some(limit) = manual_tpm_limit {
+        let completion_tokens = u64::from(completion_budget.total_output_tokens);
+        let total_tokens = estimated_input_tokens
+            .checked_add(completion_tokens)
+            .ok_or_else(|| "Manual TPM preflight token estimate overflowed".to_string())?;
+        if total_tokens > limit {
+            return Err(format!(
+                "protocol={} model=\"{}\" estimated_input_tokens={} completion_tokens={} reserved_total_tokens={} exceeds the configured manual TPM limit ({} tokens).",
+                runtime.protocol.as_str(),
+                model.request_name,
+                estimated_input_tokens,
+                completion_tokens,
+                total_tokens,
+                limit,
+            ));
+        }
+    }
+    Ok(ResolvedModelRequest {
+        options,
+        temperature,
+        top_p,
+    })
 }
 
 async fn resolve_translation_runtime_selection(
@@ -1677,12 +1758,6 @@ pub async fn create_translation_task(
     let tags_json = serialize_tags(&tags)?;
     let source_path = PathBuf::from(input.file_path.trim());
     validate_supported_source_file(&source_path)?;
-    let source_bytes = tokio::fs::read(&source_path)
-        .await
-        .map_err(|error| format!("Unable to read source document: {error}"))?;
-    let source_file_name = source_file_name_from_path(&source_path);
-    let materialized_source =
-        materialize_source_bytes(&source_file_name, &source_bytes, &source_path).await?;
     validate_execution_mode(
         input.enable_translation,
         input.use_glossary,
@@ -1714,29 +1789,54 @@ pub async fn create_translation_task(
         .map(|value| value.model.request_name.clone())
         .unwrap_or_default();
     let config = get_translation_config(config_pool).await?;
-    let (task_glossary_config, glossary_generation_snapshot) =
-        snapshot_task_glossary_input(provider_pool, &input).await?;
+    let translation_request = match selection.as_ref() {
+        Some(selection) => Some(
+            resolve_and_validate_model_request(
+                provider_pool,
+                &selection.provider,
+                &selection.model,
+                selection.assistant.as_ref(),
+                &ModelRequestSettings {
+                    thinking_effort: config.thinking_effort,
+                    use_web_search: config.use_web_search,
+                    use_custom_parameters: config.use_custom_parameters,
+                },
+                config.chunk_token_limit.max(0) as u64,
+                visible_output_token_reserve(config.chunk_token_limit.max(0) as u64),
+                manual_tpm_limit(&config),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let (task_glossary_config, glossary_generation_snapshot) = snapshot_task_glossary_input(
+        provider_pool,
+        &input,
+        config.chunk_token_limit,
+        manual_tpm_limit(&config),
+    )
+    .await?;
     let glossary_generation_snapshot_json =
         serialize_glossary_generation_snapshot(glossary_generation_snapshot.as_ref())?;
-    let (assistant_prompt, assistant_custom_parameters, assistant_temperature, assistant_top_p) =
-        match selection.and_then(|value| value.assistant) {
-            Some(assistant) => {
-                let custom_parameters = if config.use_custom_parameters {
-                    assistant.custom_parameters.clone()
-                } else {
-                    json!({})
-                };
-                (
-                    Some(assistant.system_prompt),
-                    custom_parameters,
-                    assistant
-                        .temperature_enabled
-                        .then_some(assistant.temperature),
-                    assistant.top_p_enabled.then_some(assistant.top_p),
-                )
-            }
-            None => (None, json!({}), None, None),
+    let assistant_prompt = selection
+        .as_ref()
+        .and_then(|value| value.assistant.as_ref())
+        .map(|assistant| assistant.system_prompt.clone());
+    let (assistant_custom_parameters, assistant_temperature, assistant_top_p) =
+        match translation_request {
+            Some(request) => (
+                request.options.custom_parameters,
+                request.temperature,
+                request.top_p,
+            ),
+            None => (json!({}), None, None),
         };
+    let source_bytes = tokio::fs::read(&source_path)
+        .await
+        .map_err(|error| format!("Unable to read source document: {error}"))?;
+    let source_file_name = source_file_name_from_path(&source_path);
+    let materialized_source =
+        materialize_source_bytes(&source_file_name, &source_bytes, &source_path).await?;
     let task_id = app_db::new_id("task");
     let display_name = display_name_from_path(&source_path);
     let inp_path = next_inp_path(workspace_root, &display_name).await?;
@@ -2299,19 +2399,20 @@ pub async fn apply_staged_task_execution_snapshot(
             .map_err(|error| error.to_string())?;
     let mut effective_config = snapshot.config.clone();
     effective_config.chunk_token_limit = preprocessing_row.get("token_limit");
-    let preprocessing_snapshot: Value = serde_json::from_str(
-        preprocessing_row
-            .get::<String, _>("config_snapshot_json")
-            .as_str(),
-    )
-    .map_err(|error| format!("Stored preprocessing config snapshot is invalid: {error}"))?;
+    let preprocessing_snapshot = parse_task_json_object(
+        task_id,
+        "preprocessing config snapshot",
+        &preprocessing_row.get::<String, _>("config_snapshot_json"),
+    )?;
     effective_config.pdf_parsing_mode = serde_json::from_value(
         preprocessing_snapshot
             .get("pdfParsingMode")
             .cloned()
-            .ok_or_else(|| "Stored preprocessing PDF parsing mode is missing".to_string())?,
+            .ok_or_else(|| format!("Task {task_id} preprocessing PDF parsing mode is missing"))?,
     )
-    .map_err(|error| format!("Stored preprocessing PDF parsing mode is invalid: {error}"))?;
+    .map_err(|error| {
+        format!("Task {task_id} preprocessing PDF parsing mode is invalid: {error}")
+    })?;
     let total_chunks = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chunks")
         .fetch_one(&inp_pool)
         .await
@@ -2939,16 +3040,20 @@ async fn resolve_task_runtime_snapshot(
     {
         return Err("Glossary selection is required when using an existing glossary".into());
     }
-    let glossary_snapshot = if glossary_config.use_glossary
-        && glossary_config.glossary_mode == GlossaryMode::Auto
-    {
-        Some(
-            build_glossary_generation_snapshot(provider_pool, &config.glossary_generation_config)
+    let glossary_snapshot =
+        if glossary_config.use_glossary && glossary_config.glossary_mode == GlossaryMode::Auto {
+            Some(
+                build_glossary_generation_snapshot(
+                    provider_pool,
+                    &config.glossary_generation_config,
+                    config.chunk_token_limit,
+                    manual_tpm_limit(&config),
+                )
                 .await?,
-        )
-    } else {
-        None
-    };
+            )
+        } else {
+            None
+        };
     let glossary_generation_snapshot_json =
         serialize_glossary_generation_snapshot(glossary_snapshot.as_ref())?;
     let assistant_system_prompt = assistant.as_ref().map(|value| value.system_prompt.clone());
@@ -4457,6 +4562,8 @@ pub(super) async fn task_glossary_config(pool: &SqlitePool) -> Result<TaskGlossa
 async fn build_glossary_generation_snapshot(
     provider_pool: &SqlitePool,
     generation_config: &super::GlossaryGenerationConfig,
+    chunk_token_limit: i64,
+    manual_tpm_limit: Option<u64>,
 ) -> Result<GlossaryGenerationSnapshot, String> {
     validate_failure_percentage(generation_config.max_failure_percentage)?;
     let provider_id = generation_config.provider_id.trim();
@@ -4505,20 +4612,21 @@ async fn build_glossary_generation_snapshot(
         }
         None => None,
     };
-    let runtime = app_db::runtime_config(provider_pool, provider_id).await?;
-    let options = resolve_model_request_options(
+    let request = resolve_and_validate_model_request(
+        provider_pool,
+        &provider,
+        model,
+        assistant.as_ref(),
         &ModelRequestSettings {
             thinking_effort: generation_config.thinking_effort,
             use_web_search: generation_config.use_web_search,
             use_custom_parameters: generation_config.use_custom_parameters,
         },
-        &runtime,
-        model,
-        assistant
-            .as_ref()
-            .map(|value| value.custom_parameters.clone())
-            .unwrap_or_else(|| json!({})),
-    )?;
+        chunk_token_limit.max(0) as u64,
+        visible_output_token_reserve(chunk_token_limit.max(0) as u64),
+        manual_tpm_limit,
+    )
+    .await?;
     Ok(GlossaryGenerationSnapshot {
         version: GLOSSARY_GENERATION_SNAPSHOT_VERSION,
         provider_id: provider.id.clone(),
@@ -4526,23 +4634,19 @@ async fn build_glossary_generation_snapshot(
         model_request_name: model.request_name.clone(),
         assistant_id,
         assistant_system_prompt: assistant.as_ref().map(|value| value.system_prompt.clone()),
-        assistant_custom_parameters: options.custom_parameters,
-        temperature: assistant
-            .as_ref()
-            .filter(|value| value.temperature_enabled)
-            .map(|value| value.temperature),
-        top_p: assistant
-            .as_ref()
-            .filter(|value| value.top_p_enabled)
-            .map(|value| value.top_p),
-        web_search: options.web_search,
-        thinking: options.thinking,
+        assistant_custom_parameters: request.options.custom_parameters,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        web_search: request.options.web_search,
+        thinking: request.options.thinking,
     })
 }
 
 async fn snapshot_task_glossary_input(
     provider_pool: &SqlitePool,
     input: &CreateTranslationTaskInput,
+    chunk_token_limit: i64,
+    manual_tpm_limit: Option<u64>,
 ) -> Result<(TaskGlossaryConfig, Option<GlossaryGenerationSnapshot>), String> {
     validate_execution_mode(
         input.enable_translation,
@@ -4583,6 +4687,8 @@ async fn snapshot_task_glossary_input(
                 build_glossary_generation_snapshot(
                     provider_pool,
                     &input.glossary_generation_config,
+                    chunk_token_limit,
+                    manual_tpm_limit,
                 )
                 .await?,
             ),
@@ -4598,22 +4704,41 @@ fn serialize_glossary_generation_snapshot(
         .transpose()
 }
 
+pub(super) fn parse_task_json_object(
+    task_id: &str,
+    label: &str,
+    raw: &str,
+) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("Task {task_id} {label} JSON is invalid: {error}"))?;
+    if !value.is_object() {
+        return Err(format!("Task {task_id} {label} must be a JSON object"));
+    }
+    Ok(value)
+}
+
 fn parse_glossary_generation_snapshot_json(
+    task_id: &str,
     value: Option<String>,
 ) -> Result<Option<GlossaryGenerationSnapshot>, String> {
     let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
     };
-    let snapshot = serde_json::from_str::<GlossaryGenerationSnapshot>(&value)
-        .map_err(|error| format!("Task glossary generation snapshot JSON is invalid: {error}"))?;
+    let value = parse_task_json_object(task_id, "glossary generation snapshot", &value)?;
+    let snapshot =
+        serde_json::from_value::<GlossaryGenerationSnapshot>(value).map_err(|error| {
+            format!("Task {task_id} glossary generation snapshot JSON is invalid: {error}")
+        })?;
     if snapshot.version != GLOSSARY_GENERATION_SNAPSHOT_VERSION {
         return Err(format!(
-            "Unsupported task glossary generation snapshot version: {}",
+            "Task {task_id} has unsupported glossary generation snapshot version: {}",
             snapshot.version
         ));
     }
     if !snapshot.assistant_custom_parameters.is_object() {
-        return Err("Task glossary assistant custom parameters must be a JSON object".into());
+        return Err(format!(
+            "Task {task_id} glossary assistant custom parameters must be a JSON object"
+        ));
     }
     Ok(Some(snapshot))
 }
@@ -4621,13 +4746,15 @@ fn parse_glossary_generation_snapshot_json(
 pub(super) async fn task_glossary_generation_snapshot(
     pool: &SqlitePool,
 ) -> Result<Option<GlossaryGenerationSnapshot>, String> {
-    let value =
-        sqlx::query_scalar("SELECT glossary_generation_snapshot_json FROM metadata LIMIT 1")
-            .fetch_optional(pool)
+    let row =
+        sqlx::query("SELECT task_id, glossary_generation_snapshot_json FROM metadata LIMIT 1")
+            .fetch_one(pool)
             .await
-            .map_err(|error| error.to_string())?
-            .flatten();
-    parse_glossary_generation_snapshot_json(value)
+            .map_err(|error| error.to_string())?;
+    parse_glossary_generation_snapshot_json(
+        &row.get::<String, _>("task_id"),
+        row.get("glossary_generation_snapshot_json"),
+    )
 }
 
 async fn write_task_glossary_generation_snapshot(
@@ -4661,6 +4788,8 @@ pub(super) async fn ensure_task_glossary_generation_snapshot(
     let snapshot = build_glossary_generation_snapshot(
         provider_pool,
         &fallback_config.glossary_generation_config,
+        fallback_config.chunk_token_limit,
+        manual_tpm_limit(fallback_config),
     )
     .await?;
     write_task_glossary_generation_snapshot(pool, &snapshot).await?;
@@ -4723,24 +4852,15 @@ pub(super) async fn set_task_glossary_id(
 }
 
 pub(super) async fn task_assistant_custom_parameters(pool: &SqlitePool) -> Result<Value, String> {
-    let json: Option<String> =
-        sqlx::query_scalar("SELECT assistant_custom_parameters_json FROM metadata LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .map_err(|error| error.to_string())?
-            .flatten();
-    match json {
-        Some(value) if !value.trim().is_empty() => {
-            let parsed = serde_json::from_str::<Value>(&value)
-                .map_err(|error| format!("Assistant custom parameters JSON is invalid: {error}"))?;
-            if parsed.is_object() {
-                Ok(parsed)
-            } else {
-                Ok(json!({}))
-            }
-        }
-        _ => Ok(json!({})),
-    }
+    let row = sqlx::query("SELECT task_id, assistant_custom_parameters_json FROM metadata LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    parse_task_json_object(
+        &row.get::<String, _>("task_id"),
+        "assistant custom parameters snapshot",
+        &row.get::<String, _>("assistant_custom_parameters_json"),
+    )
 }
 
 fn task_failure_thresholds_from_config(
@@ -4756,13 +4876,18 @@ fn task_failure_thresholds_from_config(
 pub(super) async fn task_failure_thresholds(
     pool: &SqlitePool,
 ) -> Result<TaskFailureThresholdSnapshot, String> {
-    let config_snapshot_json: String =
-        sqlx::query_scalar("SELECT config_snapshot_json FROM metadata LIMIT 1")
-            .fetch_one(pool)
-            .await
-            .map_err(|error| error.to_string())?;
-    let thresholds = serde_json::from_str::<TaskFailureThresholdSnapshot>(&config_snapshot_json)
-        .map_err(|error| format!("Stored task config snapshot is invalid: {error}"))?;
+    let row = sqlx::query("SELECT task_id, config_snapshot_json FROM metadata LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let task_id = row.get::<String, _>("task_id");
+    let snapshot = parse_task_json_object(
+        &task_id,
+        "config snapshot",
+        &row.get::<String, _>("config_snapshot_json"),
+    )?;
+    let thresholds = serde_json::from_value::<TaskFailureThresholdSnapshot>(snapshot)
+        .map_err(|error| format!("Task {task_id} config snapshot JSON is invalid: {error}"))?;
     validate_failure_percentage(thresholds.max_failure_percentage)?;
     validate_failure_percentage(thresholds.glossary_max_failure_percentage)?;
     Ok(thresholds)
@@ -4806,13 +4931,16 @@ pub(super) async fn task_execution_config(
     pool: &SqlitePool,
     config_pool: &SqlitePool,
 ) -> Result<TranslationConfigView, String> {
-    let snapshot_json: String =
-        sqlx::query_scalar("SELECT config_snapshot_json FROM metadata LIMIT 1")
-            .fetch_one(pool)
-            .await
-            .map_err(|error| error.to_string())?;
-    let snapshot: Value = serde_json::from_str(&snapshot_json)
-        .map_err(|error| format!("Stored task config snapshot is invalid: {error}"))?;
+    let row = sqlx::query("SELECT task_id, config_snapshot_json FROM metadata LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let task_id = row.get::<String, _>("task_id");
+    let snapshot = parse_task_json_object(
+        &task_id,
+        "config snapshot",
+        &row.get::<String, _>("config_snapshot_json"),
+    )?;
     let is_execution_snapshot = snapshot.as_object().is_some_and(|object| {
         [
             "sourceLanguage",
@@ -4830,7 +4958,7 @@ pub(super) async fn task_execution_config(
     });
     if is_execution_snapshot {
         let config = serde_json::from_value::<TranslationConfigView>(snapshot)
-            .map_err(|error| format!("Stored task config snapshot is invalid: {error}"))?;
+            .map_err(|error| format!("Task {task_id} config snapshot JSON is invalid: {error}"))?;
         Ok(normalize_translation_config(config))
     } else {
         get_translation_config(config_pool).await

@@ -15,8 +15,8 @@ use crate::document_parsing::restore_chunk_for_map;
 use crate::domain::UnifiedChatRequest;
 use crate::pdf_parsing::PdfParsingMode;
 use crate::providers::{
-    finish_reason_is_truncation, ProviderChatError, ProviderChatMeta, RateLimitTelemetry,
-    RuntimeAdapter,
+    finish_reason_is_truncation, ChatAttemptContext, ChatAttemptKind, PreparedChatRequest,
+    ProviderChatError, ProviderChatMeta, RateLimitTelemetry, RuntimeAdapter,
 };
 use crate::task_prompt::{ContentFormat, DocumentFormat, TaskChunkInput};
 use crate::translation_prompt::{
@@ -42,8 +42,11 @@ use super::db::{
 use super::glossary::{prepare_task_glossary, TaskGlossaryMatcher, TaskGlossaryPreparation};
 use super::limiter::{
     current_rate_limit_status, AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter,
+    TaskChatAttemptGate,
 };
-use super::request_options::{resolve_translation_request_options, TranslationRequestOptions};
+use super::request_options::{
+    resolve_translation_request_options, visible_output_token_reserve, TranslationRequestOptions,
+};
 use super::types::{ChunkOutcome, ChunkRecord};
 use super::{
     failure_threshold_exceeded, ConfidenceMode, ContextHandlingMode, PreparedRun, ProgressDetail,
@@ -1075,38 +1078,40 @@ pub(super) async fn translate_chunk(
             logprobs: confidence_mode.enabled(),
             custom_parameters: request_options.custom_parameters.clone(),
         };
-        let estimated_tokens = estimate_tokens(&chunk.source_text)
-            + global_background
-                .as_deref()
-                .map(estimate_tokens)
-                .unwrap_or(0)
-            + previous_context
-                .as_deref()
-                .map(estimate_tokens)
-                .unwrap_or(0)
-            + 256;
-        if let Some(manual_limiter) = manual_limiter.as_ref() {
-            if !manual_limiter
-                .before_request(estimated_tokens, interrupt.token())
-                .await
-            {
-                return interrupted_outcome(chunk, retry_count, interrupt.reason());
+        let visible_output_tokens =
+            visible_output_token_reserve(estimate_tokens(&chunk.source_text));
+        let prepared = match adapter.prepare_chat_request(&request, visible_output_tokens) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                log_chunk_issue(
+                    &backend_log,
+                    "ERROR",
+                    &chunk,
+                    attempt,
+                    max_retries,
+                    format!("request preflight failed before network I/O: {error}"),
+                );
+                return failed_outcome(
+                    chunk,
+                    TranslationChunkStatus::Failed,
+                    retry_count,
+                    Some(error),
+                    None,
+                    last_stats,
+                    None,
+                    true,
+                );
             }
-        }
-        if !quota
-            .before_request(estimated_tokens, interrupt.token())
-            .await
-        {
-            return interrupted_outcome(chunk, retry_count, interrupt.reason());
-        }
+        };
+        let attempt_gate = TaskChatAttemptGate::new(quota.clone(), manual_limiter.clone());
         let request_result = send_chat_with_logprobs_fallback(
             &adapter,
-            &request,
-            estimated_tokens,
-            &quota,
+            &prepared,
+            visible_output_tokens,
+            &attempt_gate,
             &limiter,
-            manual_limiter.as_ref(),
             interrupt.token(),
+            attempt,
         )
         .await;
         if interrupt.is_interrupted() {
@@ -1114,22 +1119,26 @@ pub(super) async fn translate_chunk(
         }
         match request_result {
             Ok(Some(meta)) => {
-                quota.update(&meta.rate_limits).await;
                 limiter
                     .on_result(meta.rate_limits.has_quota_headers(), true, false)
                     .await;
-                let mut stats = token_stats_from_response(&meta.response, &chunk.source_text);
-                if stats.input_tokens == 0 {
-                    stats.input_tokens = estimate_tokens(&chunk.source_text);
-                }
-                if stats.output_tokens == 0 {
-                    stats.output_tokens = estimate_tokens(&meta.response.text);
-                }
-                stats.thinking_tokens = estimate_tokens(&meta.response.reasoning);
-                stats.total_tokens =
-                    stats.input_tokens + stats.output_tokens + stats.thinking_tokens;
+                let stats = match token_stats_from_response(&meta.response, &chunk.source_text) {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        return failed_outcome(
+                            chunk,
+                            TranslationChunkStatus::Failed,
+                            retry_count,
+                            Some(error),
+                            None,
+                            last_stats,
+                            None,
+                            true,
+                        );
+                    }
+                };
                 last_stats = stats.clone();
-                let confidence = if request.logprobs {
+                let confidence = if prepared.request.logprobs {
                     meta.response
                         .logprob_stats
                         .as_ref()
@@ -1140,56 +1149,33 @@ pub(super) async fn translate_chunk(
                 let text = meta.response.text;
                 let rate_status =
                     current_rate_limit_status(&meta.rate_limits, &limiter, &manual_limiter).await;
+                if finish_reason_is_truncation(meta.finish_reason.as_deref()) {
+                    let finish_reason = meta.finish_reason.as_deref().unwrap_or("truncation");
+                    let error = adapter.output_truncation_error(&prepared.request, finish_reason);
+                    log_chunk_issue(
+                        &backend_log,
+                        "ERROR",
+                        &chunk,
+                        attempt,
+                        max_retries,
+                        format!(
+                            "provider returned status={} finish_reason={}; deterministic truncation will not be retried; {}; error={}",
+                            meta.status,
+                            finish_reason,
+                            rate_limit_summary(&meta.rate_limits),
+                            error
+                        ),
+                    );
+                    let mut outcome = interrupted_outcome(chunk, retry_count, Some(error));
+                    outcome.token_stats = last_stats;
+                    outcome.rate_limit_status = rate_status;
+                    return outcome;
+                }
                 last_text = Some(if text.is_empty() {
                     chunk.source_text.clone()
                 } else {
                     text.clone()
                 });
-                if finish_reason_is_truncation(meta.finish_reason.as_deref()) {
-                    let finish_reason = meta.finish_reason.as_deref().unwrap_or("truncation");
-                    last_error = Some(format!("Interrupted by finish reason: {finish_reason}"));
-                    log_chunk_issue(
-                        &backend_log,
-                        if attempt == max_retries {
-                            "ERROR"
-                        } else {
-                            "WARN"
-                        },
-                        &chunk,
-                        attempt,
-                        max_retries,
-                        format!(
-                            "provider returned status={} finish_reason={} {}; {}",
-                            meta.status,
-                            finish_reason,
-                            retry_action(attempt, max_retries),
-                            rate_limit_summary(&meta.rate_limits)
-                        ),
-                    );
-                    if attempt == max_retries {
-                        return failed_outcome(
-                            chunk,
-                            TranslationChunkStatus::Interrupted,
-                            retry_count,
-                            last_error,
-                            last_text,
-                            last_stats,
-                            rate_status,
-                            false,
-                        );
-                    }
-                    report_active_retry(
-                        retry_reporter.as_ref(),
-                        &chunk,
-                        attempt,
-                        max_retries,
-                        last_error
-                            .as_deref()
-                            .unwrap_or("Interrupted by finish reason"),
-                    )
-                    .await;
-                    continue;
-                }
                 if text.trim().is_empty() {
                     last_error = Some("Model returned empty content".to_string());
                     log_chunk_issue(
@@ -1347,7 +1333,6 @@ pub(super) async fn translate_chunk(
                 return interrupted_outcome(chunk, retry_count, interrupt.reason());
             }
             Err(error) => {
-                quota.update(&error.rate_limits).await;
                 limiter
                     .on_result(
                         error.rate_limits.has_quota_headers(),
@@ -1459,15 +1444,24 @@ pub(super) async fn translate_chunk(
 
 async fn send_chat_with_logprobs_fallback(
     adapter: &RuntimeAdapter,
-    request: &UnifiedChatRequest,
-    estimated_tokens: u64,
-    quota: &HeaderQuotaPolicy,
+    prepared: &PreparedChatRequest,
+    visible_output_tokens: u32,
+    gate: &TaskChatAttemptGate,
     limiter: &AdaptiveLimiter,
-    manual_limiter: Option<&Arc<ManualRateLimiter>>,
     cancellation: &CancellationToken,
+    logical_attempt: u32,
 ) -> Result<Option<ProviderChatMeta>, ProviderChatError> {
     let initial = tokio::select! {
-        result = adapter.send_chat_with_meta(request) => Some(result),
+        result = adapter.send_prepared_chat_with_gate(
+            prepared,
+            gate,
+            ChatAttemptContext {
+                kind: ChatAttemptKind::Primary,
+                logical_attempt,
+                compatibility_retry: false,
+            },
+            cancellation,
+        ) => Some(result),
         _ = cancellation.cancelled() => None,
     };
     let Some(initial) = initial else {
@@ -1475,8 +1469,7 @@ async fn send_chat_with_logprobs_fallback(
     };
     match initial {
         Ok(meta) => Ok(Some(meta)),
-        Err(error) if request.logprobs && logprobs_parameter_rejected(&error) => {
-            quota.update(&error.rate_limits).await;
+        Err(error) if prepared.request.logprobs && logprobs_parameter_rejected(&error) => {
             limiter
                 .on_result(
                     error.rate_limits.has_quota_headers(),
@@ -1484,21 +1477,22 @@ async fn send_chat_with_logprobs_fallback(
                     error.is_rate_limited(),
                 )
                 .await;
-            let mut fallback = request.clone();
+            let mut fallback = prepared.request.clone();
             fallback.logprobs = false;
-            if let Some(manual_limiter) = manual_limiter {
-                if !manual_limiter
-                    .before_request(estimated_tokens, cancellation)
-                    .await
-                {
-                    return Ok(None);
-                }
-            }
-            if !quota.before_request(estimated_tokens, cancellation).await {
-                return Ok(None);
-            }
+            let fallback = adapter
+                .prepare_chat_request(&fallback, visible_output_tokens)
+                .map_err(ProviderChatError::local)?;
             tokio::select! {
-                result = adapter.send_chat_with_meta(&fallback) => result.map(Some),
+                result = adapter.send_prepared_chat_with_gate(
+                    &fallback,
+                    gate,
+                    ChatAttemptContext {
+                        kind: ChatAttemptKind::LogprobsFallback,
+                        logical_attempt,
+                        compatibility_retry: false,
+                    },
+                    cancellation,
+                ) => result.map(Some),
                 _ = cancellation.cancelled() => Ok(None),
             }
         }
@@ -1518,15 +1512,10 @@ fn failed_outcome(
     retry_count: i64,
     error_message: Option<String>,
     translated_text: Option<String>,
-    mut token_stats: TokenStats,
+    token_stats: TokenStats,
     rate_limit_status: Option<String>,
     interrupt_task: bool,
 ) -> ChunkOutcome {
-    if token_stats.input_tokens == 0 {
-        token_stats.input_tokens = estimate_tokens(&chunk.source_text);
-        token_stats.total_tokens =
-            token_stats.input_tokens + token_stats.output_tokens + token_stats.thinking_tokens;
-    }
     ChunkOutcome {
         chunk_id: chunk.id,
         status,
@@ -1565,26 +1554,31 @@ fn interrupted_outcome(
 fn token_stats_from_response(
     response: &crate::domain::UnifiedChatResponse,
     source_text: &str,
-) -> TokenStats {
+) -> Result<TokenStats, String> {
     match &response.usage {
-        Some(usage) => TokenStats {
+        Some(usage) => Ok(TokenStats {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cached_tokens: usage.cached_tokens,
-            thinking_tokens: estimate_tokens(&response.reasoning),
-            total_tokens: usage.input_tokens
-                + usage.output_tokens
-                + estimate_tokens(&response.reasoning),
-        },
-        None => TokenStats {
-            input_tokens: estimate_tokens(source_text),
-            output_tokens: estimate_tokens(&response.text),
-            cached_tokens: 0,
-            thinking_tokens: estimate_tokens(&response.reasoning),
-            total_tokens: estimate_tokens(source_text)
-                + estimate_tokens(&response.text)
-                + estimate_tokens(&response.reasoning),
-        },
+            thinking_tokens: usage.thinking_tokens,
+            total_tokens: usage.total_tokens,
+        }),
+        None => {
+            let input_tokens = estimate_tokens(source_text);
+            let output_tokens = estimate_tokens(&response.text);
+            let thinking_tokens = estimate_tokens(&response.reasoning);
+            let total_tokens = input_tokens
+                .checked_add(output_tokens)
+                .and_then(|total| total.checked_add(thinking_tokens))
+                .ok_or_else(|| "Estimated response token statistics overflow u64".to_string())?;
+            Ok(TokenStats {
+                input_tokens,
+                output_tokens,
+                cached_tokens: 0,
+                thinking_tokens,
+                total_tokens,
+            })
+        }
     }
 }
 

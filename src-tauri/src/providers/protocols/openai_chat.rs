@@ -5,6 +5,9 @@ use crate::domain::{
     ThinkingSummary, UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedMessage,
 };
 use crate::features::{is_feature_supported, openai_chat_capabilities, FeatureId};
+use crate::providers::budget::{
+    normalize_completion_budget, CompletionBudgetAlias, OPENAI_CHAT_ALIASES,
+};
 use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
     openai_endpoint, EncodedRequest, EndpointPreview, HttpMethod, JsonEventStreamDecoder,
@@ -23,6 +26,10 @@ pub static CODEC: OpenAiChatCodec = OpenAiChatCodec;
 impl ProtocolCodec for OpenAiChatCodec {
     fn id(&self) -> &'static str {
         "openai-chat"
+    }
+
+    fn completion_budget_aliases(&self) -> &'static [CompletionBudgetAlias] {
+        OPENAI_CHAT_ALIASES
     }
 
     fn encode_model_list(&self, config: &ProviderRuntimeConfig) -> Result<EncodedRequest, String> {
@@ -75,6 +82,8 @@ impl ProtocolCodec for OpenAiChatCodec {
                 model_id,
                 inferred.reasoning,
             ),
+            thinking_required: false,
+            default_thinking_effort: None,
         }
     }
 
@@ -92,7 +101,7 @@ impl ProtocolCodec for OpenAiChatCodec {
         base_url: &str,
         model_id: &str,
         effort: ThinkingEffort,
-    ) -> ThinkingConfig {
+    ) -> Result<ThinkingConfig, String> {
         let mut config = thinking::base_config(effort);
         if is_feature_supported(FeatureId::OpenAiDeepSeekReasoningEffort, base_url, model_id) {
             config.effort = Some(thinking::deepseek_effort(effort));
@@ -106,7 +115,7 @@ impl ProtocolCodec for OpenAiChatCodec {
         } else {
             config.effort = Some(thinking::openai_effort(effort));
         }
-        config
+        Ok(config)
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {
@@ -176,13 +185,20 @@ fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
             );
         }
     }
-    let usage = usage_from_openai(raw.get("usage"));
+    let usage = usage_from_openai(raw.get("usage"))?;
     Ok(unified_response(
         raw, text, reasoning, thinking, usage, logprobs,
     ))
 }
 
 pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result<Value, String> {
+    let completion_budget = normalize_completion_budget(
+        request.max_output_tokens,
+        &request.custom_parameters,
+        OPENAI_CHAT_ALIASES,
+    )?;
+    let max_output_tokens = completion_budget.resolved_max_output_tokens(None);
+    let legacy_alias_pointer = completion_budget.legacy_alias_pointer();
     let cache_control =
         is_feature_supported(FeatureId::OpenAiCacheControl, base_url, &request.model);
     let mut body = json!({
@@ -193,33 +209,26 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
     if request.stream {
         body["stream_options"] = json!({"include_usage": true});
     }
-    if let Some(tokens) = request.max_output_tokens {
-        if is_feature_supported(
-            FeatureId::OpenAiOnlyMaxCompletionTokens,
-            base_url,
-            &request.model,
-        ) {
-            body["max_completion_tokens"] = json!(tokens);
-        } else if is_feature_supported(FeatureId::OpenAiOnlyMaxTokens, base_url, &request.model) {
-            body["max_tokens"] = json!(tokens);
-        } else {
-            body["max_tokens"] = json!(tokens);
-            body["max_completion_tokens"] = json!(tokens);
-        }
-    }
     set_optional_field(
         &mut body,
         "temperature",
         request.temperature.map(Value::from),
     );
     set_optional_field(&mut body, "top_p", request.top_p.map(Value::from));
-    apply_structured_overrides(&mut body, base_url, request);
+    apply_structured_overrides(&mut body, base_url, request, max_output_tokens);
     if request.logprobs && logprobs_supported(base_url) {
         body["logprobs"] = json!(true);
     }
 
-    let mut body = merge_custom_parameters(body, &request.custom_parameters)?;
-    apply_structured_overrides(&mut body, base_url, request);
+    let mut body = merge_custom_parameters(body, completion_budget.custom_parameters())?;
+    apply_structured_overrides(&mut body, base_url, request, max_output_tokens);
+    apply_completion_budget(
+        &mut body,
+        base_url,
+        &request.model,
+        max_output_tokens,
+        legacy_alias_pointer,
+    );
     if request.logprobs && logprobs_supported(base_url) {
         body["logprobs"] = json!(true);
     } else {
@@ -228,7 +237,12 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
     Ok(body)
 }
 
-fn apply_structured_overrides(body: &mut Value, base_url: &str, request: &UnifiedChatRequest) {
+fn apply_structured_overrides(
+    body: &mut Value,
+    base_url: &str,
+    request: &UnifiedChatRequest,
+    max_output_tokens: Option<u32>,
+) {
     remove_object_keys(
         body,
         &[
@@ -251,12 +265,7 @@ fn apply_structured_overrides(body: &mut Value, base_url: &str, request: &Unifie
     if let Some(thinking) = &request.thinking {
         merge_object(
             body,
-            reasoning_params(
-                base_url,
-                &request.model,
-                thinking,
-                request.max_output_tokens,
-            ),
+            reasoning_params(base_url, &request.model, thinking, max_output_tokens),
         );
     }
     if is_feature_supported(FeatureId::OpenAiClearThinking, base_url, &request.model) {
@@ -268,6 +277,28 @@ fn apply_structured_overrides(body: &mut Value, base_url: &str, request: &Unifie
     if request.web_search {
         body["web_search_options"] = json!({});
     }
+}
+
+fn apply_completion_budget(
+    body: &mut Value,
+    base_url: &str,
+    model: &str,
+    max_output_tokens: Option<u32>,
+    legacy_alias_pointer: Option<&str>,
+) {
+    remove_object_keys(body, &["max_tokens", "max_completion_tokens"]);
+    let Some(tokens) = max_output_tokens else {
+        return;
+    };
+    let field = match legacy_alias_pointer {
+        Some("/max_tokens") => "max_tokens",
+        Some("/max_completion_tokens") => "max_completion_tokens",
+        _ if is_feature_supported(FeatureId::OpenAiOnlyMaxCompletionTokens, base_url, model) => {
+            "max_completion_tokens"
+        }
+        _ => "max_tokens",
+    };
+    body[field] = json!(tokens);
 }
 
 fn openai_messages(

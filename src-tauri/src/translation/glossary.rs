@@ -26,7 +26,7 @@ use crate::glossary_prompt::{
     build_glossary_prompt, sanitize_and_flatten_glossary, GlossaryEntry, GlossaryPromptBuildResult,
     GlossaryPromptInput,
 };
-use crate::providers::RuntimeAdapter;
+use crate::providers::{ChatAttemptContext, ChatAttemptKind, RuntimeAdapter};
 use crate::task_prompt::{ContentFormat, DocumentFormat, TaskChunkInput};
 
 use super::context::estimate_tokens;
@@ -37,7 +37,8 @@ use super::db::{
     set_task_glossary_id, task_execution_config, task_failure_thresholds, task_glossary_config,
     GlossaryProgressSnapshot, GlossaryRetrySnapshot,
 };
-use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter};
+use super::limiter::{AdaptiveLimiter, HeaderQuotaPolicy, ManualRateLimiter, TaskChatAttemptGate};
+use super::request_options::visible_output_token_reserve;
 use super::scheduler::{
     retry_base_delay_ms, retry_delay_with_jitter_ms, transient_retry_base_delay_ms,
 };
@@ -1040,70 +1041,27 @@ async fn generate_glossary_for_chunk_inner(
             logprobs: false,
             custom_parameters: runtime.assistant_custom_parameters.clone(),
         };
-        let estimated_tokens = estimate_tokens(&chunk.source_text) + 512;
-        if let Some(manual_limiter) = manual_limiter.as_ref() {
-            loop {
-                match manual_limiter.reserve_or_delay(estimated_tokens).await {
-                    Some(delay) => {
-                        reporter.log(
-                            "INFO",
-                            format!(
-                                "chunk={} sequence={} manual rate-limit wait_ms={}",
-                                chunk.id,
-                                chunk.sequence,
-                                delay.as_millis(),
-                            ),
-                        );
-                        if !wait_with_countdown(
-                            delay,
-                            &reporter,
-                            &chunk,
-                            attempt,
-                            max_retries,
-                            "手动限流等待",
-                            &interrupted,
-                        )
-                        .await
-                        {
-                            return AutoGlossaryChunkOutcome::Interrupted {
-                                error: interrupted
-                                    .reason()
-                                    .unwrap_or_else(|| "Task interrupted".to_string()),
-                            };
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
-        if let Some(delay) = quota.wait_duration(estimated_tokens).await {
-            reporter.log(
-                "INFO",
-                format!(
-                    "chunk={} sequence={} provider quota wait_ms={}",
-                    chunk.id,
-                    chunk.sequence,
-                    delay.as_millis(),
-                ),
-            );
-            if !wait_with_countdown(
-                delay,
-                &reporter,
-                &chunk,
-                attempt,
-                max_retries,
-                "服务商限流等待",
-                &interrupted,
-            )
-            .await
-            {
-                return AutoGlossaryChunkOutcome::Interrupted {
-                    error: interrupted
-                        .reason()
-                        .unwrap_or_else(|| "Task interrupted".to_string()),
+        let visible_output_tokens =
+            visible_output_token_reserve(estimate_tokens(&chunk.source_text));
+        let prepared = match runtime
+            .adapter
+            .prepare_chat_request(&request, visible_output_tokens)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                reporter.log(
+                    "ERROR",
+                    format!(
+                        "chunk={} sequence={} request preflight failed before network I/O: {}",
+                        chunk.id, chunk.sequence, error
+                    ),
+                );
+                return AutoGlossaryChunkOutcome::Failed {
+                    chunk_id: chunk.id.clone(),
+                    error,
                 };
             }
-        }
+        };
         reporter
             .status(format!(
                 "正在请求自动术语表... ({}/{})",
@@ -1114,12 +1072,15 @@ async fn generate_glossary_for_chunk_inner(
         reporter.log(
             "INFO",
             format!(
-                "chunk={} sequence={} attempt={}/{} requesting model=\"{}\" estimated_tokens={estimated_tokens}",
+                "chunk={} sequence={} attempt={}/{} requesting model=\"{}\" estimated_input_tokens={} completion_tokens={} reserved_total_tokens={}",
                 chunk.id,
                 chunk.sequence,
                 attempt + 1,
                 max_retries + 1,
                 runtime.model_request_name,
+                prepared.cost.estimated_input_tokens,
+                prepared.cost.completion_tokens,
+                prepared.cost.total_tokens,
             ),
         );
         reporter
@@ -1130,8 +1091,18 @@ async fn generate_glossary_for_chunk_inner(
             ))
             .await;
         let request_started = Instant::now();
+        let attempt_gate = TaskChatAttemptGate::new(quota.clone(), manual_limiter.clone());
         let request_result = tokio::select! {
-            result = runtime.adapter.send_chat_with_meta(&request) => Some(result),
+            result = runtime.adapter.send_prepared_chat_with_gate(
+                &prepared,
+                &attempt_gate,
+                ChatAttemptContext {
+                    kind: ChatAttemptKind::Primary,
+                    logical_attempt: attempt,
+                    compatibility_retry: false,
+                },
+                interrupted.token(),
+            ) => Some(result),
             _ = interrupted.cancelled() => None,
         };
         let Some(request_result) = request_result else {
@@ -1165,10 +1136,30 @@ async fn generate_glossary_for_chunk_inner(
                         request_started.elapsed().as_millis(),
                     ),
                 );
-                quota.update(&meta.rate_limits).await;
                 limiter
                     .on_result(meta.rate_limits.has_quota_headers(), true, false)
                     .await;
+                if crate::providers::finish_reason_is_truncation(meta.finish_reason.as_deref()) {
+                    let finish_reason = meta.finish_reason.as_deref().unwrap_or("truncation");
+                    let error = runtime
+                        .adapter
+                        .output_truncation_error(&prepared.request, finish_reason);
+                    reporter.log(
+                        "ERROR",
+                        format!(
+                            "chunk={} sequence={} attempt={}/{} deterministic truncation will not be retried: {}",
+                            chunk.id,
+                            chunk.sequence,
+                            attempt + 1,
+                            max_retries + 1,
+                            error,
+                        ),
+                    );
+                    return AutoGlossaryChunkOutcome::Failed {
+                        chunk_id: chunk.id.clone(),
+                        error,
+                    };
+                }
                 match sanitize_and_flatten_glossary(&meta.response.text, Some(&chunk.source_text)) {
                     Ok(parsed) => {
                         return AutoGlossaryChunkOutcome::Success {
@@ -1220,7 +1211,6 @@ async fn generate_glossary_for_chunk_inner(
                         request_started.elapsed().as_millis(),
                     ),
                 );
-                quota.update(&error.rate_limits).await;
                 limiter
                     .on_result(
                         error.rate_limits.has_quota_headers(),
@@ -1414,6 +1404,10 @@ fn valid_glossary_match_boundary(
 #[cfg(test)]
 mod report_state_tests {
     use super::*;
+    use crate::domain::{ProtocolId, ProviderRuntimeConfig};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn glossary_report_state_does_not_regress_progress() {
@@ -1465,6 +1459,121 @@ mod report_state_tests {
             message: None,
         });
         assert!(state.latest_retry().is_none());
+    }
+
+    #[tokio::test]
+    async fn truncated_valid_partial_glossary_is_rejected_without_retry_or_persistence() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+        let address = listener.local_addr().expect("mock address");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = request_count.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            server_count.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = r#"{"choices":[{"message":{"content":"[{\"src\":\"Hello\",\"dst\":\"你好\"}]"},"finish_reason":"length"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write mock response");
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "insitu-glossary-truncation-{}",
+            app_db::new_id("test")
+        ));
+        let config_pool = glossaries::connect_config_db(&root)
+            .await
+            .expect("glossary config");
+        let draft = Arc::new(
+            glossaries::ensure_auto_glossary_draft(
+                &config_pool,
+                &root,
+                EnsureAutoGlossaryDraftInput {
+                    name: "Truncation test".into(),
+                    source_language: "en".into(),
+                    target_language: "zh-CN".into(),
+                    origin_task_id: app_db::new_id("task"),
+                    chunks: vec![AutoGlossarySourceChunk {
+                        id: "glossary-chunk-truncated".into(),
+                        sequence: 0,
+                        glossary_source_text: "Hello".into(),
+                        display_source_text: "Hello".into(),
+                    }],
+                },
+            )
+            .await
+            .expect("glossary draft"),
+        );
+        let runtime = Arc::new(GlossaryRuntime {
+            adapter: Arc::new(RuntimeAdapter::new(
+                Client::new(),
+                ProviderRuntimeConfig {
+                    protocol: ProtocolId::registered("openai-chat"),
+                    base_url: format!("http://{address}/v1"),
+                    use_raw_base_url: true,
+                    config: serde_json::json!({}),
+                    credential: None,
+                    custom_headers: Vec::new(),
+                },
+            )),
+            model_request_name: "test-model".into(),
+            assistant_prompt: None,
+            assistant_custom_parameters: serde_json::json!({}),
+            temperature: None,
+            top_p: None,
+            web_search: false,
+            thinking: None,
+        });
+        let (sender, _receiver) = mpsc::channel(64);
+        let reporter = GlossaryRequestReporter {
+            sender,
+            total_chunks: 1,
+            completed_chunks: Arc::new(AtomicU64::new(0)),
+            backend_log: None,
+        };
+        let outcome = generate_glossary_for_chunk_inner(
+            runtime,
+            "zh-CN".into(),
+            DocumentFormat::Txt,
+            ContentFormat::PlainText,
+            ChunkRecord {
+                id: "glossary-chunk-truncated".into(),
+                sequence: 0,
+                preprocessed_text: "Hello".into(),
+                source_text: "Hello".into(),
+                map_json: String::new(),
+            },
+            5,
+            Arc::new(HeaderQuotaPolicy::new(true)),
+            Arc::new(AdaptiveLimiter::new(1, true)),
+            None,
+            TranslationInterrupt::new(),
+            reporter,
+            draft.clone(),
+        )
+        .await;
+        server.join().expect("mock server joins");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            outcome,
+            AutoGlossaryChunkOutcome::Failed { ref error, .. }
+                if error.contains("OUTPUT_TRUNCATED") && error.contains("length")
+        ));
+        let entry_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&draft.pool)
+            .await
+            .expect("entry count");
+        assert_eq!(entry_count, 0);
+
+        draft.pool.close().await;
+        config_pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

@@ -3,7 +3,9 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::domain::{LogprobStats, UnifiedChatResponse, UnifiedContent, UnifiedUsage};
+use crate::domain::{
+    LogprobStats, UnifiedChatResponse, UnifiedContent, UnifiedUsage, UnifiedUsageProvenance,
+};
 
 const PROTECTED_CUSTOM_PARAMETER_KEYS: &[&str] = &[
     "model",
@@ -283,24 +285,133 @@ pub fn append_responses_output_item(
     }
 }
 
-pub fn usage_from_openai(value: Option<&Value>) -> Option<UnifiedUsage> {
-    value.map(|value| UnifiedUsage {
-        input_tokens: value
-            .get("prompt_tokens")
-            .or_else(|| value.get("input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: value
-            .get("completion_tokens")
-            .or_else(|| value.get("output_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cached_tokens: value
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .or_else(|| value.pointer("/input_tokens_details/cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+pub fn usage_object<'a>(
+    value: Option<&'a Value>,
+    protocol: &str,
+) -> Result<Option<&'a Value>, String> {
+    match value {
+        None => Ok(None),
+        Some(Value::Object(_)) => Ok(value),
+        Some(_) => Err(format!("{protocol} usage must be a JSON object.")),
+    }
+}
+
+pub fn optional_usage_u64(
+    usage: &Value,
+    pointer: &str,
+    protocol: &str,
+) -> Result<Option<u64>, String> {
+    match usage.pointer(pointer) {
+        None => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            format!(
+                "{protocol} usage field \"{pointer}\" must be a non-negative integer that fits in u64."
+            )
+        }),
+    }
+}
+
+pub fn checked_usage_sum(protocol: &str, label: &str, values: &[u64]) -> Result<u64, String> {
+    values.iter().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(*value)
+            .ok_or_else(|| format!("{protocol} {label} token count overflows u64."))
     })
+}
+
+pub fn normalize_usage(
+    protocol: &str,
+    input_tokens: Option<u64>,
+    aggregate_output_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    thinking_tokens: Option<u64>,
+    provider_total_tokens: Option<u64>,
+    output_includes_thinking: bool,
+) -> Result<UnifiedUsage, String> {
+    let input = input_tokens.unwrap_or(0);
+    let aggregate_output = aggregate_output_tokens.unwrap_or(0);
+    let thinking = thinking_tokens.unwrap_or(0);
+    let output = if output_includes_thinking && thinking_tokens.is_some() {
+        aggregate_output.checked_sub(thinking).ok_or_else(|| {
+            format!(
+                "{protocol} thinking token count {thinking} exceeds output token count {aggregate_output}."
+            )
+        })?
+    } else {
+        aggregate_output
+    };
+    if let (Some(cached), Some(input)) = (cached_tokens, input_tokens) {
+        if cached > input {
+            return Err(format!(
+                "{protocol} cached input token count {cached} exceeds input token count {input}."
+            ));
+        }
+    }
+    let total = checked_usage_sum(protocol, "total", &[input, output, thinking])?;
+    if let Some(provider_total) = provider_total_tokens {
+        let components_are_complete = input_tokens.is_some() && aggregate_output_tokens.is_some();
+        if components_are_complete && provider_total != total {
+            eprintln!(
+                "Provider usage diagnostic: protocol={protocol} provider_total_tokens={provider_total} normalized_total_tokens={total}"
+            );
+        }
+    }
+    Ok(UnifiedUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_tokens: cached_tokens.unwrap_or(0),
+        thinking_tokens: thinking,
+        total_tokens: total,
+        provenance: UnifiedUsageProvenance {
+            input_tokens_reported: input_tokens.is_some(),
+            output_tokens_reported: aggregate_output_tokens.is_some(),
+            cached_tokens_reported: cached_tokens.is_some(),
+            thinking_tokens_reported: thinking_tokens.is_some(),
+            output_includes_unreported_thinking: output_includes_thinking
+                && thinking_tokens.is_none(),
+        },
+    })
+}
+
+pub fn usage_from_openai(value: Option<&Value>) -> Result<Option<UnifiedUsage>, String> {
+    let Some(value) = usage_object(value, "OpenAI")? else {
+        return Ok(None);
+    };
+    let input_tokens = if value.get("prompt_tokens").is_some() {
+        optional_usage_u64(value, "/prompt_tokens", "OpenAI")?
+    } else {
+        optional_usage_u64(value, "/input_tokens", "OpenAI")?
+    };
+    let output_tokens = if value.get("completion_tokens").is_some() {
+        optional_usage_u64(value, "/completion_tokens", "OpenAI")?
+    } else {
+        optional_usage_u64(value, "/output_tokens", "OpenAI")?
+    };
+    let cached_tokens = if value.get("prompt_tokens_details").is_some() {
+        optional_usage_u64(value, "/prompt_tokens_details/cached_tokens", "OpenAI")?
+    } else {
+        optional_usage_u64(value, "/input_tokens_details/cached_tokens", "OpenAI")?
+    };
+    let thinking_tokens = if value.get("completion_tokens_details").is_some() {
+        optional_usage_u64(
+            value,
+            "/completion_tokens_details/reasoning_tokens",
+            "OpenAI",
+        )?
+    } else {
+        optional_usage_u64(value, "/output_tokens_details/reasoning_tokens", "OpenAI")?
+    };
+    let total_tokens = optional_usage_u64(value, "/total_tokens", "OpenAI")?;
+    normalize_usage(
+        "OpenAI",
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        thinking_tokens,
+        total_tokens,
+        true,
+    )
+    .map(Some)
 }
 
 pub fn filtered_token_logprobs(content: &[Value], logprob_field: &str) -> Vec<f64> {
@@ -431,4 +542,87 @@ fn confidence_index(logprobs: &[f64]) -> Option<LogprobStats> {
         standard_deviation,
         confidence: (average_probability - 0.5 * standard_deviation).clamp(0.0, 1.0),
     })
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn openai_chat_usage_splits_reasoning_from_visible_output() {
+        let raw = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 40,
+            "total_tokens": 140,
+            "prompt_tokens_details": {"cached_tokens": 20},
+            "completion_tokens_details": {"reasoning_tokens": 15}
+        });
+        let usage = usage_from_openai(Some(&raw))
+            .expect("valid usage")
+            .expect("usage exists");
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.thinking_tokens, 15);
+        assert_eq!(usage.cached_tokens, 20);
+        assert_eq!(usage.total_tokens, 140);
+        assert!(usage.provenance.thinking_tokens_reported);
+        assert!(!usage.provenance.output_includes_unreported_thinking);
+    }
+
+    #[test]
+    fn openai_responses_usage_preserves_missing_reasoning_provenance() {
+        let raw = json!({
+            "input_tokens": 80,
+            "output_tokens": 30,
+            "total_tokens": 110,
+            "input_tokens_details": {"cached_tokens": 0}
+        });
+        let usage = usage_from_openai(Some(&raw))
+            .expect("valid usage")
+            .expect("usage exists");
+
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.thinking_tokens, 0);
+        assert_eq!(usage.total_tokens, 110);
+        assert!(usage.provenance.cached_tokens_reported);
+        assert!(!usage.provenance.thinking_tokens_reported);
+        assert!(usage.provenance.output_includes_unreported_thinking);
+    }
+
+    #[test]
+    fn openai_usage_rejects_invalid_numbers_and_inconsistent_totals() {
+        let invalid = json!({"prompt_tokens": "100", "completion_tokens": 10});
+        let error = usage_from_openai(Some(&invalid)).expect_err("string count must fail");
+        assert!(error.contains("/prompt_tokens"));
+
+        let overflow = json!({"prompt_tokens": u64::MAX, "completion_tokens": 1});
+        let error = usage_from_openai(Some(&overflow)).expect_err("overflow must fail");
+        assert!(error.contains("total token count overflows u64"));
+
+        let mismatch = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 109
+        });
+        let usage = usage_from_openai(Some(&mismatch))
+            .expect("mismatch is diagnostic-only")
+            .expect("usage");
+        assert_eq!(usage.total_tokens, 110);
+    }
+
+    #[test]
+    fn usage_serialization_does_not_expose_internal_provenance() {
+        let raw = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+        let usage = usage_from_openai(Some(&raw))
+            .expect("valid usage")
+            .expect("usage exists");
+        let serialized = serde_json::to_value(usage).expect("serialize usage");
+
+        assert_eq!(serialized.get("inputTokens"), Some(&json!(0)));
+        assert_eq!(serialized.get("thinkingTokens"), Some(&json!(0)));
+        assert!(serialized.get("provenance").is_none());
+    }
 }

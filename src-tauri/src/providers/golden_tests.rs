@@ -172,7 +172,7 @@ fn request(model: &str) -> UnifiedChatRequest {
         }],
         web_search: false,
         thinking: None,
-        max_output_tokens: Some(128),
+        max_output_tokens: Some(4096),
         temperature: Some(0.2),
         top_p: None,
         stream: false,

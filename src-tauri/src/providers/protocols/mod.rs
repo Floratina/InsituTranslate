@@ -1,3 +1,5 @@
+mod anthropic_profile;
+
 pub mod anthropic;
 pub mod gemini;
 pub mod ollama;

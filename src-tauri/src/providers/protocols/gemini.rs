@@ -5,14 +5,17 @@ use crate::domain::{
     UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedUsage,
 };
 use crate::features::{is_feature_supported, FeatureId};
+use crate::providers::budget::{
+    normalize_completion_budget, CompletionBudgetAlias, CompletionLimitScope, GEMINI_ALIASES,
+};
 use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
     append_endpoint_suffix, EncodedRequest, EndpointPreview, HttpMethod, JsonEventStreamDecoder,
     ProtocolCodec, ProtocolStreamDecoder,
 };
 use crate::providers::shared::{
-    disable_gemini_logprobs, enable_gemini_logprobs, merge_custom_parameters, push_thinking_text,
-    remove_object_keys, unified_response,
+    disable_gemini_logprobs, enable_gemini_logprobs, merge_custom_parameters, normalize_usage,
+    optional_usage_u64, push_thinking_text, remove_object_keys, unified_response, usage_object,
 };
 use crate::providers::thinking;
 
@@ -23,6 +26,14 @@ pub static CODEC: GeminiCodec = GeminiCodec;
 impl ProtocolCodec for GeminiCodec {
     fn id(&self) -> &'static str {
         "gemini"
+    }
+
+    fn completion_budget_aliases(&self) -> &'static [CompletionBudgetAlias] {
+        GEMINI_ALIASES
+    }
+
+    fn completion_limit_scope(&self) -> CompletionLimitScope {
+        CompletionLimitScope::VisibleOutput
     }
 
     fn encode_model_list(&self, config: &ProviderRuntimeConfig) -> Result<EncodedRequest, String> {
@@ -92,6 +103,8 @@ impl ProtocolCodec for GeminiCodec {
                 model_id,
                 inferred.reasoning,
             ),
+            thinking_required: false,
+            default_thinking_effort: None,
         }
     }
 
@@ -109,14 +122,14 @@ impl ProtocolCodec for GeminiCodec {
         base_url: &str,
         model_id: &str,
         effort: ThinkingEffort,
-    ) -> ThinkingConfig {
+    ) -> Result<ThinkingConfig, String> {
         let mut config = thinking::base_config(effort);
         if is_feature_supported(FeatureId::GeminiThinkingLevel, base_url, model_id) {
             config.effort = Some(thinking::gemini_level_effort(effort));
         } else {
             config.budget_tokens = Some(thinking::budget_tokens(effort));
         }
-        config
+        Ok(config)
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {
@@ -141,6 +154,13 @@ impl ProtocolCodec for GeminiCodec {
 }
 
 pub(super) fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
+    decode_chat_for_protocol(raw, "Gemini")
+}
+
+pub(super) fn decode_chat_for_protocol(
+    raw: Value,
+    protocol: &'static str,
+) -> Result<UnifiedChatResponse, String> {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut thinking = Vec::new();
@@ -163,24 +183,7 @@ pub(super) fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
             }
         }
     }
-    let usage = raw.get("usageMetadata").map(|value| UnifiedUsage {
-        input_tokens: value
-            .get("promptTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: value
-            .get("candidatesTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            + value
-                .get("thoughtsTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        cached_tokens: value
-            .get("cachedContentTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-    });
+    let usage = usage_from_gemini(raw.get("usageMetadata"), protocol)?;
     let logprobs = raw
         .pointer("/candidates/0/logprobsResult/chosenCandidates")
         .or_else(|| raw.pointer("/candidates/0/logprobs_result/chosen_candidates"))
@@ -200,6 +203,25 @@ pub(super) fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
     ))
 }
 
+fn usage_from_gemini(
+    value: Option<&Value>,
+    protocol: &str,
+) -> Result<Option<UnifiedUsage>, String> {
+    let Some(value) = usage_object(value, protocol)? else {
+        return Ok(None);
+    };
+    normalize_usage(
+        protocol,
+        optional_usage_u64(value, "/promptTokenCount", protocol)?,
+        optional_usage_u64(value, "/candidatesTokenCount", protocol)?,
+        optional_usage_u64(value, "/cachedContentTokenCount", protocol)?,
+        optional_usage_u64(value, "/thoughtsTokenCount", protocol)?,
+        optional_usage_u64(value, "/totalTokenCount", protocol)?,
+        false,
+    )
+    .map(Some)
+}
+
 pub(super) fn finish_reason(raw: &Value) -> Option<String> {
     raw.pointer("/candidates/0/finishReason")
         .and_then(Value::as_str)
@@ -207,6 +229,12 @@ pub(super) fn finish_reason(raw: &Value) -> Option<String> {
 }
 
 pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result<Value, String> {
+    let completion_budget = normalize_completion_budget(
+        request.max_output_tokens,
+        &request.custom_parameters,
+        GEMINI_ALIASES,
+    )?;
+    let max_output_tokens = completion_budget.resolved_max_output_tokens(None);
     let mut system_parts = Vec::new();
     let mut contents = Vec::new();
     for message in &request.messages {
@@ -242,9 +270,6 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
         }
     }
     let mut generation = json!({});
-    if let Some(tokens) = request.max_output_tokens {
-        generation["maxOutputTokens"] = json!(tokens);
-    }
     if let Some(temperature) = request.temperature {
         generation["temperature"] = json!(temperature);
     }
@@ -265,7 +290,7 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
         body["tools"] = json!([{"googleSearch": {}}]);
     }
 
-    let mut body = merge_custom_parameters(body, &request.custom_parameters)?;
+    let mut body = merge_custom_parameters(body, completion_budget.custom_parameters())?;
     remove_object_keys(
         &mut body,
         &[
@@ -287,6 +312,10 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
         generation.remove("temperature");
         generation.remove("topP");
         generation.remove("thinkingConfig");
+        generation.remove("maxOutputTokens");
+        if let Some(tokens) = max_output_tokens {
+            generation.insert("maxOutputTokens".into(), json!(tokens));
+        }
         if let Some(temperature) = request.temperature {
             generation.insert("temperature".into(), json!(temperature));
         }
@@ -379,4 +408,51 @@ pub fn google_models(raw: &Value, normalize_name: bool, gemini_only: bool) -> Ve
         .collect::<Vec<_>>();
     models.sort_by(|left, right| left.request_name.cmp(&right.request_name));
     models
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn gemini_usage_keeps_candidates_and_thoughts_separate() {
+        let response = decode_chat(json!({
+            "candidates": [{"content": {"parts": [{"text": "done"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "cachedContentTokenCount": 80,
+                "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 30,
+                "totalTokenCount": 150
+            }
+        }))
+        .expect("valid response");
+        let usage = response.usage.expect("usage");
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_tokens, 80);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.thinking_tokens, 30);
+        assert_eq!(usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn gemini_usage_rejects_wrong_types_and_normalizes_total_mismatches() {
+        let invalid = decode_chat(json!({
+            "usageMetadata": {"promptTokenCount": -1}
+        }))
+        .expect_err("negative count must fail");
+        assert!(invalid.contains("/promptTokenCount"));
+
+        let mismatch = decode_chat(json!({
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "thoughtsTokenCount": 2,
+                "totalTokenCount": 18
+            }
+        }))
+        .expect("total mismatch is diagnostic-only");
+        assert_eq!(mismatch.usage.expect("usage").total_tokens, 17);
+    }
 }

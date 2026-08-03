@@ -172,15 +172,7 @@ pub fn openai_responses_capabilities(model_id: &str) -> InferredModelCapabilitie
 
 pub fn anthropic_capabilities(base_url: &str, model_id: &str) -> InferredModelCapabilities {
     InferredModelCapabilities {
-        reasoning: model_name_starts(
-            model_id,
-            &[
-                "claude-opus-4",
-                "claude-sonnet-4",
-                "claude-haiku-4",
-                "claude-3-7-sonnet",
-            ],
-        ),
+        reasoning: crate::providers::protocols::anthropic::is_known_reasoning_model(model_id),
         web: is_feature_supported(FeatureId::AnthropicWebSearch, base_url, model_id),
     }
 }

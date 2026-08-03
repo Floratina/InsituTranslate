@@ -1235,6 +1235,8 @@ mod tests {
             source: "builtin".into(),
             capability_reasoning: false,
             supported_thinking_efforts: vec![],
+            thinking_required: false,
+            default_thinking_effort: None,
             capability_web: false,
             test_status: "untested".into(),
             latency_ms: None,

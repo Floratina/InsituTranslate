@@ -5,6 +5,7 @@ use crate::domain::{
     UnifiedChatResponse,
 };
 use crate::features::{is_feature_supported, FeatureId};
+use crate::providers::budget::{CompletionBudgetAlias, CompletionLimitScope, GEMINI_ALIASES};
 use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
     EncodedRequest, EndpointPreview, HttpMethod, JsonEventStreamDecoder, ProtocolCodec,
@@ -19,6 +20,14 @@ pub static CODEC: VertexAiCodec = VertexAiCodec;
 impl ProtocolCodec for VertexAiCodec {
     fn id(&self) -> &'static str {
         "vertex-ai"
+    }
+
+    fn completion_budget_aliases(&self) -> &'static [CompletionBudgetAlias] {
+        GEMINI_ALIASES
+    }
+
+    fn completion_limit_scope(&self) -> CompletionLimitScope {
+        CompletionLimitScope::VisibleOutput
     }
 
     fn encode_model_list(&self, config: &ProviderRuntimeConfig) -> Result<EncodedRequest, String> {
@@ -82,6 +91,8 @@ impl ProtocolCodec for VertexAiCodec {
                 model_id,
                 inferred.reasoning,
             ),
+            thinking_required: false,
+            default_thinking_effort: None,
         }
     }
 
@@ -99,14 +110,14 @@ impl ProtocolCodec for VertexAiCodec {
         base_url: &str,
         model_id: &str,
         effort: ThinkingEffort,
-    ) -> ThinkingConfig {
+    ) -> Result<ThinkingConfig, String> {
         let mut config = thinking::base_config(effort);
         if is_feature_supported(FeatureId::GeminiThinkingLevel, base_url, model_id) {
             config.effort = Some(thinking::gemini_level_effort(effort));
         } else {
             config.budget_tokens = Some(thinking::budget_tokens(effort));
         }
-        config
+        Ok(config)
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {
@@ -132,5 +143,30 @@ impl ProtocolCodec for VertexAiCodec {
 }
 
 fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
-    super::gemini::decode_chat(raw)
+    super::gemini::decode_chat_for_protocol(raw, "Vertex AI")
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn vertex_usage_uses_gemini_normalization() {
+        let response = decode_chat(json!({
+            "usageMetadata": {
+                "promptTokenCount": 40,
+                "candidatesTokenCount": 12,
+                "thoughtsTokenCount": 8,
+                "totalTokenCount": 60
+            }
+        }))
+        .expect("valid Vertex response");
+        let usage = response.usage.expect("usage");
+
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(usage.thinking_tokens, 8);
+        assert_eq!(usage.total_tokens, 60);
+    }
 }

@@ -77,6 +77,8 @@ impl ProtocolCodec for TestProtocolCodec {
                 model_id,
                 model_id.ends_with("-r"),
             ),
+            thinking_required: false,
+            default_thinking_effort: None,
         }
     }
 
@@ -98,8 +100,8 @@ impl ProtocolCodec for TestProtocolCodec {
         _base_url: &str,
         _model_id: &str,
         effort: ThinkingEffort,
-    ) -> ThinkingConfig {
-        crate::providers::thinking::base_config(effort)
+    ) -> Result<ThinkingConfig, String> {
+        Ok(crate::providers::thinking::base_config(effort))
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {

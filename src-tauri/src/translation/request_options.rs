@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::domain::{ModelView, ProviderRuntimeConfig, ThinkingConfig, ThinkingEffort};
-use crate::providers::descriptor_for;
+use crate::providers::{descriptor_for, CompletionBudget};
 
 use super::TranslationConfigView;
 
@@ -20,6 +20,37 @@ pub(super) struct ModelRequestOptions {
 }
 
 pub(super) type TranslationRequestOptions = ModelRequestOptions;
+
+pub(super) fn visible_output_token_reserve(source_tokens: u64) -> u32 {
+    source_tokens.saturating_mul(2).clamp(4_096, 16_000) as u32
+}
+
+pub(super) fn validate_and_plan_model_request(
+    runtime: &ProviderRuntimeConfig,
+    model: &ModelView,
+    options: &ModelRequestOptions,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    visible_output_tokens: u32,
+) -> Result<CompletionBudget, String> {
+    let descriptor = descriptor_for(&runtime.protocol)?;
+    descriptor.codec.validate_chat_options(
+        &runtime.base_url,
+        &model.request_name,
+        options.thinking.as_ref(),
+        temperature,
+        top_p,
+        &options.custom_parameters,
+    )?;
+    descriptor.codec.plan_completion_budget(
+        &runtime.base_url,
+        &model.request_name,
+        options.thinking.as_ref(),
+        None,
+        &options.custom_parameters,
+        visible_output_tokens,
+    )
+}
 
 pub(super) fn resolve_model_request_options(
     settings: &ModelRequestSettings,
@@ -102,7 +133,21 @@ fn resolve_model_thinking(
     model: &ModelView,
 ) -> Result<Option<ThinkingConfig>, String> {
     if effort == ThinkingEffort::None {
-        return Ok(None);
+        if model.thinking_required {
+            return Err(format!(
+                "Model \"{}\" requires thinking. Select the default {:?} effort or another supported effort.",
+                model.alias_or_request_name(),
+                model.default_thinking_effort.unwrap_or(ThinkingEffort::High)
+            ));
+        }
+        if model.default_thinking_effort.is_none() {
+            return Ok(None);
+        }
+        let descriptor = descriptor_for(&runtime.protocol)?;
+        return descriptor
+            .codec
+            .resolve_thinking(&runtime.base_url, &model.request_name, effort)
+            .map(Some);
     }
     if !model.capability_reasoning {
         return Err(format!(
@@ -124,7 +169,7 @@ fn resolve_model_thinking(
         &runtime.base_url,
         &model.request_name,
         effort,
-    )))
+    )?))
 }
 
 trait ModelLabel {
@@ -144,7 +189,10 @@ impl ModelLabel for ModelView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ProtocolId;
+    use crate::domain::{
+        ProtocolId, ThinkingMode, UnifiedChatRequest, UnifiedContent, UnifiedMessage,
+    };
+    use crate::providers::protocols::anthropic;
     use serde_json::json;
 
     fn runtime(protocol: &str, base_url: &str) -> ProviderRuntimeConfig {
@@ -167,6 +215,8 @@ mod tests {
             source: "custom".into(),
             capability_reasoning: reasoning,
             supported_thinking_efforts: Vec::new(),
+            thinking_required: false,
+            default_thinking_effort: None,
             capability_web: false,
             test_status: "untested".into(),
             latency_ms: None,
@@ -203,6 +253,19 @@ mod tests {
         }
     }
 
+    fn anthropic_model(request_name: &str) -> ModelView {
+        let mut value = model(request_name, true);
+        let capabilities = descriptor_for(&ProtocolId::registered("anthropic"))
+            .expect("Anthropic descriptor")
+            .codec
+            .infer_capabilities("https://api.anthropic.com", request_name);
+        value.capability_reasoning = capabilities.reasoning;
+        value.supported_thinking_efforts = capabilities.thinking_efforts;
+        value.thinking_required = capabilities.thinking_required;
+        value.default_thinking_effort = capabilities.default_thinking_effort;
+        value
+    }
+
     #[test]
     fn none_thinking_sends_no_thinking_config() {
         let options = resolve_translation_request_options(
@@ -214,6 +277,109 @@ mod tests {
         .expect("options");
 
         assert!(options.thinking.is_none());
+    }
+
+    #[test]
+    fn default_on_and_always_on_models_resolve_none_differently() {
+        let opus = resolve_translation_request_options(
+            &config(ThinkingEffort::None),
+            &runtime("anthropic", "https://api.anthropic.com"),
+            &anthropic_model("claude-opus-5"),
+            json!({}),
+        )
+        .expect("Opus 5 can explicitly disable default thinking");
+        assert_eq!(
+            opus.thinking.as_ref().map(|thinking| thinking.mode),
+            Some(ThinkingMode::Disabled)
+        );
+
+        let error = resolve_translation_request_options(
+            &config(ThinkingEffort::None),
+            &runtime("anthropic", "https://api.anthropic.com"),
+            &anthropic_model("claude-fable-5"),
+            json!({}),
+        )
+        .expect_err("Fable 5 cannot disable thinking");
+        assert!(error.contains("requires thinking"));
+    }
+
+    #[test]
+    fn anthropic_preflight_matches_codec_validation_and_plans_dynamic_budget() {
+        let runtime = runtime("anthropic", "https://api.anthropic.com");
+        let adaptive_model = anthropic_model("claude-sonnet-4-6");
+        let options = resolve_translation_request_options(
+            &config(ThinkingEffort::High),
+            &runtime,
+            &adaptive_model,
+            json!({}),
+        )
+        .expect("adaptive options");
+        let preflight_error = validate_and_plan_model_request(
+            &runtime,
+            &adaptive_model,
+            &options,
+            Some(0.2),
+            None,
+            visible_output_token_reserve(800),
+        )
+        .expect_err("4.6 thinking sampling preflight");
+        let request = UnifiedChatRequest {
+            model: adaptive_model.request_name.clone(),
+            messages: vec![UnifiedMessage {
+                role: "user".into(),
+                content: vec![UnifiedContent::Text {
+                    text: "Translate this".into(),
+                }],
+            }],
+            web_search: false,
+            thinking: options.thinking.clone(),
+            max_output_tokens: None,
+            temperature: Some(0.2),
+            top_p: None,
+            stream: false,
+            logprobs: false,
+            custom_parameters: json!({}),
+        };
+        let codec_error = anthropic::build_body(&request).expect_err("same codec validation");
+        assert_eq!(preflight_error, codec_error);
+
+        let manual_model = anthropic_model("claude-sonnet-4-5");
+        let manual_options = resolve_translation_request_options(
+            &config(ThinkingEffort::High),
+            &runtime,
+            &manual_model,
+            json!({}),
+        )
+        .expect("manual options");
+        let planned = validate_and_plan_model_request(
+            &runtime,
+            &manual_model,
+            &manual_options,
+            None,
+            None,
+            visible_output_token_reserve(8_000),
+        )
+        .expect("planned max tokens");
+        assert_eq!(planned.wire_max_output_tokens, Some(48_000));
+
+        let unknown = model("private-claude-model", false);
+        let unknown_options = resolve_translation_request_options(
+            &config(ThinkingEffort::None),
+            &runtime,
+            &unknown,
+            json!({}),
+        )
+        .expect("unknown options without thinking");
+        let planned = validate_and_plan_model_request(
+            &runtime,
+            &unknown,
+            &unknown_options,
+            None,
+            None,
+            visible_output_token_reserve(8_000),
+        )
+        .expect("conservative unknown plan");
+        assert_eq!(planned.wire_max_output_tokens, Some(4_096));
     }
 
     #[test]
@@ -455,5 +621,29 @@ mod tests {
         .expect("web search options");
 
         assert!(options.web_search);
+    }
+
+    #[test]
+    fn deepseek_legacy_max_tokens_is_promoted_during_preflight() {
+        let runtime = runtime("openai-chat", "https://api.deepseek.com");
+        let model = model("deepseek-chat", false);
+        let options = resolve_translation_request_options(
+            &config_with_custom_parameters(),
+            &runtime,
+            &model,
+            json!({"max_tokens": 8192, "response_format": {"type": "json_object"}}),
+        )
+        .expect("DeepSeek custom parameters");
+
+        let planned = validate_and_plan_model_request(
+            &runtime,
+            &model,
+            &options,
+            None,
+            None,
+            visible_output_token_reserve(2_000),
+        )
+        .expect("DeepSeek completion budget");
+        assert_eq!(planned.wire_max_output_tokens, Some(8192));
     }
 }

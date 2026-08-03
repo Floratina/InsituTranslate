@@ -197,6 +197,8 @@ function sameModelView(left: ModelView, right: ModelView): boolean {
     && left.source === right.source
     && left.capabilityReasoning === right.capabilityReasoning
     && sameStringArray(left.supportedThinkingEfforts, right.supportedThinkingEfforts)
+    && left.thinkingRequired === right.thinkingRequired
+    && left.defaultThinkingEffort === right.defaultThinkingEffort
     && left.capabilityWeb === right.capabilityWeb
     && left.testStatus === right.testStatus
     && left.latencyMs === right.latencyMs

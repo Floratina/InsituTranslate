@@ -2,14 +2,19 @@ use serde_json::{json, Value};
 
 use crate::domain::{
     ProviderRuntimeConfig, RemoteModel, ThinkingConfig, ThinkingEffort, UnifiedChatRequest,
-    UnifiedChatResponse, UnifiedContent, UnifiedUsage,
+    UnifiedChatResponse, UnifiedContent,
+};
+use crate::providers::budget::{
+    normalize_completion_budget, CompletionBudgetAlias, OLLAMA_ALIASES,
 };
 use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
     append_endpoint_suffix, endpoint_base_url, EncodedRequest, EndpointPreview, HttpMethod,
     JsonEventStreamDecoder, ProtocolCodec, ProtocolStreamDecoder,
 };
-use crate::providers::shared::{content_text, merge_custom_parameters, remove_object_keys};
+use crate::providers::shared::{
+    content_text, merge_custom_parameters, normalize_usage, optional_usage_u64, remove_object_keys,
+};
 use crate::providers::thinking;
 
 pub struct OllamaCodec;
@@ -19,6 +24,10 @@ pub static CODEC: OllamaCodec = OllamaCodec;
 impl ProtocolCodec for OllamaCodec {
     fn id(&self) -> &'static str {
         "ollama"
+    }
+
+    fn completion_budget_aliases(&self) -> &'static [CompletionBudgetAlias] {
+        OLLAMA_ALIASES
     }
 
     fn encode_model_list(&self, config: &ProviderRuntimeConfig) -> Result<EncodedRequest, String> {
@@ -90,6 +99,8 @@ impl ProtocolCodec for OllamaCodec {
             reasoning: inferred.reasoning,
             web: inferred.web,
             thinking_efforts: self.supported_thinking_efforts("", model_id, inferred.reasoning),
+            thinking_required: false,
+            default_thinking_effort: None,
         }
     }
 
@@ -107,10 +118,10 @@ impl ProtocolCodec for OllamaCodec {
         _base_url: &str,
         _model_id: &str,
         effort: ThinkingEffort,
-    ) -> ThinkingConfig {
+    ) -> Result<ThinkingConfig, String> {
         let mut config = thinking::base_config(effort);
         config.effort = Some(thinking::ollama_effort(effort));
-        config
+        Ok(config)
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {
@@ -141,14 +152,21 @@ fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
             encrypted_data: None,
         }]
     };
-    let usage = Some(UnifiedUsage {
-        input_tokens: raw
-            .get("prompt_eval_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: raw.get("eval_count").and_then(Value::as_u64).unwrap_or(0),
-        cached_tokens: 0,
-    });
+    let input_tokens = optional_usage_u64(&raw, "/prompt_eval_count", "Ollama")?;
+    let output_tokens = optional_usage_u64(&raw, "/eval_count", "Ollama")?;
+    let usage = if input_tokens.is_some() || output_tokens.is_some() {
+        Some(normalize_usage(
+            "Ollama",
+            input_tokens,
+            output_tokens,
+            None,
+            None,
+            None,
+            true,
+        )?)
+    } else {
+        None
+    };
     Ok(crate::providers::shared::unified_response(
         raw,
         text,
@@ -160,6 +178,12 @@ fn decode_chat(raw: Value) -> Result<UnifiedChatResponse, String> {
 }
 
 pub(crate) fn build_body(request: &UnifiedChatRequest) -> Result<Value, String> {
+    let completion_budget = normalize_completion_budget(
+        request.max_output_tokens,
+        &request.custom_parameters,
+        OLLAMA_ALIASES,
+    )?;
+    let max_output_tokens = completion_budget.resolved_max_output_tokens(None);
     let messages = request
         .messages
         .iter()
@@ -192,9 +216,6 @@ pub(crate) fn build_body(request: &UnifiedChatRequest) -> Result<Value, String> 
         body["think"] = think_value(thinking);
     }
     let mut options = json!({});
-    if let Some(tokens) = request.max_output_tokens {
-        options["num_predict"] = json!(tokens);
-    }
     if let Some(temperature) = request.temperature {
         options["temperature"] = json!(temperature);
     }
@@ -205,7 +226,7 @@ pub(crate) fn build_body(request: &UnifiedChatRequest) -> Result<Value, String> 
         body["options"] = options;
     }
 
-    let mut body = merge_custom_parameters(body, &request.custom_parameters)?;
+    let mut body = merge_custom_parameters(body, completion_budget.custom_parameters())?;
     remove_object_keys(
         &mut body,
         &[
@@ -230,6 +251,10 @@ pub(crate) fn build_body(request: &UnifiedChatRequest) -> Result<Value, String> 
     if let Some(options) = body.get_mut("options").and_then(Value::as_object_mut) {
         options.remove("temperature");
         options.remove("top_p");
+        options.remove("num_predict");
+        if let Some(tokens) = max_output_tokens {
+            options.insert("num_predict".into(), json!(tokens));
+        }
         if let Some(temperature) = request.temperature {
             options.insert("temperature".into(), json!(temperature));
         }
@@ -265,5 +290,34 @@ fn ollama_url(config: &ProviderRuntimeConfig, suffix: &str) -> String {
         format!("{base}/{suffix}")
     } else {
         format!("{base}/api/{suffix}")
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn ollama_usage_marks_generated_count_as_unsplit() {
+        let response = decode_chat(json!({
+            "message": {"content": "done", "thinking": "reason"},
+            "prompt_eval_count": 11,
+            "eval_count": 18
+        }))
+        .expect("valid response");
+        let usage = response.usage.expect("usage");
+
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 18);
+        assert_eq!(usage.thinking_tokens, 0);
+        assert_eq!(usage.total_tokens, 29);
+        assert!(usage.provenance.output_includes_unreported_thinking);
+    }
+
+    #[test]
+    fn ollama_response_without_counts_has_no_usage() {
+        let response =
+            decode_chat(json!({"message": {"content": "done"}})).expect("valid response");
+        assert!(response.usage.is_none());
     }
 }

@@ -7,15 +7,13 @@ use crate::domain::{
 use crate::providers::budget::{
     normalize_completion_budget, CompletionBudgetAlias, OLLAMA_ALIASES,
 };
-use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
     append_endpoint_suffix, endpoint_base_url, EncodedRequest, EndpointPreview, HttpMethod,
-    JsonEventStreamDecoder, ProtocolCodec, ProtocolStreamDecoder,
+    ProtocolCodec,
 };
 use crate::providers::shared::{
     content_text, merge_custom_parameters, normalize_usage, optional_usage_u64, remove_object_keys,
 };
-use crate::providers::thinking;
 
 pub struct OllamaCodec;
 
@@ -87,41 +85,6 @@ impl ProtocolCodec for OllamaCodec {
             .or_else(|| raw.get("doneReason"))
             .and_then(Value::as_str)
             .map(str::to_string)
-    }
-
-    fn new_stream_decoder(&self) -> Box<dyn ProtocolStreamDecoder> {
-        Box::new(JsonEventStreamDecoder::new(self.id(), decode_chat))
-    }
-
-    fn infer_capabilities(&self, _base_url: &str, model_id: &str) -> ModelCapabilities {
-        let inferred = crate::features::ollama_capabilities(model_id);
-        ModelCapabilities {
-            reasoning: inferred.reasoning,
-            web: inferred.web,
-            thinking_efforts: self.supported_thinking_efforts("", model_id, inferred.reasoning),
-            thinking_required: false,
-            default_thinking_effort: None,
-        }
-    }
-
-    fn supported_thinking_efforts(
-        &self,
-        _base_url: &str,
-        _model_id: &str,
-        reasoning: bool,
-    ) -> Vec<ThinkingEffort> {
-        crate::features::budget_thinking_efforts(reasoning)
-    }
-
-    fn resolve_thinking(
-        &self,
-        _base_url: &str,
-        _model_id: &str,
-        effort: ThinkingEffort,
-    ) -> Result<ThinkingConfig, String> {
-        let mut config = thinking::base_config(effort);
-        config.effort = Some(thinking::ollama_effort(effort));
-        Ok(config)
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {
@@ -210,7 +173,7 @@ pub(crate) fn build_body(request: &UnifiedChatRequest) -> Result<Value, String> 
     let mut body = json!({
         "model": request.model,
         "messages": messages,
-        "stream": request.stream
+        "stream": false
     });
     if let Some(thinking) = &request.thinking {
         body["think"] = think_value(thinking);

@@ -79,17 +79,48 @@ export interface ModelView {
   requestName: string;
   alias: string;
   source: string;
-  capabilityReasoning: boolean;
-  supportedThinkingEfforts: Array<
-    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-  >;
-  thinkingRequired: boolean;
-  defaultThinkingEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
-  capabilityWeb: boolean;
+  capabilities: Record<string, CapabilityValue>;
   testStatus: string;
   latencyMs: number | null;
   testedAt: string | null;
   testError: string | null;
+}
+
+export type ThinkingEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export type CapabilityValue = boolean | ThinkingEffort[] | ThinkingEffort | null;
+
+export type CapabilityValueKind =
+  | "boolean"
+  | "thinking-efforts"
+  | "optional-thinking-effort";
+
+export type CapabilityEditor = "toggle" | "select" | "hidden";
+export type CapabilityPresentation = "badge" | "hidden";
+
+export interface CapabilityOptionDescriptor {
+  value: string;
+  label: string;
+}
+
+export interface CapabilityDescriptor {
+  id: string;
+  label: string;
+  description: string;
+  valueKind: CapabilityValueKind;
+  userEditable: boolean;
+  icon: string | null;
+  editor: CapabilityEditor;
+  presentation: CapabilityPresentation;
+  options: CapabilityOptionDescriptor[];
+  defaultValue: CapabilityValue;
 }
 
 export interface ProviderView {

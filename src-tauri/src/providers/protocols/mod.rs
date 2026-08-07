@@ -1,4 +1,4 @@
-mod anthropic_profile;
+pub(crate) mod anthropic_profile;
 
 pub mod anthropic;
 pub mod gemini;

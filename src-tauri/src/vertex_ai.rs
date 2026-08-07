@@ -235,19 +235,12 @@ pub fn generate_content_url(
     project_id: &str,
     location: &str,
     model: &str,
-    stream: bool,
 ) -> String {
     let base = service_base_url(base_url, project_id, location);
-    let action = if stream {
-        "streamGenerateContent?alt=sse"
-    } else {
-        "generateContent"
-    };
     format!(
-        "{}/publishers/google/models/{}:{}",
+        "{}/publishers/google/models/{}:generateContent",
         base.trim_end_matches('/'),
-        model_id(model),
-        action
+        model_id(model)
     )
 }
 
@@ -450,7 +443,6 @@ mod tests {
                 "project-1",
                 DEFAULT_LOCATION,
                 "models/gemini-2.5-flash",
-                false,
             ),
             "https://aiplatform.googleapis.com/v1/projects/project-1/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
         );

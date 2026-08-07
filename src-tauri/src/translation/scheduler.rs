@@ -989,6 +989,7 @@ pub(super) async fn translate_chunk(
     let mut last_error = None;
     let mut last_text = None;
     let mut last_stats = TokenStats::default();
+    let mut current_thinking = request_options.thinking.clone();
     for attempt in 0..=max_retries {
         if interrupt.is_interrupted() {
             return interrupted_outcome(chunk, retry_count, interrupt.reason());
@@ -1070,11 +1071,10 @@ pub(super) async fn translate_chunk(
             model: model_request_name.clone(),
             messages,
             web_search: request_options.web_search,
-            thinking: request_options.thinking.clone(),
+            thinking: current_thinking.clone(),
             max_output_tokens: None,
             temperature: assistant_temperature,
             top_p: assistant_top_p,
-            stream: false,
             logprobs: confidence_mode.enabled(),
             custom_parameters: request_options.custom_parameters.clone(),
         };
@@ -1122,7 +1122,10 @@ pub(super) async fn translate_chunk(
                 limiter
                     .on_result(meta.rate_limits.has_quota_headers(), true, false)
                     .await;
-                let stats = match token_stats_from_response(&meta.response, &chunk.source_text) {
+                let stats = match token_stats_from_response(
+                    &meta.response,
+                    prepared.cost.estimated_input_tokens,
+                ) {
                     Ok(stats) => stats,
                     Err(error) => {
                         return failed_outcome(
@@ -1151,7 +1154,64 @@ pub(super) async fn translate_chunk(
                     current_rate_limit_status(&meta.rate_limits, &limiter, &manual_limiter).await;
                 if finish_reason_is_truncation(meta.finish_reason.as_deref()) {
                     let finish_reason = meta.finish_reason.as_deref().unwrap_or("truncation");
-                    let error = adapter.output_truncation_error(&prepared.request, finish_reason);
+                    let error = adapter.prepared_output_truncation_error(&prepared, finish_reason);
+                    let lower_thinking = if attempt < max_retries {
+                        match adapter.lower_thinking_config(
+                            &model_request_name,
+                            prepared.request.thinking.as_ref(),
+                        ) {
+                            Ok(lower) => lower,
+                            Err(resolve_error) => {
+                                log_chunk_issue(
+                                    &backend_log,
+                                    "ERROR",
+                                    &chunk,
+                                    attempt,
+                                    max_retries,
+                                    format!(
+                                        "thinking downgrade resolution failed after truncation: {resolve_error}"
+                                    ),
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(lower_thinking) = lower_thinking {
+                        let previous_effort = prepared
+                            .request
+                            .thinking
+                            .as_ref()
+                            .and_then(|thinking| thinking.effort);
+                        let next_effort = lower_thinking.effort;
+                        log_chunk_issue(
+                            &backend_log,
+                            "WARN",
+                            &chunk,
+                            attempt,
+                            max_retries,
+                            format!(
+                                "provider returned status={} finish_reason={}; lowering thinking effort from {:?} to {:?} and retrying; {}; {}",
+                                meta.status,
+                                finish_reason,
+                                previous_effort,
+                                next_effort,
+                                rate_limit_summary(&meta.rate_limits),
+                                error
+                            ),
+                        );
+                        report_active_retry(
+                            retry_reporter.as_ref(),
+                            &chunk,
+                            attempt,
+                            max_retries,
+                            &error,
+                        )
+                        .await;
+                        current_thinking = Some(lower_thinking);
+                        continue;
+                    }
                     log_chunk_issue(
                         &backend_log,
                         "ERROR",
@@ -1159,17 +1219,23 @@ pub(super) async fn translate_chunk(
                         attempt,
                         max_retries,
                         format!(
-                            "provider returned status={} finish_reason={}; deterministic truncation will not be retried; {}; error={}",
+                            "provider returned status={} finish_reason={}; no lower supported thinking effort or retry slot remains; {}; error={}",
                             meta.status,
                             finish_reason,
                             rate_limit_summary(&meta.rate_limits),
                             error
                         ),
                     );
-                    let mut outcome = interrupted_outcome(chunk, retry_count, Some(error));
-                    outcome.token_stats = last_stats;
-                    outcome.rate_limit_status = rate_status;
-                    return outcome;
+                    return failed_outcome(
+                        chunk,
+                        TranslationChunkStatus::Failed,
+                        retry_count,
+                        Some(error),
+                        None,
+                        last_stats,
+                        rate_status,
+                        true,
+                    );
                 }
                 last_text = Some(if text.is_empty() {
                     chunk.source_text.clone()
@@ -1553,7 +1619,7 @@ fn interrupted_outcome(
 
 fn token_stats_from_response(
     response: &crate::domain::UnifiedChatResponse,
-    source_text: &str,
+    estimated_input_tokens: u64,
 ) -> Result<TokenStats, String> {
     match &response.usage {
         Some(usage) => Ok(TokenStats {
@@ -1564,15 +1630,14 @@ fn token_stats_from_response(
             total_tokens: usage.total_tokens,
         }),
         None => {
-            let input_tokens = estimate_tokens(source_text);
             let output_tokens = estimate_tokens(&response.text);
             let thinking_tokens = estimate_tokens(&response.reasoning);
-            let total_tokens = input_tokens
+            let total_tokens = estimated_input_tokens
                 .checked_add(output_tokens)
                 .and_then(|total| total.checked_add(thinking_tokens))
                 .ok_or_else(|| "Estimated response token statistics overflow u64".to_string())?;
             Ok(TokenStats {
-                input_tokens,
+                input_tokens: estimated_input_tokens,
                 output_tokens,
                 cached_tokens: 0,
                 thinking_tokens,

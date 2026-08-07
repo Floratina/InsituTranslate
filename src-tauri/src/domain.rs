@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+use crate::providers::capabilities::ModelCapabilities;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
@@ -202,11 +206,7 @@ pub struct ModelView {
     pub request_name: String,
     pub alias: String,
     pub source: String,
-    pub capability_reasoning: bool,
-    pub supported_thinking_efforts: Vec<ThinkingEffort>,
-    pub thinking_required: bool,
-    pub default_thinking_effort: Option<ThinkingEffort>,
-    pub capability_web: bool,
+    pub capabilities: ModelCapabilities,
     pub test_status: String,
     pub latency_ms: Option<i64>,
     pub tested_at: Option<String>,
@@ -312,8 +312,7 @@ pub struct AddModelInput {
 pub struct UpdateModelInput {
     pub id: String,
     pub alias: String,
-    pub capability_reasoning: bool,
-    pub capability_web: bool,
+    pub capabilities: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,7 +415,6 @@ pub struct UnifiedChatRequest {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub top_p: Option<f64>,
-    pub stream: bool,
     #[serde(default)]
     pub logprobs: bool,
     #[serde(default = "default_custom_parameters")]

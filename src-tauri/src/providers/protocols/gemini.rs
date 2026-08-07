@@ -6,18 +6,15 @@ use crate::domain::{
 };
 use crate::features::{is_feature_supported, FeatureId};
 use crate::providers::budget::{
-    normalize_completion_budget, CompletionBudgetAlias, CompletionLimitScope, GEMINI_ALIASES,
+    normalize_completion_budget, CompletionBudgetAlias, GEMINI_ALIASES,
 };
-use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
-    append_endpoint_suffix, EncodedRequest, EndpointPreview, HttpMethod, JsonEventStreamDecoder,
-    ProtocolCodec, ProtocolStreamDecoder,
+    append_endpoint_suffix, EncodedRequest, EndpointPreview, HttpMethod, ProtocolCodec,
 };
 use crate::providers::shared::{
     disable_gemini_logprobs, enable_gemini_logprobs, merge_custom_parameters, normalize_usage,
     optional_usage_u64, push_thinking_text, remove_object_keys, unified_response, usage_object,
 };
-use crate::providers::thinking;
 
 pub struct GeminiCodec;
 
@@ -30,10 +27,6 @@ impl ProtocolCodec for GeminiCodec {
 
     fn completion_budget_aliases(&self) -> &'static [CompletionBudgetAlias] {
         GEMINI_ALIASES
-    }
-
-    fn completion_limit_scope(&self) -> CompletionLimitScope {
-        CompletionLimitScope::VisibleOutput
     }
 
     fn encode_model_list(&self, config: &ProviderRuntimeConfig) -> Result<EncodedRequest, String> {
@@ -67,11 +60,7 @@ impl ProtocolCodec for GeminiCodec {
                 "v1beta/"
             },
             request.model.trim_start_matches("models/"),
-            if request.stream {
-                "streamGenerateContent?alt=sse"
-            } else {
-                "generateContent"
-            }
+            "generateContent"
         );
         Ok(EncodedRequest {
             method: HttpMethod::Post,
@@ -87,49 +76,6 @@ impl ProtocolCodec for GeminiCodec {
 
     fn finish_reason(&self, raw: &Value) -> Option<String> {
         finish_reason(raw)
-    }
-
-    fn new_stream_decoder(&self) -> Box<dyn ProtocolStreamDecoder> {
-        Box::new(JsonEventStreamDecoder::new(self.id(), decode_chat))
-    }
-
-    fn infer_capabilities(&self, base_url: &str, model_id: &str) -> ModelCapabilities {
-        let inferred = crate::features::gemini_capabilities(model_id);
-        ModelCapabilities {
-            reasoning: inferred.reasoning,
-            web: inferred.web,
-            thinking_efforts: self.supported_thinking_efforts(
-                base_url,
-                model_id,
-                inferred.reasoning,
-            ),
-            thinking_required: false,
-            default_thinking_effort: None,
-        }
-    }
-
-    fn supported_thinking_efforts(
-        &self,
-        base_url: &str,
-        model_id: &str,
-        reasoning: bool,
-    ) -> Vec<ThinkingEffort> {
-        crate::features::gemini_thinking_efforts(base_url, model_id, reasoning)
-    }
-
-    fn resolve_thinking(
-        &self,
-        base_url: &str,
-        model_id: &str,
-        effort: ThinkingEffort,
-    ) -> Result<ThinkingConfig, String> {
-        let mut config = thinking::base_config(effort);
-        if is_feature_supported(FeatureId::GeminiThinkingLevel, base_url, model_id) {
-            config.effort = Some(thinking::gemini_level_effort(effort));
-        } else {
-            config.budget_tokens = Some(thinking::budget_tokens(effort));
-        }
-        Ok(config)
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {

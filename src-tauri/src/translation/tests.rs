@@ -1,8 +1,9 @@
 use crate::db as app_db;
 use crate::domain::{
     AddModelInput, AssistantIconKind, CreateAssistantInput, CreateProviderInput, ProtocolId,
-    ProviderPurpose, ProviderRuntimeConfig, SetProviderEnabledInput, ThinkingEffort,
-    UpdateAssistantCustomParametersInput, UpdateAssistantSettingsInput,
+    ProviderPurpose, ProviderRuntimeConfig, SetProviderEnabledInput, ThinkingConfig,
+    ThinkingEffort, ThinkingMode, UpdateAssistantCustomParametersInput,
+    UpdateAssistantSettingsInput,
 };
 use crate::glossary_prompt::GlossaryEntry;
 use crate::languages::{DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE};
@@ -258,7 +259,7 @@ use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 fn temp_root(label: &str) -> PathBuf {
@@ -789,8 +790,16 @@ async fn translation_and_glossary_snapshot_preflight_reject_anthropic_sampling_b
         .expect_err("manual TPM preflight");
     assert!(tpm_error.contains("protocol=anthropic"));
     assert!(tpm_error.contains("claude-sonnet-4-6"));
-    assert!(tpm_error.contains("estimated_input_tokens=800"));
-    assert!(tpm_error.contains("completion_tokens="));
+    let estimated_input_tokens = tpm_error
+        .split("estimated_input_tokens=")
+        .nth(1)
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("input estimate in error");
+    assert!(estimated_input_tokens > 800);
+    assert!(tpm_error.contains("visible_output_tokens="));
+    assert!(tpm_error.contains("estimated_thinking_tokens="));
+    assert!(tpm_error.contains("combined_completion_tokens="));
     assert!(tpm_error.contains("manual TPM limit (1000 tokens)"));
 
     let glossary_provider = app_db::create_provider(
@@ -2178,24 +2187,34 @@ async fn translate_chunk_retries_transient_429_without_interrupting_task() {
 }
 
 #[tokio::test]
-async fn translate_chunk_rejects_truncated_partial_text_without_retrying() {
+async fn translate_chunk_discards_truncated_text_and_retries_with_lower_thinking() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
     let address = listener.local_addr().expect("mock address");
     let request_count = Arc::new(AtomicUsize::new(0));
     let server_count = request_count.clone();
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = captured_requests.clone();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept mock request");
-        server_count.fetch_add(1, Ordering::SeqCst);
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request);
-        let body = r#"{"choices":[{"message":{"content":"部分译文"},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":8}}"#;
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .expect("write mock response");
+        for body in [
+            r#"{"choices":[{"message":{"content":"部分译文"},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":8}}"#,
+            r#"{"choices":[{"message":{"content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            server_count.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 65_536];
+            let request_len = stream.read(&mut request).expect("read mock request");
+            server_requests
+                .lock()
+                .expect("capture requests")
+                .push(String::from_utf8_lossy(&request[..request_len]).into_owned());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write mock response");
+        }
     });
     let adapter = Arc::new(RuntimeAdapter::new(
         Client::new(),
@@ -2210,13 +2229,18 @@ async fn translate_chunk_rejects_truncated_partial_text_without_retrying() {
     ));
     let outcome = translate_chunk(
         adapter,
-        "test-model".into(),
+        "gpt-5".into(),
         "zh-CN".into(),
         None,
         TranslationRequestOptions {
             custom_parameters: json!({}),
             web_search: false,
-            thinking: None,
+            thinking: Some(ThinkingConfig {
+                mode: ThinkingMode::Enabled,
+                budget_tokens: None,
+                effort: Some(ThinkingEffort::High),
+                summary: None,
+            }),
         },
         None,
         None,
@@ -2244,15 +2268,15 @@ async fn translate_chunk_rejects_truncated_partial_text_without_retrying() {
     .await;
     server.join().expect("mock server joins");
 
-    assert_eq!(request_count.load(Ordering::SeqCst), 1);
-    assert_eq!(outcome.status, TranslationChunkStatus::Interrupted);
-    assert_eq!(outcome.retry_count, 0);
-    assert_eq!(outcome.after_translate_text, "");
-    assert_eq!(outcome.translated_text, "");
-    assert!(outcome
-        .error_message
-        .as_deref()
-        .is_some_and(|message| message.contains("OUTPUT_TRUNCATED") && message.contains("length")));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(outcome.status, TranslationChunkStatus::Success);
+    assert_eq!(outcome.retry_count, 1);
+    assert_eq!(outcome.after_translate_text, "你好");
+    assert_eq!(outcome.translated_text, "你好");
+    assert!(outcome.error_message.is_none());
+    let captured_requests = captured_requests.lock().expect("captured requests");
+    assert!(captured_requests[0].contains("\"reasoning_effort\":\"high\""));
+    assert!(captured_requests[1].contains("\"reasoning_effort\":\"medium\""));
 }
 
 #[tokio::test]

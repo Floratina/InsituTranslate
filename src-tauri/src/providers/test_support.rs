@@ -30,7 +30,6 @@ pub fn request() -> UnifiedChatRequest {
         max_output_tokens: Some(4096),
         temperature: None,
         top_p: None,
-        stream: true,
         logprobs: false,
         custom_parameters: json!({}),
     }
@@ -58,7 +57,6 @@ pub fn prompt_request() -> UnifiedChatRequest {
         max_output_tokens: None,
         temperature: Some(0.0),
         top_p: None,
-        stream: false,
         logprobs: false,
         custom_parameters: json!({}),
     }

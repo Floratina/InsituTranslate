@@ -4,20 +4,17 @@ use crate::domain::{
     ProviderRuntimeConfig, RemoteModel, ThinkingConfig, ThinkingEffort, ThinkingMode,
     ThinkingSummary, UnifiedChatRequest, UnifiedChatResponse, UnifiedContent, UnifiedMessage,
 };
-use crate::features::{is_feature_supported, openai_chat_capabilities, FeatureId};
+use crate::features::{is_feature_supported, FeatureId};
 use crate::providers::budget::{
     normalize_completion_budget, CompletionBudgetAlias, OPENAI_CHAT_ALIASES,
 };
-use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
-    openai_endpoint, EncodedRequest, EndpointPreview, HttpMethod, JsonEventStreamDecoder,
-    ProtocolCodec, ProtocolStreamDecoder,
+    openai_endpoint, EncodedRequest, EndpointPreview, HttpMethod, ProtocolCodec,
 };
 use crate::providers::shared::{
     append_openai_reasoning_details, filtered_token_logprobs, merge_custom_parameters,
     merge_object, remove_object_keys, set_optional_field, unified_response, usage_from_openai,
 };
-use crate::providers::thinking;
 
 pub struct OpenAiChatCodec;
 
@@ -66,56 +63,6 @@ impl ProtocolCodec for OpenAiChatCodec {
         raw.pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
             .map(str::to_string)
-    }
-
-    fn new_stream_decoder(&self) -> Box<dyn ProtocolStreamDecoder> {
-        Box::new(JsonEventStreamDecoder::new(self.id(), decode_chat))
-    }
-
-    fn infer_capabilities(&self, base_url: &str, model_id: &str) -> ModelCapabilities {
-        let inferred = openai_chat_capabilities(base_url, model_id);
-        ModelCapabilities {
-            reasoning: inferred.reasoning,
-            web: inferred.web,
-            thinking_efforts: self.supported_thinking_efforts(
-                base_url,
-                model_id,
-                inferred.reasoning,
-            ),
-            thinking_required: false,
-            default_thinking_effort: None,
-        }
-    }
-
-    fn supported_thinking_efforts(
-        &self,
-        base_url: &str,
-        model_id: &str,
-        reasoning: bool,
-    ) -> Vec<ThinkingEffort> {
-        crate::features::openai_chat_thinking_efforts(base_url, model_id, reasoning)
-    }
-
-    fn resolve_thinking(
-        &self,
-        base_url: &str,
-        model_id: &str,
-        effort: ThinkingEffort,
-    ) -> Result<ThinkingConfig, String> {
-        let mut config = thinking::base_config(effort);
-        if is_feature_supported(FeatureId::OpenAiDeepSeekReasoningEffort, base_url, model_id) {
-            config.effort = Some(thinking::deepseek_effort(effort));
-        } else if is_feature_supported(FeatureId::OpenAiEnableThinking, base_url, model_id) {
-            config.effort = Some(thinking::openai_effort(effort));
-            if is_feature_supported(FeatureId::OpenAiThinkingBudget, base_url, model_id) {
-                config.budget_tokens = Some(thinking::budget_tokens(effort));
-            }
-        } else if is_feature_supported(FeatureId::OpenAiReasoningEffort, base_url, model_id) {
-            config.effort = Some(thinking::volc_effort(effort));
-        } else {
-            config.effort = Some(thinking::openai_effort(effort));
-        }
-        Ok(config)
     }
 
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {
@@ -203,25 +150,21 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
         is_feature_supported(FeatureId::OpenAiCacheControl, base_url, &request.model);
     let mut body = json!({
         "model": request.model,
-        "messages": openai_messages(&request.messages, cache_control, base_url, &request.model),
-        "stream": request.stream
+        "messages": openai_messages(&request.messages, cache_control, base_url, &request.model)
     });
-    if request.stream {
-        body["stream_options"] = json!({"include_usage": true});
-    }
     set_optional_field(
         &mut body,
         "temperature",
         request.temperature.map(Value::from),
     );
     set_optional_field(&mut body, "top_p", request.top_p.map(Value::from));
-    apply_structured_overrides(&mut body, base_url, request, max_output_tokens);
+    apply_structured_overrides(&mut body, base_url, request);
     if request.logprobs && logprobs_supported(base_url) {
         body["logprobs"] = json!(true);
     }
 
     let mut body = merge_custom_parameters(body, completion_budget.custom_parameters())?;
-    apply_structured_overrides(&mut body, base_url, request, max_output_tokens);
+    apply_structured_overrides(&mut body, base_url, request);
     apply_completion_budget(
         &mut body,
         base_url,
@@ -237,12 +180,7 @@ pub(crate) fn build_body(base_url: &str, request: &UnifiedChatRequest) -> Result
     Ok(body)
 }
 
-fn apply_structured_overrides(
-    body: &mut Value,
-    base_url: &str,
-    request: &UnifiedChatRequest,
-    max_output_tokens: Option<u32>,
-) {
+fn apply_structured_overrides(body: &mut Value, base_url: &str, request: &UnifiedChatRequest) {
     remove_object_keys(
         body,
         &[
@@ -263,10 +201,7 @@ fn apply_structured_overrides(
     set_optional_field(body, "temperature", request.temperature.map(Value::from));
     set_optional_field(body, "top_p", request.top_p.map(Value::from));
     if let Some(thinking) = &request.thinking {
-        merge_object(
-            body,
-            reasoning_params(base_url, &request.model, thinking, max_output_tokens),
-        );
+        merge_object(body, reasoning_params(base_url, &request.model, thinking));
     }
     if is_feature_supported(FeatureId::OpenAiClearThinking, base_url, &request.model) {
         body["clear_thinking"] = json!(false);
@@ -402,12 +337,7 @@ fn is_plain_text_part(part: &Value) -> bool {
         && part.get("cache_control").is_none()
 }
 
-pub(crate) fn reasoning_params(
-    base_url: &str,
-    model: &str,
-    thinking: &ThinkingConfig,
-    max_output_tokens: Option<u32>,
-) -> Value {
+pub(crate) fn reasoning_params(base_url: &str, model: &str, thinking: &ThinkingConfig) -> Value {
     let disabled = thinking.mode == ThinkingMode::Disabled
         || thinking.effort == Some(ThinkingEffort::None)
         || thinking.budget_tokens == Some(0);
@@ -416,11 +346,7 @@ pub(crate) fn reasoning_params(
         output["reasoning"] = if disabled {
             json!({"enabled": false})
         } else if let Some(tokens) = thinking.budget_tokens {
-            json!({
-                "max_tokens": max_output_tokens
-                    .map(|max| tokens.min(max.saturating_sub(1)))
-                    .unwrap_or(tokens)
-            })
+            json!({"max_tokens": tokens})
         } else if let Some(effort) = thinking.effort {
             json!({"effort": effort_name(effort)})
         } else {

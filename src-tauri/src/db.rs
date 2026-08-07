@@ -20,7 +20,8 @@ use crate::domain::{
     UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
 };
 use crate::providers::capabilities::{
-    infer_capabilities, resolve_capabilities, CapabilityId, CapabilityOverrides,
+    infer_capabilities, resolve_capabilities, CapabilityId, CapabilityOverridePolicy,
+    CapabilityOverrides, CapabilityValue, ModelCapabilities,
 };
 use crate::providers::config_schema::{config_issues, materialize_defaults, validated_config};
 use crate::providers::registry::{
@@ -993,12 +994,14 @@ async fn backfill_model_capabilities(pool: &SqlitePool) -> Result<(), String> {
             continue;
         };
         let request_name: String = row.get("request_name");
-        let inferred = descriptor
-            .codec
-            .infer_capabilities(row.get::<String, _>("base_url").as_str(), &request_name);
-        let capability_reasoning =
-            row.get::<i64, _>("capability_reasoning") != 0 || inferred.reasoning;
-        let capability_web = row.get::<i64, _>("capability_web") != 0 || inferred.web;
+        let inferred = infer_capabilities(
+            descriptor.capability_profile,
+            row.get::<String, _>("base_url").as_str(),
+            &request_name,
+        );
+        let legacy = legacy_model_capabilities(&row)?;
+        let capability_reasoning = legacy.reasoning() || inferred.reasoning();
+        let capability_web = legacy.web() || inferred.web();
         sqlx::query(
             "UPDATE models
              SET capability_reasoning = ?, capability_web = ?,
@@ -1059,22 +1062,22 @@ async fn migrate_model_capability_overrides(pool: &SqlitePool) -> Result<(), Str
         let model_id: String = row.get("id");
         let request_name: String = row.get("request_name");
         let base_url: String = row.get("base_url");
-        let inferred = descriptor
-            .codec
-            .infer_capabilities(&base_url, &request_name);
-        for (capability, legacy_value, inferred_value) in [
-            (
-                CapabilityId::REASONING,
-                row.get::<i64, _>("capability_reasoning") != 0,
-                inferred.reasoning,
-            ),
-            (
-                CapabilityId::WEB,
-                row.get::<i64, _>("capability_web") != 0,
-                inferred.web,
-            ),
-        ] {
-            if legacy_value != inferred_value {
+        let inferred = infer_capabilities(descriptor.capability_profile, &base_url, &request_name);
+        for capability in CapabilityId::REGISTERED
+            .iter()
+            .copied()
+            .filter(|capability| {
+                capability.definition().override_policy == CapabilityOverridePolicy::User
+            })
+        {
+            let legacy_value = legacy_boolean_capability(&row, capability)?;
+            let CapabilityValue::Boolean(inferred_value) = inferred.get(capability) else {
+                return Err(format!(
+                    "Legacy capability {} must be registered as a boolean",
+                    capability.as_str()
+                ));
+            };
+            if legacy_value != *inferred_value {
                 sqlx::query(
                     "INSERT INTO model_capability_overrides
                      (model_id, capability_id, value_json)
@@ -1105,6 +1108,27 @@ async fn migrate_model_capability_overrides(pool: &SqlitePool) -> Result<(), Str
     Ok(())
 }
 
+fn legacy_boolean_capability(
+    row: &sqlx::sqlite::SqliteRow,
+    capability: CapabilityId,
+) -> Result<bool, String> {
+    match capability {
+        CapabilityId::REASONING => Ok(row.get::<i64, _>("capability_reasoning") != 0),
+        CapabilityId::WEB => Ok(row.get::<i64, _>("capability_web") != 0),
+        _ => Err(format!(
+            "Capability {} has no legacy boolean mirror column",
+            capability.as_str()
+        )),
+    }
+}
+
+fn legacy_model_capabilities(row: &sqlx::sqlite::SqliteRow) -> Result<ModelCapabilities, String> {
+    Ok(ModelCapabilities::legacy(
+        legacy_boolean_capability(row, CapabilityId::REASONING)?,
+        legacy_boolean_capability(row, CapabilityId::WEB)?,
+    ))
+}
+
 async fn capability_overrides_for_provider(
     pool: &SqlitePool,
     provider_id: &str,
@@ -1122,17 +1146,15 @@ async fn capability_overrides_for_provider(
     let mut overrides = HashMap::<String, CapabilityOverrides>::new();
     for row in rows {
         let capability_id: String = row.get("capability_id");
-        let Some(capability) = CapabilityId::from_registered(&capability_id) else {
-            eprintln!("Ignoring unregistered model capability override: {capability_id}");
-            continue;
-        };
+        let capability = CapabilityId::from_registered(&capability_id)
+            .ok_or_else(|| format!("Unknown capability ID in database: {capability_id}"))?;
         let value_json: String = row.get("value_json");
         let value = serde_json::from_str(&value_json)
             .map_err(|error| format!("Invalid capability override {capability_id}: {error}"))?;
         overrides
             .entry(row.get("model_id"))
             .or_default()
-            .insert_json(capability, value);
+            .insert_json(capability, value)?;
     }
     Ok(overrides)
 }
@@ -1153,14 +1175,12 @@ async fn capability_overrides_for_model(
     let mut overrides = CapabilityOverrides::default();
     for row in rows {
         let capability_id: String = row.get("capability_id");
-        let Some(capability) = CapabilityId::from_registered(&capability_id) else {
-            eprintln!("Ignoring unregistered model capability override: {capability_id}");
-            continue;
-        };
+        let capability = CapabilityId::from_registered(&capability_id)
+            .ok_or_else(|| format!("Unknown capability ID in database: {capability_id}"))?;
         let value_json: String = row.get("value_json");
         let value = serde_json::from_str(&value_json)
             .map_err(|error| format!("Invalid capability override {capability_id}: {error}"))?;
-        overrides.insert_json(capability, value);
+        overrides.insert_json(capability, value)?;
     }
     Ok(overrides)
 }
@@ -1567,36 +1587,17 @@ fn model_from_row(
     overrides: Option<&CapabilityOverrides>,
 ) -> Result<ModelView, String> {
     let request_name: String = row.get("request_name");
-    let (
-        capability_reasoning,
-        capability_web,
-        supported_thinking_efforts,
-        thinking_required,
-        default_thinking_effort,
-    ) = match descriptor {
+    let capabilities = match descriptor {
         Some(descriptor) => {
             let empty_overrides = CapabilityOverrides::default();
-            let capabilities = resolve_capabilities(
-                descriptor.codec,
+            resolve_capabilities(
+                descriptor.capability_profile,
                 base_url,
                 &request_name,
                 overrides.unwrap_or(&empty_overrides),
-            )?;
-            (
-                capabilities.reasoning,
-                capabilities.web,
-                capabilities.thinking_efforts,
-                capabilities.thinking_required,
-                capabilities.default_thinking_effort,
-            )
+            )?
         }
-        None => (
-            row.get::<i64, _>("capability_reasoning") != 0,
-            row.get::<i64, _>("capability_web") != 0,
-            Vec::new(),
-            false,
-            None,
-        ),
+        None => legacy_model_capabilities(row)?,
     };
     Ok(ModelView {
         id: row.get("id"),
@@ -1604,11 +1605,7 @@ fn model_from_row(
         request_name,
         alias: row.get("alias"),
         source: row.get("source"),
-        capability_reasoning,
-        supported_thinking_efforts,
-        thinking_required,
-        default_thinking_effort,
-        capability_web,
+        capabilities,
         test_status: row.get("test_status"),
         latency_ms: row.get("latency_ms"),
         tested_at: row.get("tested_at"),
@@ -2490,15 +2487,19 @@ pub async fn add_model(pool: &SqlitePool, input: AddModelInput) -> Result<ModelV
     } else {
         input.alias.trim()
     };
-    let inferred = infer_capabilities(descriptor.codec, base_url.as_str(), request_name);
+    let inferred = infer_capabilities(
+        descriptor.capability_profile,
+        base_url.as_str(),
+        request_name,
+    );
     sqlx::query("INSERT INTO models (id, provider_id, request_name, alias, source, capability_reasoning, capability_web, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM models WHERE provider_id = ?), 0)) ON CONFLICT(provider_id, request_name) DO UPDATE SET alias = excluded.alias")
         .bind(&id)
         .bind(&input.provider_id)
         .bind(request_name)
         .bind(alias)
         .bind(input.source)
-        .bind(inferred.reasoning)
-        .bind(inferred.web)
+        .bind(inferred.reasoning())
+        .bind(inferred.web())
         .bind(&input.provider_id)
         .execute(pool)
         .await
@@ -2529,31 +2530,59 @@ pub async fn update_model(pool: &SqlitePool, input: UpdateModelInput) -> Result<
     let descriptor = registered_descriptor(model.get::<String, _>("protocol").as_str())?;
     let base_url: String = model.get("base_url");
     let request_name: String = model.get("request_name");
-    let inferred = infer_capabilities(descriptor.codec, &base_url, &request_name);
-    if inferred.thinking_required && !input.capability_reasoning {
-        return Err(format!(
-            "Model \"{request_name}\" requires thinking and cannot disable reasoning capability"
-        ));
+    let inferred = infer_capabilities(descriptor.capability_profile, &base_url, &request_name);
+    for capability_id in input.capabilities.keys() {
+        let capability = CapabilityId::from_registered(capability_id)
+            .ok_or_else(|| format!("Unknown capability ID: {capability_id}"))?;
+        if capability.definition().override_policy != CapabilityOverridePolicy::User {
+            return Err(format!(
+                "Capability {} cannot be changed by the user",
+                capability.as_str()
+            ));
+        }
     }
+    let mut overrides = capability_overrides_for_model(pool, &input.id).await?;
+    for capability in CapabilityId::REGISTERED
+        .iter()
+        .copied()
+        .filter(|capability| {
+            capability.definition().override_policy == CapabilityOverridePolicy::User
+        })
+    {
+        let value = input
+            .capabilities
+            .get(capability.as_str())
+            .ok_or_else(|| format!("Missing user-editable capability: {}", capability.as_str()))?;
+        overrides.remove(capability);
+        overrides.insert_user_value(capability, value.clone())?;
+    }
+    let resolved = resolve_capabilities(
+        descriptor.capability_profile,
+        &base_url,
+        &request_name,
+        &overrides,
+    )?;
 
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query("UPDATE models SET alias = ?, capability_reasoning = ?, capability_web = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(input.alias.trim())
-        .bind(input.capability_reasoning)
-        .bind(input.capability_web)
+        .bind(resolved.reasoning())
+        .bind(resolved.web())
         .bind(&input.id)
         .execute(&mut *transaction)
         .await
         .map_err(|error| error.to_string())?;
-    for (capability, final_value, inferred_value) in [
-        (
-            CapabilityId::REASONING,
-            input.capability_reasoning,
-            inferred.reasoning,
-        ),
-        (CapabilityId::WEB, input.capability_web, inferred.web),
-    ] {
-        if final_value == inferred_value {
+    for capability in CapabilityId::REGISTERED
+        .iter()
+        .copied()
+        .filter(|capability| {
+            capability.definition().override_policy == CapabilityOverridePolicy::User
+        })
+    {
+        let final_value = overrides
+            .get(capability)
+            .expect("all user-editable capabilities were validated");
+        if final_value == inferred.get(capability) {
             sqlx::query(
                 "DELETE FROM model_capability_overrides
                  WHERE model_id = ? AND capability_id = ?",
@@ -2574,7 +2603,7 @@ pub async fn update_model(pool: &SqlitePool, input: UpdateModelInput) -> Result<
             )
             .bind(&input.id)
             .bind(capability.as_str())
-            .bind(if final_value { "true" } else { "false" })
+            .bind(final_value.as_json()?.to_string())
             .execute(&mut *transaction)
             .await
             .map_err(|error| error.to_string())?;
@@ -2713,6 +2742,14 @@ mod tests {
         UpdateAssistantPromptInput, UpdateAssistantSettingsInput, UpdateModelInput,
         UpdateProviderConfigInput, UpdateProviderMetadataInput, UpdateVertexAiConfigInput,
     };
+    use std::collections::BTreeMap;
+
+    fn user_capabilities(reasoning: bool, web: bool) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("reasoning".into(), Value::Bool(reasoning)),
+            ("web".into(), Value::Bool(web)),
+        ])
+    }
 
     #[test]
     fn custom_header_json_uses_http_validation_and_rejects_unsafe_fields() {
@@ -2863,7 +2900,10 @@ mod tests {
         assert!(provider.enabled);
         assert_eq!(provider.config.pointer("/legacy/keep"), Some(&json!(true)));
         assert_eq!(provider.custom_header_keys, vec!["X-Legacy"]);
-        assert!(provider.models[0].supported_thinking_efforts.is_empty());
+        assert_eq!(
+            provider.models[0].capabilities.thinking_efforts(),
+            &[crate::domain::ThinkingEffort::None]
+        );
         assert!(runtime_config(&pool, &provider_id).await.is_err());
         assert!(set_provider_enabled(
             &pool,
@@ -3479,8 +3519,7 @@ mod tests {
             UpdateModelInput {
                 id: model.id,
                 alias: "Renamed".into(),
-                capability_reasoning: true,
-                capability_web: false,
+                capabilities: user_capabilities(true, false),
             },
         )
         .await
@@ -3527,27 +3566,25 @@ mod tests {
         )
         .await
         .expect("model");
-        assert!(model.capability_reasoning);
-        assert!(model.thinking_required);
+        assert!(model.capabilities.reasoning());
+        assert!(model.capabilities.thinking_required());
 
         let error = update_model(
             &pool,
             UpdateModelInput {
                 id: model.id.clone(),
                 alias: "Still required".into(),
-                capability_reasoning: false,
-                capability_web: model.capability_web,
+                capabilities: user_capabilities(false, model.capabilities.web()),
             },
         )
         .await
         .expect_err("required thinking cannot be disabled");
         assert!(error.contains("requires thinking"));
-        assert!(
-            get_model(&pool, &model.id)
-                .await
-                .expect("model after rejected update")
-                .capability_reasoning
-        );
+        assert!(get_model(&pool, &model.id)
+            .await
+            .expect("model after rejected update")
+            .capabilities
+            .reasoning());
 
         pool.close().await;
         let _ = std::fs::remove_file(path);
@@ -3581,8 +3618,8 @@ mod tests {
         .await
         .expect("add model");
 
-        assert!(model.capability_reasoning);
-        assert!(model.capability_web);
+        assert!(model.capabilities.reasoning());
+        assert!(model.capabilities.web());
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
@@ -3622,16 +3659,15 @@ mod tests {
 
         backfill_model_capabilities(&pool).await.expect("backfill");
         let backfilled = get_model(&pool, &model_id).await.expect("backfilled model");
-        assert!(backfilled.capability_reasoning);
-        assert!(backfilled.capability_web);
+        assert!(backfilled.capabilities.reasoning());
+        assert!(backfilled.capabilities.web());
 
         update_model(
             &pool,
             UpdateModelInput {
                 id: model_id.clone(),
                 alias: "GPT-5".into(),
-                capability_reasoning: true,
-                capability_web: false,
+                capabilities: user_capabilities(true, false),
             },
         )
         .await
@@ -3640,7 +3676,7 @@ mod tests {
             .await
             .expect("second backfill skips");
         let manual = get_model(&pool, &model_id).await.expect("manual model");
-        assert!(!manual.capability_web);
+        assert!(!manual.capabilities.web());
 
         pool.close().await;
         let _ = std::fs::remove_file(path);
@@ -3682,22 +3718,37 @@ mod tests {
             .await
             .expect("migrate overrides");
         let migrated = get_model(&pool, &model_id).await.expect("migrated model");
-        assert!(!migrated.capability_reasoning);
-        assert!(!migrated.capability_web);
+        assert!(!migrated.capabilities.reasoning());
+        assert!(!migrated.capabilities.web());
 
         let updated = update_model(
             &pool,
             UpdateModelInput {
                 id: model_id,
                 alias: "GPT-5".into(),
-                capability_reasoning: true,
-                capability_web: false,
+                capabilities: user_capabilities(true, false),
             },
         )
         .await
         .expect("update override");
-        assert!(updated.capability_reasoning);
-        assert!(!updated.capability_web);
+        assert!(updated.capabilities.reasoning());
+        assert!(!updated.capabilities.web());
+
+        sqlx::query(
+            "INSERT INTO model_capability_overrides (model_id, capability_id, value_json)
+             VALUES (?, 'thinking-effort', '[\"high\"]')",
+        )
+        .bind(&updated.id)
+        .execute(&pool)
+        .await
+        .expect("store legacy thinking-effort override");
+        let stored = get_model(&pool, &updated.id)
+            .await
+            .expect("stored thinking-effort override");
+        assert_eq!(
+            stored.capabilities.thinking_efforts(),
+            &[crate::domain::ThinkingEffort::High]
+        );
 
         let copied = copy_provider(
             &pool,
@@ -3708,8 +3759,12 @@ mod tests {
         )
         .await
         .expect("copy provider");
-        assert!(copied.models[0].capability_reasoning);
-        assert!(!copied.models[0].capability_web);
+        assert!(copied.models[0].capabilities.reasoning());
+        assert!(!copied.models[0].capabilities.web());
+        assert_eq!(
+            copied.models[0].capabilities.thinking_efforts(),
+            &[crate::domain::ThinkingEffort::High]
+        );
 
         pool.close().await;
         let _ = std::fs::remove_file(path);

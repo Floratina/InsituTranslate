@@ -6,6 +6,12 @@ import { Switch } from "@/components/ui/switch";
 import { AssistantIcon } from "@/features/assistants/AssistantIcon";
 import type { AssistantView } from "@/features/assistants/types";
 import { ProviderAvatar } from "@/features/providers/ProviderAvatar";
+import {
+  defaultThinkingEffortCapability,
+  reasoningCapability,
+  thinkingEffortsCapability,
+  webCapability,
+} from "@/features/providers/capabilities";
 import type { ModelView, ProviderView } from "@/features/providers/types";
 import type { ThinkingEffort } from "@/features/translation/types";
 import { cn } from "@/lib/utils";
@@ -56,11 +62,8 @@ function FieldBlock({ label, children }: FieldBlockProps) {
 }
 
 export function supportedThinkingEffortsForModel(model: ModelView | null): ThinkingEffort[] {
-  if (!model?.capabilityReasoning) return ["none"];
-  if (model.supportedThinkingEfforts.length === 0) {
-    return THINKING_EFFORT_OPTIONS.map((option) => option.value);
-  }
-  return model.supportedThinkingEfforts;
+  if (!model || !reasoningCapability(model)) return ["none"];
+  return thinkingEffortsCapability(model);
 }
 
 function effectiveThinkingEffort(
@@ -69,7 +72,7 @@ function effectiveThinkingEffort(
   supportedThinkingEfforts: ThinkingEffort[],
 ): ThinkingEffort {
   if (supportedThinkingEfforts.includes(value)) return value;
-  return model?.defaultThinkingEffort ?? supportedThinkingEfforts[0] ?? "none";
+  return model ? defaultThinkingEffortCapability(model) ?? supportedThinkingEfforts[0] ?? "none" : "none";
 }
 
 function normalizeCapabilities(
@@ -85,7 +88,7 @@ function normalizeCapabilities(
       model,
       supportedThinkingEfforts,
     ),
-    useWebSearch: model.capabilityWeb ? value.useWebSearch : false,
+    useWebSearch: webCapability(model) ? value.useWebSearch : false,
   };
 }
 
@@ -148,7 +151,7 @@ export function useModelRuntimeSettings({
     models,
     supportedThinkingEfforts,
     reasoningAvailable: supportedThinkingEfforts.some((effort) => effort !== "none"),
-    webSearchAvailable: Boolean(selectedModel?.capabilityWeb),
+    webSearchAvailable: selectedModel ? webCapability(selectedModel) : false,
     changeProvider,
     changeModel,
   };

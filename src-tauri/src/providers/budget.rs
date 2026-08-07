@@ -1,7 +1,5 @@
 use serde_json::Value;
 
-use crate::domain::{ThinkingConfig, ThinkingEffort, ThinkingMode};
-
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionBudgetAlias {
     pointer: &'static str,
@@ -35,12 +33,6 @@ pub enum CompletionLimitSource {
     Structured,
     LegacyAlias,
     Automatic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionLimitScope {
-    TotalOutput,
-    VisibleOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,30 +92,11 @@ impl NormalizedCompletionBudget {
     }
 }
 
-pub fn thinking_token_reserve(thinking: Option<&ThinkingConfig>) -> u32 {
-    let Some(thinking) = thinking else {
-        return 0;
-    };
-    if thinking.mode == ThinkingMode::Disabled || thinking.effort == Some(ThinkingEffort::None) {
-        return 0;
-    }
-    if let Some(tokens) = thinking.budget_tokens {
-        return tokens;
-    }
-    match thinking.effort {
-        None | Some(ThinkingEffort::None) => 0,
-        Some(ThinkingEffort::Minimal | ThinkingEffort::Low) => 1_024,
-        Some(ThinkingEffort::Medium) => 16_000,
-        Some(ThinkingEffort::High | ThinkingEffort::Xhigh | ThinkingEffort::Max) => 32_000,
-    }
-}
-
 pub fn completion_budget(
     normalized: NormalizedCompletionBudget,
     visible_output_tokens: u32,
     thinking_tokens: u32,
     automatic_wire_max: Option<u32>,
-    limit_scope: CompletionLimitScope,
     protocol: &str,
     model: &str,
 ) -> Result<CompletionBudget, String> {
@@ -139,26 +112,14 @@ pub fn completion_budget(
         })?;
 
     if let Some(limit) = explicit {
-        let required = match limit_scope {
-            CompletionLimitScope::TotalOutput => required_total,
-            CompletionLimitScope::VisibleOutput => visible_output_tokens,
-        };
-        if limit < required {
+        if limit < required_total {
             return Err(format!(
-                "{protocol} output limit for model \"{model}\" is {limit}, but the planned visible output ({visible_output_tokens}) and thinking reserve ({thinking_tokens}) require at least {required}."
+                "{protocol} output limit for model \"{model}\" is {limit}, but the planned visible output ({visible_output_tokens}) and thinking reserve ({thinking_tokens}) require at least {required_total}."
             ));
         }
     }
 
-    let total_output_tokens = match (wire_max_output_tokens, limit_scope) {
-        (Some(limit), CompletionLimitScope::VisibleOutput) => {
-            limit.checked_add(thinking_tokens).ok_or_else(|| {
-                format!("{protocol} completion budget overflows u32 for model \"{model}\".")
-            })?
-        }
-        (Some(limit), CompletionLimitScope::TotalOutput) => limit,
-        (None, _) => required_total,
-    };
+    let total_output_tokens = wire_max_output_tokens.unwrap_or(required_total);
 
     Ok(CompletionBudget {
         visible_output_tokens,
@@ -259,7 +220,10 @@ fn remove_path(value: &mut Value, segments: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{UnifiedChatRequest, UnifiedContent, UnifiedMessage};
+    use crate::domain::{
+        ThinkingConfig, ThinkingEffort, ThinkingMode, UnifiedChatRequest, UnifiedContent,
+        UnifiedMessage,
+    };
     use crate::providers::codec::ProtocolCodec;
     use crate::providers::protocols::{
         anthropic, gemini, ollama, openai_chat, openai_responses, vertex_ai,
@@ -280,7 +244,6 @@ mod tests {
             max_output_tokens: None,
             temperature: None,
             top_p: None,
-            stream: false,
             logprobs: false,
             custom_parameters,
         }
@@ -376,34 +339,19 @@ mod tests {
     }
 
     #[test]
-    fn completion_limit_scope_controls_whether_thinking_is_inside_the_wire_cap() {
-        let total_scope = completion_budget(
+    fn completion_limits_always_include_visible_and_thinking_tokens() {
+        let budget = completion_budget(
             normalize_completion_budget(Some(12_000), &json!({}), OPENAI_CHAT_ALIASES)
-                .expect("total-scope normalized budget"),
+                .expect("normalized budget"),
             4_000,
             8_000,
             None,
-            CompletionLimitScope::TotalOutput,
             "openai-chat",
             "reasoning-model",
         )
-        .expect("total-scope budget");
-        assert_eq!(total_scope.wire_max_output_tokens, Some(12_000));
-        assert_eq!(total_scope.total_output_tokens, 12_000);
-
-        let visible_scope = completion_budget(
-            normalize_completion_budget(Some(4_000), &json!({}), GEMINI_ALIASES)
-                .expect("visible-scope normalized budget"),
-            4_000,
-            8_000,
-            None,
-            CompletionLimitScope::VisibleOutput,
-            "gemini",
-            "thinking-model",
-        )
-        .expect("visible-scope budget");
-        assert_eq!(visible_scope.wire_max_output_tokens, Some(4_000));
-        assert_eq!(visible_scope.total_output_tokens, 12_000);
+        .expect("combined budget");
+        assert_eq!(budget.wire_max_output_tokens, Some(12_000));
+        assert_eq!(budget.total_output_tokens, 12_000);
 
         let error = completion_budget(
             normalize_completion_budget(Some(11_999), &json!({}), OPENAI_CHAT_ALIASES)
@@ -411,7 +359,6 @@ mod tests {
             4_000,
             8_000,
             None,
-            CompletionLimitScope::TotalOutput,
             "openai-chat",
             "reasoning-model",
         )
@@ -535,5 +482,54 @@ mod tests {
             )
             .expect("Vertex completion budget");
         assert_eq!(planned, Some(8192));
+    }
+
+    #[test]
+    fn every_dynamic_protocol_rejects_a_total_cap_that_would_squeeze_visible_output() {
+        let thinking = ThinkingConfig {
+            mode: ThinkingMode::Auto,
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            summary: None,
+        };
+        for (codec, base_url, model) in [
+            (
+                &openai_chat::CODEC as &dyn ProtocolCodec,
+                "https://api.openai.com/v1",
+                "gpt-5",
+            ),
+            (
+                &openai_responses::CODEC as &dyn ProtocolCodec,
+                "https://api.openai.com/v1",
+                "gpt-5",
+            ),
+            (
+                &gemini::CODEC as &dyn ProtocolCodec,
+                "https://generativelanguage.googleapis.com",
+                "gemini-3-pro",
+            ),
+            (
+                &vertex_ai::CODEC as &dyn ProtocolCodec,
+                "https://aiplatform.googleapis.com",
+                "gemini-3-pro",
+            ),
+            (
+                &ollama::CODEC as &dyn ProtocolCodec,
+                "http://localhost:11434",
+                "gpt-oss:20b",
+            ),
+        ] {
+            let error = codec
+                .plan_completion_budget(
+                    base_url,
+                    model,
+                    Some(&thinking),
+                    Some(7_000),
+                    &json!({}),
+                    4_096,
+                )
+                .expect_err("total cap must include the adaptive thinking reserve");
+            assert!(error.contains("require at least 8192"), "{model}: {error}");
+        }
     }
 }

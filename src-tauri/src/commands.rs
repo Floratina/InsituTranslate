@@ -32,7 +32,7 @@ use crate::glossaries::{
 };
 use crate::providers::registry::ProtocolDescriptorView;
 use crate::providers::EndpointPreview;
-use crate::providers::{ProviderAdapter, RuntimeAdapter};
+use crate::providers::RuntimeAdapter;
 use crate::settings::{
     AppearancePreferences, AppearancePreferencesState, FontCacheRefresh, TaskSchedulerPreferences,
 };
@@ -174,6 +174,12 @@ pub async fn delete_assistant(state: State<'_, AppState>, id: String) -> Result<
 #[tauri::command]
 pub fn list_protocol_descriptors() -> Result<Vec<ProtocolDescriptorView>, String> {
     crate::providers::registry::descriptor_views()
+}
+
+#[tauri::command]
+pub fn list_capability_descriptors(
+) -> Result<Vec<crate::providers::capabilities::CapabilityDescriptorView>, String> {
+    crate::providers::capabilities::descriptor_views()
 }
 
 #[tauri::command]
@@ -386,17 +392,16 @@ pub async fn test_model_connectivity(
         max_output_tokens: Some(8),
         temperature: Some(0.0),
         top_p: None,
-        stream: false,
         logprobs: false,
         custom_parameters: json!({}),
     };
     let started = Instant::now();
-    let result = adapter.send_chat(&request).await;
+    let result = adapter.send_chat_with_meta(&request).await;
     let latency_ms = started.elapsed().as_millis() as i64;
     let tested_at = unix_timestamp();
     let error = result
         .err()
-        .map(|value| value.chars().take(500).collect::<String>());
+        .map(|value| value.to_string().chars().take(500).collect::<String>());
     let success = error.is_none();
     db::update_test_result(
         &state.pool,
@@ -1215,14 +1220,51 @@ fn validate_manual_model_request_name(value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mineru_probe_result, mineru_remote_models, validate_manual_model_request_name};
+    use super::{
+        list_capability_descriptors, mineru_probe_result, mineru_remote_models,
+        validate_manual_model_request_name,
+    };
     use crate::domain::ModelView;
+    use crate::providers::capabilities::ModelCapabilities;
+    use serde_json::json;
 
     #[test]
     fn manual_model_request_name_preserves_common_provider_names() {
         assert!(validate_manual_model_request_name("MyOrg/Model-V2:free").is_ok());
         assert!(validate_manual_model_request_name("gpt-4.1").is_ok());
         assert!(validate_manual_model_request_name("bad model").is_err());
+    }
+
+    #[test]
+    fn capability_ipc_shapes_are_generic_and_stable() {
+        let descriptors = list_capability_descriptors().expect("capability descriptors");
+        let descriptor_json = serde_json::to_value(&descriptors[0]).expect("descriptor JSON");
+        assert_eq!(descriptor_json["id"], "reasoning");
+        assert_eq!(descriptor_json["valueKind"], "boolean");
+        assert_eq!(descriptor_json["editor"], "toggle");
+        assert_eq!(descriptor_json["presentation"], "badge");
+        assert_eq!(descriptor_json["defaultValue"], false);
+
+        let model = ModelView {
+            id: "model".into(),
+            provider_id: "provider".into(),
+            request_name: "model-id".into(),
+            alias: "Model".into(),
+            source: "manual".into(),
+            capabilities: ModelCapabilities::legacy(true, false),
+            test_status: "untested".into(),
+            latency_ms: None,
+            tested_at: None,
+            test_error: None,
+        };
+        let model_json = serde_json::to_value(model).expect("model JSON");
+        assert_eq!(model_json["capabilities"]["reasoning"], json!(true));
+        assert_eq!(
+            model_json["capabilities"]["thinking-effort"],
+            json!(["none"])
+        );
+        assert!(model_json.get("capabilityReasoning").is_none());
+        assert!(model_json.get("capabilityWeb").is_none());
     }
 
     #[test]
@@ -1233,11 +1275,7 @@ mod tests {
             request_name: "vlm".into(),
             alias: "VLM".into(),
             source: "builtin".into(),
-            capability_reasoning: false,
-            supported_thinking_efforts: vec![],
-            thinking_required: false,
-            default_thinking_effort: None,
-            capability_web: false,
+            capabilities: ModelCapabilities::legacy(false, false),
             test_status: "untested".into(),
             latency_ms: None,
             tested_at: None,

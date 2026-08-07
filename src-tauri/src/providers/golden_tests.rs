@@ -175,7 +175,6 @@ fn request(model: &str) -> UnifiedChatRequest {
         max_output_tokens: Some(4096),
         temperature: Some(0.2),
         top_p: None,
-        stream: false,
         logprobs: false,
         custom_parameters: json!({}),
     }

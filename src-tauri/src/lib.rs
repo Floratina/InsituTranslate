@@ -5,22 +5,16 @@ mod document_parsing;
 mod domain;
 mod features;
 mod glossaries;
+mod glossary_prompt;
 mod languages;
 mod pdf_parsing;
 mod providers;
-// Reserved for the glossary extraction pipeline; intentionally not exposed through IPC yet.
-#[allow(dead_code)]
-mod glossary_prompt;
 mod secrets;
 mod settings;
 mod sqlite_paths;
 mod system_fonts;
-mod task_scheduler;
-// Shared infrastructure for task-specific document prompt builders.
-#[allow(dead_code)]
 mod task_prompt;
-// Reserved for the document translation pipeline; intentionally not exposed through IPC yet.
-#[allow(dead_code)]
+mod task_scheduler;
 mod translation_prompt;
 #[path = "translation/mod.rs"]
 mod translation_tasks;
@@ -124,6 +118,7 @@ pub fn run() {
             commands::get_cached_system_fonts,
             commands::refresh_system_fonts_cache,
             commands::list_protocol_descriptors,
+            commands::list_capability_descriptors,
             commands::preview_protocol_endpoints,
             commands::list_providers,
             commands::list_assistants,

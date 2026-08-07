@@ -1,61 +1,29 @@
 use std::fmt;
 
-use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Method};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::document_parsing::count_tokens;
 use crate::domain::{
-    ProviderRuntimeConfig, RemoteModel, UnifiedChatRequest, UnifiedChatResponse, UnifiedUsage,
-    UnifiedUsageProvenance,
+    ProviderRuntimeConfig, RemoteModel, ThinkingConfig, UnifiedChatRequest, UnifiedChatResponse,
+    UnifiedUsage, UnifiedUsageProvenance,
 };
+use crate::providers::capabilities::lower_thinking_config;
 use crate::providers::negotiation::{
     plan_retry, write_audit, NegotiationFailure, NegotiationFailureKind,
 };
-use crate::providers::registry::{descriptor_for, AuthStrategy};
-use crate::providers::{
-    CompletionBudget, EncodedRequest, HeaderDirective, HeaderMode, HttpMethod, ProtocolCodec,
-};
+use crate::providers::registry::descriptor_for;
+use crate::providers::{CompletionBudget, EncodedRequest, HttpMethod, ProtocolCodec};
 
-pub trait ProviderAdapter {
-    async fn list_models(&self) -> Result<Vec<RemoteModel>, String>;
-    #[allow(dead_code)]
-    fn build_chat_request(&self, request: &UnifiedChatRequest) -> Result<(String, Value), String>;
-    async fn send_chat(&self, request: &UnifiedChatRequest) -> Result<UnifiedChatResponse, String>;
-    #[allow(dead_code)]
-    async fn stream_chat(
-        &self,
-        request: &UnifiedChatRequest,
-    ) -> Result<Vec<UnifiedChatResponse>, String>;
-}
+use super::headers::request_headers;
+pub use super::rate_limits::RateLimitTelemetry;
+use super::rate_limits::{merge_retry_after_from_error_body, rate_limits_from_headers};
 
 #[derive(Clone)]
 pub struct RuntimeAdapter {
     client: Client,
     config: ProviderRuntimeConfig,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RateLimitTelemetry {
-    pub request_limit: Option<u64>,
-    pub request_remaining: Option<u64>,
-    pub request_reset_ms: Option<u64>,
-    pub token_limit: Option<u64>,
-    pub token_remaining: Option<u64>,
-    pub token_reset_ms: Option<u64>,
-    pub retry_after_ms: Option<u64>,
-    pub source: Option<String>,
-}
-
-impl RateLimitTelemetry {
-    pub fn has_quota_headers(&self) -> bool {
-        self.request_remaining.is_some()
-            || self.request_limit.is_some()
-            || self.token_remaining.is_some()
-            || self.token_limit.is_some()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +59,8 @@ impl ChatAttemptContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestCost {
     pub estimated_input_tokens: u64,
+    pub visible_output_tokens: u64,
+    pub estimated_thinking_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
 }
@@ -240,6 +210,20 @@ impl RuntimeAdapter {
         )
     }
 
+    pub fn lower_thinking_config(
+        &self,
+        model_id: &str,
+        current: Option<&ThinkingConfig>,
+    ) -> Result<Option<ThinkingConfig>, String> {
+        let descriptor = descriptor_for(&self.config.protocol)?;
+        lower_thinking_config(
+            descriptor.capability_profile,
+            &self.config.base_url,
+            model_id,
+            current,
+        )
+    }
+
     pub fn prepare_chat_request(
         &self,
         request: &UnifiedChatRequest,
@@ -251,7 +235,7 @@ impl RuntimeAdapter {
         normalized_request.max_output_tokens = completion_budget.wire_max_output_tokens;
         normalized_request.custom_parameters = completion_budget.custom_parameters.clone();
         let encoded = self.encoded_chat_request(&normalized_request)?;
-        let cost = request_cost(&encoded, completion_budget.total_output_tokens)?;
+        let cost = request_cost(&encoded, &completion_budget)?;
         Ok(PreparedChatRequest {
             request: normalized_request,
             encoded,
@@ -288,78 +272,19 @@ impl RuntimeAdapter {
         )
     }
 
-    async fn headers(&self, directives: &[HeaderDirective]) -> Result<HeaderMap, String> {
-        let descriptor = descriptor_for(&self.config.protocol)?;
-        let auth_strategy = descriptor.auth.strategy;
-        let vertex_token = if auth_strategy == AuthStrategy::VertexServiceAccount {
-            Some(crate::vertex_ai::access_token(&self.client, &self.config).await?)
-        } else {
-            None
-        };
-        self.build_headers(directives, vertex_token.as_deref())
-    }
-
-    fn build_headers(
+    pub fn prepared_output_truncation_error(
         &self,
-        directives: &[HeaderDirective],
-        vertex_token: Option<&str>,
-    ) -> Result<HeaderMap, String> {
-        let descriptor = descriptor_for(&self.config.protocol)?;
-        let auth_strategy = descriptor.auth.strategy;
-        let mut headers = HeaderMap::new();
-        if let AuthStrategy::StaticHeader { header, scheme } = auth_strategy {
-            if let Some(credential) = self
-                .config
-                .credential
-                .as_deref()
-                .filter(|value| !value.is_empty())
-            {
-                let name = HeaderName::from_bytes(header.as_bytes())
-                    .map_err(|error| format!("Invalid authentication header: {error}"))?;
-                let value = match scheme {
-                    Some(scheme) => format!("{scheme} {credential}"),
-                    None => credential.to_string(),
-                };
-                headers.insert(
-                    name,
-                    HeaderValue::from_str(&value)
-                        .map_err(|error| format!("Invalid authentication value: {error}"))?,
-                );
-            }
-        }
-        for (name, value) in &self.config.custom_headers {
-            let header_name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|error| format!("Invalid custom header {name}: {error}"))?;
-            if auth_strategy == AuthStrategy::VertexServiceAccount && header_name == AUTHORIZATION {
-                continue;
-            }
-            headers.insert(
-                header_name,
-                HeaderValue::from_str(value)
-                    .map_err(|error| format!("Invalid custom header value for {name}: {error}"))?,
-            );
-        }
-        if auth_strategy == AuthStrategy::VertexServiceAccount {
-            let token = vertex_token.ok_or_else(|| {
-                "Agent Platform OAuth token is required to construct request headers".to_string()
-            })?;
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|error| format!("Invalid Agent Platform token: {error}"))?,
-            );
-        }
-        for directive in directives {
-            let name = HeaderName::from_bytes(directive.name.as_bytes())
-                .map_err(|error| format!("Invalid protocol header {}: {error}", directive.name))?;
-            if directive.mode == HeaderMode::Replace || !headers.contains_key(&name) {
-                let value = HeaderValue::from_str(&directive.value)
-                    .map_err(|error| format!("Invalid protocol header value: {error}"))?;
-                headers.insert(name, value);
-            }
-        }
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(headers)
+        prepared: &PreparedChatRequest,
+        finish_reason: &str,
+    ) -> String {
+        format!(
+            "{} visible_output_tokens={} estimated_thinking_tokens={} combined_completion_tokens={} reserved_total_tokens={}",
+            self.output_truncation_error(&prepared.request, finish_reason),
+            prepared.cost.visible_output_tokens,
+            prepared.cost.estimated_thinking_tokens,
+            prepared.cost.completion_tokens,
+            prepared.cost.total_tokens,
+        )
     }
 
     fn encoded_chat_request(&self, request: &UnifiedChatRequest) -> Result<EncodedRequest, String> {
@@ -386,7 +311,7 @@ impl RuntimeAdapter {
             .client
             .request(reqwest_method(encoded.method), encoded.url)
             .headers(
-                self.headers(&encoded.headers)
+                request_headers(&self.client, &self.config, &encoded.headers)
                     .await
                     .map_err(local_request_error)?,
             );
@@ -447,7 +372,7 @@ impl RuntimeAdapter {
             .client
             .request(reqwest_method(encoded.method), encoded.url)
             .headers(
-                self.headers(&encoded.headers)
+                request_headers(&self.client, &self.config, &encoded.headers)
                     .await
                     .map_err(local_request_error)?,
             );
@@ -459,10 +384,12 @@ impl RuntimeAdapter {
             .await
             .map_err(|error| {
                 local_request_error(format!(
-                    "protocol={} model=\"{}\" estimated_input_tokens={} completion_tokens={} reserved_total_tokens={}: {error}",
+                    "protocol={} model=\"{}\" estimated_input_tokens={} visible_output_tokens={} estimated_thinking_tokens={} combined_completion_tokens={} reserved_total_tokens={}: {error}",
                     self.config.protocol.as_str(),
                     model_id,
                     cost.estimated_input_tokens,
+                    cost.visible_output_tokens,
+                    cost.estimated_thinking_tokens,
                     cost.completion_tokens,
                     cost.total_tokens,
                 ))
@@ -607,15 +534,12 @@ impl RuntimeAdapter {
                     &prepared.encoded,
                     negotiation_failure(&original_error),
                     0,
-                    !prepared.request.stream,
+                    true,
                 ) else {
                     return Err(original_error);
                 };
-                let retry_cost = request_cost(
-                    &plan.request,
-                    prepared.completion_budget.total_output_tokens,
-                )
-                .map_err(local_request_error)?;
+                let retry_cost = request_cost(&plan.request, &prepared.completion_budget)
+                    .map_err(local_request_error)?;
                 match self
                     .request_json_with_gate(
                         plan.request,
@@ -728,7 +652,7 @@ impl RuntimeAdapter {
                     &encoded,
                     negotiation_failure(&original_error),
                     0,
-                    !request.stream,
+                    true,
                 ) else {
                     return Err(original_error);
                 };
@@ -770,8 +694,8 @@ impl RuntimeAdapter {
     }
 }
 
-impl ProviderAdapter for RuntimeAdapter {
-    async fn list_models(&self) -> Result<Vec<RemoteModel>, String> {
+impl RuntimeAdapter {
+    pub async fn list_models(&self) -> Result<Vec<RemoteModel>, String> {
         let request = self.codec()?.encode_model_list(&self.config)?;
         let value = self.request_json(request).await?;
         let mut models = self.codec()?.decode_model_list(&value)?;
@@ -779,7 +703,11 @@ impl ProviderAdapter for RuntimeAdapter {
         Ok(models)
     }
 
-    fn build_chat_request(&self, request: &UnifiedChatRequest) -> Result<(String, Value), String> {
+    #[cfg(test)]
+    pub fn build_chat_request(
+        &self,
+        request: &UnifiedChatRequest,
+    ) -> Result<(String, Value), String> {
         let encoded = self.encoded_chat_request(request)?;
         Ok((
             encoded.url,
@@ -788,51 +716,12 @@ impl ProviderAdapter for RuntimeAdapter {
                 .ok_or_else(|| "Chat request body is missing".to_string())?,
         ))
     }
-
-    async fn send_chat(&self, request: &UnifiedChatRequest) -> Result<UnifiedChatResponse, String> {
-        self.send_chat_with_meta(request)
-            .await
-            .map(|meta| meta.response)
-            .map_err(|error| error.to_string())
-    }
-
-    async fn stream_chat(
-        &self,
-        request: &UnifiedChatRequest,
-    ) -> Result<Vec<UnifiedChatResponse>, String> {
-        if !request.stream {
-            return Err("Stream chat requires request.stream to be true".into());
-        }
-        let encoded = self.encoded_chat_request(request)?;
-        let headers = self.headers(&encoded.headers).await?;
-        let body = encoded
-            .body
-            .ok_or_else(|| "Chat request body is missing".to_string())?;
-        let response = self
-            .client
-            .request(reqwest_method(encoded.method), encoded.url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.map_err(|error| error.to_string())?;
-            return Err(self.codec()?.decode_error(status.as_u16(), &text));
-        }
-        let mut stream = response.bytes_stream();
-        let mut decoder = self.codec()?.new_stream_decoder();
-        let mut output = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            output.extend(decoder.push(&chunk.map_err(|error| error.to_string())?)?);
-        }
-        output.extend(decoder.finish()?);
-        Ok(output)
-    }
 }
 
-fn request_cost(encoded: &EncodedRequest, completion_tokens: u32) -> Result<RequestCost, String> {
+fn request_cost(
+    encoded: &EncodedRequest,
+    completion_budget: &CompletionBudget,
+) -> Result<RequestCost, String> {
     let body = encoded
         .body
         .as_ref()
@@ -841,12 +730,16 @@ fn request_cost(encoded: &EncodedRequest, completion_tokens: u32) -> Result<Requ
         .map_err(|error| format!("Failed to serialize the final chat request body: {error}"))?;
     let estimated_input_tokens = u64::try_from(count_tokens(&serialized))
         .map_err(|_| "Estimated chat input token count exceeds u64".to_string())?;
-    let completion_tokens = u64::from(completion_tokens);
+    let visible_output_tokens = u64::from(completion_budget.visible_output_tokens);
+    let estimated_thinking_tokens = u64::from(completion_budget.thinking_tokens);
+    let completion_tokens = u64::from(completion_budget.total_output_tokens);
     let total_tokens = estimated_input_tokens
         .checked_add(completion_tokens)
         .ok_or_else(|| "Estimated chat request token count overflows u64".to_string())?;
     Ok(RequestCost {
         estimated_input_tokens,
+        visible_output_tokens,
+        estimated_thinking_tokens,
         completion_tokens,
         total_tokens,
     })
@@ -987,174 +880,9 @@ fn negotiation_failure(error: &ProviderChatError) -> NegotiationFailure<'_> {
     }
 }
 
-fn rate_limits_from_headers(headers: &HeaderMap) -> RateLimitTelemetry {
-    let request_limit = header_u64(
-        headers,
-        &[
-            "x-ratelimit-limit-requests",
-            "anthropic-ratelimit-requests-limit",
-        ],
-    );
-    let request_remaining = header_u64(
-        headers,
-        &[
-            "x-ratelimit-remaining-requests",
-            "anthropic-ratelimit-requests-remaining",
-        ],
-    );
-    let token_limit = header_u64(
-        headers,
-        &[
-            "x-ratelimit-limit-tokens",
-            "anthropic-ratelimit-tokens-limit",
-        ],
-    );
-    let token_remaining = header_u64(
-        headers,
-        &[
-            "x-ratelimit-remaining-tokens",
-            "anthropic-ratelimit-tokens-remaining",
-        ],
-    );
-    let request_reset_ms = header_duration_ms(
-        headers,
-        &[
-            "x-ratelimit-reset-requests",
-            "anthropic-ratelimit-requests-reset",
-        ],
-    );
-    let token_reset_ms = header_duration_ms(
-        headers,
-        &[
-            "x-ratelimit-reset-tokens",
-            "anthropic-ratelimit-tokens-reset",
-        ],
-    );
-    let retry_after_ms = header_duration_ms(headers, &["retry-after"]);
-    let source = if headers.get("anthropic-ratelimit-requests-limit").is_some()
-        || headers.get("anthropic-ratelimit-tokens-limit").is_some()
-    {
-        Some("anthropic".to_string())
-    } else if headers.get("x-ratelimit-limit-requests").is_some()
-        || headers.get("x-ratelimit-limit-tokens").is_some()
-    {
-        Some("openai-compatible".to_string())
-    } else {
-        None
-    };
-    RateLimitTelemetry {
-        request_limit,
-        request_remaining,
-        request_reset_ms,
-        token_limit,
-        token_remaining,
-        token_reset_ms,
-        retry_after_ms,
-        source,
-    }
-}
-
-fn merge_retry_after_from_error_body(rate_limits: &mut RateLimitTelemetry, text: &str) {
-    if let Some(delay) = retry_after_ms_from_error_body(text) {
-        rate_limits.retry_after_ms = Some(
-            rate_limits
-                .retry_after_ms
-                .map_or(delay, |value| value.max(delay)),
-        );
-        if rate_limits.source.is_none() {
-            rate_limits.source = Some("google-rpc".to_string());
-        }
-    }
-}
-
-fn retry_after_ms_from_error_body(text: &str) -> Option<u64> {
-    let raw = serde_json::from_str::<Value>(text).ok()?;
-    let details = raw
-        .pointer("/error/details")
-        .and_then(Value::as_array)
-        .or_else(|| raw.pointer("/details").and_then(Value::as_array))?;
-    details.iter().find_map(|detail| {
-        let type_name = detail
-            .get("@type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if type_name.ends_with("google.rpc.RetryInfo") {
-            detail.get("retryDelay").and_then(parse_retry_delay_ms)
-        } else {
-            None
-        }
-    })
-}
-
-fn parse_retry_delay_ms(value: &Value) -> Option<u64> {
-    if let Some(text) = value.as_str() {
-        return parse_duration_ms(text);
-    }
-    let seconds = value.get("seconds").and_then(Value::as_u64).unwrap_or(0);
-    let nanos = value.get("nanos").and_then(Value::as_u64).unwrap_or(0);
-    (seconds != 0 || nanos != 0).then(|| {
-        seconds
-            .saturating_mul(1000)
-            .saturating_add(nanos / 1_000_000)
-    })
-}
-
-fn header_text(headers: &HeaderMap, names: &[&str]) -> Option<String> {
-    names.iter().find_map(|name| {
-        headers
-            .get(*name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-}
-
-fn header_u64(headers: &HeaderMap, names: &[&str]) -> Option<u64> {
-    header_text(headers, names).and_then(|value| {
-        value
-            .split(',')
-            .next()
-            .unwrap_or(&value)
-            .trim()
-            .parse()
-            .ok()
-    })
-}
-
-fn header_duration_ms(headers: &HeaderMap, names: &[&str]) -> Option<u64> {
-    header_text(headers, names).and_then(|value| parse_duration_ms(&value))
-}
-
-fn parse_duration_ms(value: &str) -> Option<u64> {
-    let trimmed = value.trim().trim_matches('"').to_ascii_lowercase();
-    if trimmed.is_empty() {
-        return None;
-    }
-    for (suffix, multiplier) in [
-        ("ms", 1.0),
-        ("s", 1000.0),
-        ("m", 60_000.0),
-        ("h", 3_600_000.0),
-    ] {
-        if let Some(number) = trimmed.strip_suffix(suffix) {
-            return number
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .map(|value| (value * multiplier).ceil() as u64);
-        }
-    }
-    trimmed
-        .parse::<f64>()
-        .ok()
-        .map(|value| (value * 1000.0).ceil() as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::HeaderValue;
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
@@ -1284,7 +1012,7 @@ mod tests {
         (address, receiver, server)
     }
 
-    fn chat_request(stream: bool) -> UnifiedChatRequest {
+    fn chat_request() -> UnifiedChatRequest {
         UnifiedChatRequest {
             model: "test-model".into(),
             messages: Vec::new(),
@@ -1293,42 +1021,9 @@ mod tests {
             max_output_tokens: None,
             temperature: None,
             top_p: None,
-            stream,
             logprobs: false,
             custom_parameters: json!({}),
         }
-    }
-
-    #[test]
-    fn parses_rate_limit_headers_and_retry_durations() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-ratelimit-limit-requests",
-            HeaderValue::from_static("100"),
-        );
-        headers.insert(
-            "x-ratelimit-remaining-requests",
-            HeaderValue::from_static("2"),
-        );
-        headers.insert(
-            "x-ratelimit-reset-requests",
-            HeaderValue::from_static("1.5s"),
-        );
-        let telemetry = rate_limits_from_headers(&headers);
-        assert_eq!(telemetry.request_limit, Some(100));
-        assert_eq!(telemetry.request_remaining, Some(2));
-        assert_eq!(telemetry.request_reset_ms, Some(1500));
-        assert_eq!(telemetry.source.as_deref(), Some("openai-compatible"));
-    }
-
-    #[test]
-    fn recognizes_google_rpc_retry_info() {
-        assert_eq!(
-            retry_after_ms_from_error_body(
-                r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2.25s"}]}}"#,
-            ),
-            Some(2250)
-        );
     }
 
     #[test]
@@ -1351,7 +1046,7 @@ mod tests {
     #[test]
     fn truncation_diagnostics_distinguish_omitted_and_disabled_thinking() {
         let adapter = RuntimeAdapter::new(Client::new(), config("anthropic"));
-        let mut request = chat_request(false);
+        let mut request = chat_request();
         request.model = "claude-fable-5".into();
         request.max_output_tokens = Some(128_000);
 
@@ -1370,70 +1065,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_priority_preserves_custom_values_for_if_absent_directives() {
-        let mut config = config("anthropic");
-        config.credential = Some("credential-key".into());
-        config.custom_headers = vec![
-            ("x-api-key".into(), "custom-key".into()),
-            ("anthropic-version".into(), "custom-version".into()),
-        ];
-        let adapter = RuntimeAdapter::new(Client::new(), config);
-        let headers = adapter
-            .headers(&[HeaderDirective {
-                name: "anthropic-version".into(),
-                value: "2023-06-01".into(),
-                mode: HeaderMode::IfAbsent,
-            }])
-            .await
-            .expect("headers");
-
-        assert_eq!(headers["x-api-key"], "custom-key");
-        assert_eq!(headers["anthropic-version"], "custom-version");
-        assert_eq!(headers[CONTENT_TYPE], "application/json");
-    }
-
-    #[test]
-    fn header_order_preserves_custom_auth_and_forces_json_content_type_last() {
-        let mut config = config("openai-chat");
-        config.credential = Some("default-key".into());
-        config.custom_headers = vec![
-            ("Authorization".into(), "Custom credential".into()),
-            ("Content-Type".into(), "text/plain".into()),
-        ];
-        let adapter = RuntimeAdapter::new(Client::new(), config);
-        let headers = adapter
-            .build_headers(
-                &[HeaderDirective {
-                    name: "content-type".into(),
-                    value: "application/problem+json".into(),
-                    mode: HeaderMode::Replace,
-                }],
-                None,
-            )
-            .expect("headers");
-
-        assert_eq!(headers[AUTHORIZATION], "Custom credential");
-        assert_eq!(headers[CONTENT_TYPE], "application/json");
-    }
-
-    #[test]
-    fn vertex_oauth_has_priority_over_custom_authorization() {
-        let mut config = config("vertex-ai");
-        config.custom_headers = vec![
-            ("Authorization".into(), "Custom credential".into()),
-            ("X-Trace".into(), "trace-value".into()),
-        ];
-        let adapter = RuntimeAdapter::new(Client::new(), config);
-        let headers = adapter
-            .build_headers(&[], Some("oauth-token"))
-            .expect("vertex headers");
-
-        assert_eq!(headers[AUTHORIZATION], "Bearer oauth-token");
-        assert_eq!(headers["x-trace"], "trace-value");
-        assert_eq!(headers[CONTENT_TYPE], "application/json");
-    }
-
-    #[tokio::test]
     async fn unknown_protocol_is_rejected_before_any_http_request() {
         let mut config = config("openai-chat");
         config.protocol = crate::domain::ProtocolId::unknown();
@@ -1445,7 +1076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_stream_model_and_chat_errors_use_the_protocol_decoder() {
+    async fn model_and_chat_errors_use_the_protocol_decoder() {
         let (base_url, model_server) = serve_once(418, "", r#"{"error":"catalog failed"}"#);
         let mut model_config = config("test-seventh");
         model_config.base_url = base_url;
@@ -1464,7 +1095,7 @@ mod tests {
         let mut chat_config = config("test-seventh");
         chat_config.base_url = base_url;
         let error = RuntimeAdapter::new(Client::new(), chat_config)
-            .send_chat_with_meta(&chat_request(false))
+            .send_chat_with_meta(&chat_request())
             .await
             .expect_err("chat error");
         assert_eq!(error.status, Some(422));
@@ -1492,7 +1123,7 @@ mod tests {
             .expect("test client");
         let mut runtime_config = config("openai-chat");
         runtime_config.base_url = format!("http://api.xiaomimimo.com:{}/v1", address.port());
-        let mut request = chat_request(false);
+        let mut request = chat_request();
         request.model = "mimo-v2-pro".into();
         request.custom_parameters = json!({"max_tokens": 8});
 
@@ -1535,7 +1166,7 @@ mod tests {
         runtime_config.base_url = base_url;
         let adapter = RuntimeAdapter::new(Client::new(), runtime_config);
         let prepared = adapter
-            .prepare_chat_request(&chat_request(false), 256)
+            .prepare_chat_request(&chat_request(), 256)
             .expect("prepared test protocol request");
         let gate = RecordingGate::default();
         let context = ChatAttemptContext {
@@ -1575,7 +1206,7 @@ mod tests {
     #[test]
     fn prepared_cost_uses_the_final_compact_body_and_counts_completion_once() {
         let adapter = RuntimeAdapter::new(Client::new(), config("anthropic"));
-        let mut request = chat_request(false);
+        let mut request = chat_request();
         request.model = "claude-sonnet-4-6".into();
         request.web_search = true;
         request.messages = vec![crate::domain::UnifiedMessage {
@@ -1606,6 +1237,8 @@ mod tests {
             u64::try_from(count_tokens(&compact)).expect("input estimate fits u64");
 
         assert_eq!(prepared.cost.estimated_input_tokens, estimated_input_tokens);
+        assert_eq!(prepared.cost.visible_output_tokens, 4_096);
+        assert_eq!(prepared.cost.estimated_thinking_tokens, 0);
         assert_eq!(prepared.cost.completion_tokens, 8_192);
         assert_eq!(
             prepared.cost.total_tokens,
@@ -1642,7 +1275,7 @@ mod tests {
         let mut runtime_config = config("openai-chat");
         runtime_config.base_url = format!("http://api.xiaomimimo.com:{}/v1", address.port());
         let adapter = RuntimeAdapter::new(client, runtime_config);
-        let mut request = chat_request(false);
+        let mut request = chat_request();
         request.model = "mimo-v2-pro".into();
         request.custom_parameters = json!({"max_tokens": 8});
         let completion_budget = adapter
@@ -1651,8 +1284,7 @@ mod tests {
         let encoded = adapter
             .encoded_chat_request(&request)
             .expect("legacy-shaped initial request");
-        let cost = request_cost(&encoded, completion_budget.total_output_tokens)
-            .expect("initial request cost");
+        let cost = request_cost(&encoded, &completion_budget).expect("initial request cost");
         let prepared = PreparedChatRequest {
             request,
             encoded,
@@ -1717,7 +1349,7 @@ mod tests {
         runtime_config.base_url = base_url;
         let adapter = RuntimeAdapter::new(Client::new(), runtime_config);
         let prepared = adapter
-            .prepare_chat_request(&chat_request(false), 128)
+            .prepare_chat_request(&chat_request(), 128)
             .expect("prepared request");
         let gate = RecordingGate::default();
         let context = ChatAttemptContext {
@@ -1754,15 +1386,5 @@ mod tests {
             .expect_err("pre-send cancellation");
         assert_eq!(error.kind, ProviderChatErrorKind::LocalRequest);
         assert!(cancelled_gate.events().is_empty());
-    }
-
-    #[tokio::test]
-    async fn stream_chat_requires_a_stream_request() {
-        let adapter = RuntimeAdapter::new(Client::new(), config("test-seventh"));
-        let error = adapter
-            .stream_chat(&chat_request(false))
-            .await
-            .expect_err("non-stream request");
-        assert!(error.contains("request.stream"));
     }
 }

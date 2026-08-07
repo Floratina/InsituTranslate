@@ -29,6 +29,7 @@ import { validateProviderConfig } from "./providerConfigSchema";
 import { ProviderModelList } from "./ProviderModelList";
 import { VertexAiConfigPanel } from "./VertexAiConfigPanel";
 import type {
+  CapabilityDescriptor,
   MinerUMode,
   ModelView,
   ProtocolDescriptor,
@@ -43,6 +44,7 @@ interface ProviderDetailsPanelProps {
   draft: ProviderDraft | null;
   protocolDisplayName: string;
   protocolDescriptor: ProtocolDescriptor | null;
+  capabilityDescriptors: CapabilityDescriptor[];
   testingModelId: string;
   onDraftChange: (draft: ProviderDraft) => void;
   onEnabledChange: (provider: ProviderView, enabled: boolean) => void;
@@ -109,6 +111,7 @@ export function ProviderDetailsPanel({
   draft,
   protocolDisplayName,
   protocolDescriptor,
+  capabilityDescriptors,
   testingModelId,
   onDraftChange,
   onEnabledChange,
@@ -377,6 +380,7 @@ export function ProviderDetailsPanel({
 
           <ProviderModelList
             models={provider.models}
+            capabilityDescriptors={capabilityDescriptors}
             testingModelId={testingModelId}
             disabled={!protocolAvailable || effectiveConfigIssues.length > 0}
             supportsModelListing={protocolDescriptor?.supportsModelListing ?? false}

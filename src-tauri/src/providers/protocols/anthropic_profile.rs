@@ -34,18 +34,18 @@ enum AnthropicEffortSet {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct AnthropicModelProfile {
-    pub thinking_dialect: AnthropicThinkingDialect,
-    pub sampling_policy: AnthropicSamplingPolicy,
-    pub max_output_tokens: Option<u32>,
-    pub thinking_required: bool,
-    pub default_thinking_effort: Option<ThinkingEffort>,
-    pub disable_policy: AnthropicDisablePolicy,
+pub(crate) struct AnthropicModelProfile {
+    pub(super) thinking_dialect: AnthropicThinkingDialect,
+    pub(super) sampling_policy: AnthropicSamplingPolicy,
+    pub(super) max_output_tokens: Option<u32>,
+    pub(super) thinking_required: bool,
+    pub(super) default_thinking_effort: Option<ThinkingEffort>,
+    pub(super) disable_policy: AnthropicDisablePolicy,
     effort_set: AnthropicEffortSet,
 }
 
 impl AnthropicModelProfile {
-    pub(super) fn for_model(model_id: &str) -> Self {
+    pub(crate) fn for_model(model_id: &str) -> Self {
         let name = normalized_model_name(model_id);
 
         if matches!(
@@ -177,11 +177,11 @@ impl AnthropicModelProfile {
         }
     }
 
-    pub(super) fn is_known_reasoning_model(self) -> bool {
+    pub(crate) fn is_known_reasoning_model(self) -> bool {
         self.thinking_dialect != AnthropicThinkingDialect::Unknown
     }
 
-    pub(super) fn supported_efforts(self, reasoning: bool) -> Vec<ThinkingEffort> {
+    pub(crate) fn supported_efforts(self, reasoning: bool) -> Vec<ThinkingEffort> {
         if !reasoning {
             return vec![ThinkingEffort::None];
         }
@@ -222,6 +222,25 @@ impl AnthropicModelProfile {
 
     pub(super) fn supports_effort(self, effort: ThinkingEffort) -> bool {
         self.supported_efforts(true).contains(&effort)
+    }
+
+    pub(crate) fn thinking_required(self) -> bool {
+        self.thinking_required
+    }
+
+    pub(crate) fn uses_manual_thinking(self) -> bool {
+        matches!(
+            self.thinking_dialect,
+            AnthropicThinkingDialect::Manual | AnthropicThinkingDialect::ManualWithEffort
+        )
+    }
+
+    pub(crate) fn uses_adaptive_thinking(self) -> bool {
+        self.thinking_dialect == AnthropicThinkingDialect::Adaptive
+    }
+
+    pub(crate) fn default_thinking_effort(self) -> Option<ThinkingEffort> {
+        self.default_thinking_effort
     }
 
     fn manual(effort_set: AnthropicEffortSet, max_output_tokens: Option<u32>) -> Self {

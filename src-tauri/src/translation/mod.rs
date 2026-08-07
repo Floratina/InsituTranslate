@@ -1,6 +1,6 @@
 const CONFIG_DB_FILE: &str = "config.db";
 const TASKS_DIR: &str = "tasks";
-const DEFAULT_CHUNK_TOKEN_LIMIT: i64 = 800;
+const DEFAULT_CHUNK_TOKEN_LIMIT: i64 = 1500;
 const DEFAULT_MAX_CONCURRENCY: i64 = 5;
 const DEFAULT_MAX_RETRIES: i64 = 5;
 const DEFAULT_MAX_FAILURE_PERCENTAGE: i64 = 20;

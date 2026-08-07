@@ -7,17 +7,15 @@ use crate::domain::{
 use crate::providers::budget::{
     normalize_completion_budget, CompletionBudgetAlias, ANTHROPIC_ALIASES,
 };
-use crate::providers::capabilities::ModelCapabilities;
 use crate::providers::codec::{
     append_endpoint_suffix, EncodedRequest, EndpointPreview, HeaderDirective, HeaderMode,
-    HttpMethod, JsonEventStreamDecoder, ProtocolCodec, ProtocolStreamDecoder,
+    HttpMethod, ProtocolCodec,
 };
 use crate::providers::shared::{
     checked_usage_sum, merge_custom_parameters, normalize_usage, optional_usage_u64,
     push_encrypted_thinking, push_thinking_text, remove_object_keys, set_optional_field,
     unified_response, usage_object,
 };
-use crate::providers::thinking;
 
 use super::anthropic_profile::{
     AnthropicDisablePolicy, AnthropicModelProfile, AnthropicSamplingPolicy,
@@ -85,74 +83,6 @@ impl ProtocolCodec for AnthropicCodec {
             .map(str::to_string)
     }
 
-    fn new_stream_decoder(&self) -> Box<dyn ProtocolStreamDecoder> {
-        Box::new(JsonEventStreamDecoder::new(self.id(), decode_chat))
-    }
-
-    fn infer_capabilities(&self, base_url: &str, model_id: &str) -> ModelCapabilities {
-        let inferred = crate::features::anthropic_capabilities(base_url, model_id);
-        let profile = AnthropicModelProfile::for_model(model_id);
-        ModelCapabilities {
-            reasoning: inferred.reasoning,
-            web: inferred.web,
-            thinking_efforts: self.supported_thinking_efforts(
-                base_url,
-                model_id,
-                inferred.reasoning,
-            ),
-            thinking_required: profile.thinking_required,
-            default_thinking_effort: profile.default_thinking_effort,
-        }
-    }
-
-    fn supported_thinking_efforts(
-        &self,
-        _base_url: &str,
-        model_id: &str,
-        reasoning: bool,
-    ) -> Vec<ThinkingEffort> {
-        AnthropicModelProfile::for_model(model_id).supported_efforts(reasoning)
-    }
-
-    fn resolve_thinking(
-        &self,
-        _base_url: &str,
-        model_id: &str,
-        effort: ThinkingEffort,
-    ) -> Result<ThinkingConfig, String> {
-        let profile = AnthropicModelProfile::for_model(model_id);
-        if effort == ThinkingEffort::None {
-            if profile.thinking_required {
-                return Err(format!(
-                    "Anthropic model \"{model_id}\" keeps thinking always on and cannot use effort None."
-                ));
-            }
-            let mut config = thinking::base_config(effort);
-            config.mode = ThinkingMode::Disabled;
-            return Ok(config);
-        }
-        if profile.thinking_dialect == AnthropicThinkingDialect::Unknown {
-            return Err(format!(
-                "Anthropic thinking is enabled for unrecognized model \"{model_id}\". Select a recognized Claude model or disable thinking."
-            ));
-        }
-        if !profile.supports_effort(effort) {
-            return Err(format!(
-                "Anthropic model \"{model_id}\" does not support thinking effort {effort:?}."
-            ));
-        }
-        let mut config = thinking::base_config(effort);
-        match profile.thinking_dialect {
-            AnthropicThinkingDialect::Manual | AnthropicThinkingDialect::ManualWithEffort => {
-                config.budget_tokens = Some(thinking::budget_tokens(effort));
-            }
-            AnthropicThinkingDialect::Adaptive | AnthropicThinkingDialect::Unknown => {
-                config.mode = ThinkingMode::Auto;
-            }
-        }
-        Ok(config)
-    }
-
     fn validate_chat_options(
         &self,
         _base_url: &str,
@@ -200,10 +130,6 @@ impl ProtocolCodec for AnthropicCodec {
             models: Some(append_endpoint_suffix(&config.base_url, model_suffix)),
         })
     }
-}
-
-pub(crate) fn is_known_reasoning_model(model_id: &str) -> bool {
-    AnthropicModelProfile::for_model(model_id).is_known_reasoning_model()
 }
 
 fn protocol_headers() -> Vec<HeaderDirective> {
@@ -344,8 +270,7 @@ pub(crate) fn build_body(request: &UnifiedChatRequest) -> Result<Value, String> 
     let messages = ensure_alternating_roles(messages)?;
     let mut body = json!({
         "model": request.model,
-        "messages": messages,
-        "stream": request.stream
+        "messages": messages
     });
     if !system.is_empty() {
         body["system"] = Value::Array(system);
@@ -481,9 +406,7 @@ pub fn ensure_alternating_roles(messages: Vec<Value>) -> Result<Vec<Value>, Stri
 #[derive(Debug, Clone, Copy)]
 enum AnthropicThinkingPlan {
     Omitted,
-    ImplicitAdaptive {
-        effort: ThinkingEffort,
-    },
+    ImplicitAdaptive,
     Disabled,
     Manual {
         budget_tokens: u32,
@@ -498,7 +421,7 @@ impl AnthropicThinkingPlan {
     fn is_enabled(self) -> bool {
         matches!(
             self,
-            Self::ImplicitAdaptive { .. } | Self::Manual { .. } | Self::Adaptive { .. }
+            Self::ImplicitAdaptive | Self::Manual { .. } | Self::Adaptive { .. }
         )
     }
 
@@ -516,8 +439,8 @@ fn plan_thinking(
     model_id: &str,
 ) -> Result<AnthropicThinkingPlan, String> {
     let Some(thinking) = thinking else {
-        if let Some(effort) = profile.default_thinking_effort {
-            return Ok(AnthropicThinkingPlan::ImplicitAdaptive { effort });
+        if profile.default_thinking_effort.is_some() {
+            return Ok(AnthropicThinkingPlan::ImplicitAdaptive);
         }
         return Ok(AnthropicThinkingPlan::Omitted);
     };
@@ -564,10 +487,11 @@ fn plan_thinking(
                     "Anthropic model \"{model_id}\" uses manual thinking and requires ThinkingMode::Enabled."
                 ));
             }
-            let budget_tokens = thinking
-                .budget_tokens
-                .or_else(|| thinking.effort.map(thinking::budget_tokens))
-                .unwrap_or(1024);
+            let budget_tokens = thinking.budget_tokens.ok_or_else(|| {
+                format!(
+                    "Anthropic manual thinking for model \"{model_id}\" is missing its centrally resolved fixed budget."
+                )
+            })?;
             if budget_tokens < 1024 {
                 return Err(format!(
                     "Anthropic thinking budget for model \"{model_id}\" must be at least 1024 tokens; received {budget_tokens}."
@@ -689,34 +613,12 @@ fn required_max_tokens(
     };
     match thinking {
         AnthropicThinkingPlan::Manual { budget_tokens, .. } => add(budget_tokens),
-        AnthropicThinkingPlan::ImplicitAdaptive { effort } => {
-            required_adaptive_max_tokens(Some(effort), visible_output_tokens, model_id)
-        }
-        AnthropicThinkingPlan::Adaptive { effort } => {
-            required_adaptive_max_tokens(effort, visible_output_tokens, model_id)
+        AnthropicThinkingPlan::ImplicitAdaptive | AnthropicThinkingPlan::Adaptive { .. } => {
+            add(visible_output_tokens)
         }
         AnthropicThinkingPlan::Omitted | AnthropicThinkingPlan::Disabled => {
             Ok(visible_output_tokens)
         }
-    }
-}
-
-fn required_adaptive_max_tokens(
-    effort: Option<ThinkingEffort>,
-    visible_output_tokens: u32,
-    model_id: &str,
-) -> Result<u32, String> {
-    let add = |tokens: u32| {
-        visible_output_tokens
-            .checked_add(tokens)
-            .ok_or_else(|| format!("Anthropic output budget overflows for model \"{model_id}\"."))
-    };
-    match effort {
-        Some(ThinkingEffort::Low) => add(4_096),
-        Some(ThinkingEffort::Medium) => add(16_000),
-        Some(ThinkingEffort::High) => add(32_000),
-        Some(ThinkingEffort::Xhigh | ThinkingEffort::Max) => Ok(add(32_000)?.max(64_000)),
-        Some(ThinkingEffort::None | ThinkingEffort::Minimal) | None => add(16_000),
     }
 }
 
@@ -790,7 +692,7 @@ fn sampling_projection(
 
 fn apply_thinking(body: &mut Value, thinking: AnthropicThinkingPlan) {
     match thinking {
-        AnthropicThinkingPlan::Omitted | AnthropicThinkingPlan::ImplicitAdaptive { .. } => {}
+        AnthropicThinkingPlan::Omitted | AnthropicThinkingPlan::ImplicitAdaptive => {}
         AnthropicThinkingPlan::Disabled => {
             body["thinking"] = json!({"type": "disabled"});
         }

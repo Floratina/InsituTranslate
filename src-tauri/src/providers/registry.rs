@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::domain::ProtocolId;
+use crate::providers::capabilities::CapabilityProfile;
 use crate::providers::config_schema::{parse_default, validate_fields};
 #[cfg(test)]
 use crate::providers::protocols::test_protocol;
@@ -21,6 +22,7 @@ pub struct ProtocolDescriptor {
     pub wire_family: &'static str,
     pub config_kind: &'static str,
     pub supports_model_listing: bool,
+    pub capability_profile: CapabilityProfile,
     pub auth: AuthDescriptor,
     pub config_fields: &'static [ConfigField],
     pub help_text: Option<&'static str>,
@@ -199,6 +201,7 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
         wire_family: "openai-chat",
         config_kind: "generic",
         supports_model_listing: true,
+        capability_profile: CapabilityProfile::OpenAiChat,
         auth: AuthDescriptor {
             strategy: AuthStrategy::StaticHeader {
                 header: "Authorization",
@@ -218,6 +221,7 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
         wire_family: "openai-responses",
         config_kind: "generic",
         supports_model_listing: true,
+        capability_profile: CapabilityProfile::OpenAiResponses,
         auth: AuthDescriptor {
             strategy: AuthStrategy::StaticHeader {
                 header: "Authorization",
@@ -237,6 +241,7 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
         wire_family: "anthropic-messages",
         config_kind: "generic",
         supports_model_listing: true,
+        capability_profile: CapabilityProfile::Anthropic,
         auth: AuthDescriptor {
             strategy: AuthStrategy::StaticHeader {
                 header: "x-api-key",
@@ -256,6 +261,7 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
         wire_family: "google-generative-language",
         config_kind: "generic",
         supports_model_listing: true,
+        capability_profile: CapabilityProfile::Gemini,
         auth: AuthDescriptor {
             strategy: AuthStrategy::StaticHeader {
                 header: "x-goog-api-key",
@@ -277,6 +283,7 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
         wire_family: "google-generative-language",
         config_kind: "vertex-ai",
         supports_model_listing: true,
+        capability_profile: CapabilityProfile::VertexAi,
         auth: AuthDescriptor {
             strategy: AuthStrategy::VertexServiceAccount,
             label: "Service Account",
@@ -293,6 +300,7 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
         wire_family: "ollama-chat",
         config_kind: "generic",
         supports_model_listing: true,
+        capability_profile: CapabilityProfile::Ollama,
         auth: AuthDescriptor {
             strategy: AuthStrategy::None,
             label: "无需凭证",
@@ -310,6 +318,7 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
         wire_family: "test-wire",
         config_kind: "generic",
         supports_model_listing: true,
+        capability_profile: CapabilityProfile::Test,
         auth: AuthDescriptor {
             strategy: AuthStrategy::None,
             label: "No credential",
@@ -324,6 +333,7 @@ pub static DESCRIPTORS: &[ProtocolDescriptor] = &[
 static REGISTRY_VALIDATION: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub fn validate_registry() -> Result<(), String> {
+    crate::providers::capabilities::validate_registry()?;
     REGISTRY_VALIDATION
         .get_or_init(|| validate_descriptors(DESCRIPTORS))
         .clone()
@@ -522,6 +532,7 @@ mod tests {
             wire_family: "test",
             config_kind: "generic",
             supports_model_listing: true,
+            capability_profile: CapabilityProfile::Test,
             auth: AuthDescriptor {
                 strategy: AuthStrategy::None,
                 label: "None",

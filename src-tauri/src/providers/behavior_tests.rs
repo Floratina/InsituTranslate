@@ -5,6 +5,7 @@ use crate::domain::{
     ProtocolId, ProviderRuntimeConfig, ThinkingConfig, ThinkingEffort, ThinkingMode,
     UnifiedContent, UnifiedMessage,
 };
+use crate::providers::capabilities::infer_capabilities;
 use crate::providers::protocols::anthropic;
 use crate::providers::registry::descriptor_by_id;
 use crate::providers::runtime::{ProviderChatError, ProviderChatErrorKind};
@@ -13,7 +14,7 @@ use crate::providers::test_support::{
     build_openai_responses_body, prompt_request, protected_custom_parameters, request, SYSTEM_TEXT,
     USER_TEXT,
 };
-use crate::providers::{ProviderAdapter, RateLimitTelemetry, RuntimeAdapter};
+use crate::providers::{RateLimitTelemetry, RuntimeAdapter};
 
 fn protocol_base_url(protocol: &str) -> &'static str {
     match protocol {
@@ -107,7 +108,7 @@ fn custom_parameters_cannot_override_protocol_prompt_fields() {
         match protocol {
             "openai-chat" => {
                 assert_eq!(body["model"], "stable-model");
-                assert_eq!(body["stream"], false);
+                assert!(body.get("stream").is_none());
                 assert_eq!(
                     body.pointer("/messages/0/content"),
                     Some(&json!(SYSTEM_TEXT))
@@ -354,7 +355,6 @@ fn absent_structured_options_remove_custom_attempts() {
 #[test]
 fn logprobs_requests_obey_protocol_and_provider_capabilities() {
     let mut request = request();
-    request.stream = false;
     let plain = build_openai_chat_body("https://api.openai.com", &request);
     assert!(plain.get("logprobs").is_none());
 
@@ -432,7 +432,6 @@ fn thinking_and_web_search_map_to_each_wire_format() {
 #[test]
 fn reasoning_history_and_raw_endpoints_preserve_protocol_details() {
     let mut responses_request = request();
-    responses_request.stream = false;
     responses_request.messages = vec![
         UnifiedMessage {
             role: "user".into(),
@@ -487,7 +486,6 @@ fn reasoning_history_and_raw_endpoints_preserve_protocol_details() {
     config.credential = Some("private-key".into());
     let mut gemini_request = request();
     gemini_request.model = "gemini-3-pro".into();
-    gemini_request.stream = false;
     let (url, body) = RuntimeAdapter::new(Client::new(), config)
         .build_chat_request(&gemini_request)
         .expect("Vertex request");
@@ -596,16 +594,18 @@ fn anthropic_roles_and_openai_history_thinking_keep_legacy_behavior() {
 
 #[test]
 fn anthropic_model_profiles_drive_capabilities_and_thinking_dialects() {
-    let codec = descriptor_by_id("anthropic")
+    let descriptor = descriptor_by_id("anthropic")
         .expect("valid registry")
-        .expect("Anthropic descriptor")
-        .codec;
-
-    let manual = codec.infer_capabilities("https://api.anthropic.com", "claude-sonnet-4-5");
-    assert!(manual.reasoning);
+        .expect("Anthropic descriptor");
+    let manual = infer_capabilities(
+        descriptor.capability_profile,
+        "https://api.anthropic.com",
+        "claude-sonnet-4-5",
+    );
+    assert!(manual.reasoning());
     assert_eq!(
-        manual.thinking_efforts,
-        vec![
+        manual.thinking_efforts(),
+        &[
             ThinkingEffort::None,
             ThinkingEffort::Low,
             ThinkingEffort::Medium,
@@ -613,32 +613,42 @@ fn anthropic_model_profiles_drive_capabilities_and_thinking_dialects() {
         ]
     );
 
-    let opus_47 = codec.infer_capabilities("https://api.anthropic.com", "claude-opus-4-7");
-    assert!(opus_47.reasoning);
-    assert!(opus_47.thinking_efforts.contains(&ThinkingEffort::Xhigh));
-    assert!(opus_47.thinking_efforts.contains(&ThinkingEffort::Max));
-    assert!(!opus_47.thinking_efforts.contains(&ThinkingEffort::Minimal));
+    let opus_47 = infer_capabilities(
+        descriptor.capability_profile,
+        "https://api.anthropic.com",
+        "claude-opus-4-7",
+    );
+    assert!(opus_47.reasoning());
+    assert!(opus_47.thinking_efforts().contains(&ThinkingEffort::Xhigh));
+    assert!(opus_47.thinking_efforts().contains(&ThinkingEffort::Max));
+    assert!(!opus_47
+        .thinking_efforts()
+        .contains(&ThinkingEffort::Minimal));
 
-    let unknown = codec.infer_capabilities("https://api.anthropic.com", "claude-opus-4-9");
-    assert!(!unknown.reasoning);
-    assert_eq!(unknown.thinking_efforts, vec![ThinkingEffort::None]);
+    let unknown = infer_capabilities(
+        descriptor.capability_profile,
+        "https://api.anthropic.com",
+        "claude-opus-4-9",
+    );
+    assert!(!unknown.reasoning());
+    assert_eq!(unknown.thinking_efforts(), &[ThinkingEffort::None]);
 
-    let manual_mapping = codec
-        .resolve_thinking(
-            "https://api.anthropic.com",
-            "claude-opus-4-5",
-            ThinkingEffort::Medium,
-        )
-        .expect("manual effort mapping");
+    let manual_mapping = crate::providers::capabilities::resolve_thinking(
+        descriptor.capability_profile,
+        "https://api.anthropic.com",
+        "claude-opus-4-5",
+        ThinkingEffort::Medium,
+    )
+    .expect("manual effort mapping");
     assert_eq!(manual_mapping.mode, ThinkingMode::Enabled);
     assert_eq!(manual_mapping.budget_tokens, Some(16_000));
-    let adaptive_mapping = codec
-        .resolve_thinking(
-            "https://api.anthropic.com",
-            "claude-sonnet-4-6",
-            ThinkingEffort::Max,
-        )
-        .expect("adaptive effort mapping");
+    let adaptive_mapping = crate::providers::capabilities::resolve_thinking(
+        descriptor.capability_profile,
+        "https://api.anthropic.com",
+        "claude-sonnet-4-6",
+        ThinkingEffort::Max,
+    )
+    .expect("adaptive effort mapping");
     assert_eq!(adaptive_mapping.mode, ThinkingMode::Auto);
     assert_eq!(adaptive_mapping.budget_tokens, None);
 
@@ -988,26 +998,33 @@ fn anthropic_preflight_and_body_validate_only_effective_sampling_fields() {
 
 #[test]
 fn claude_five_default_and_required_thinking_follow_the_exact_profile() {
-    let codec = descriptor_by_id("anthropic")
+    let descriptor = descriptor_by_id("anthropic")
         .expect("valid registry")
-        .expect("Anthropic descriptor")
-        .codec;
-    let fable = codec.infer_capabilities("https://api.anthropic.com", "claude-fable-5");
-    assert!(fable.thinking_required);
-    assert_eq!(fable.default_thinking_effort, Some(ThinkingEffort::High));
-    assert!(!fable.thinking_efforts.contains(&ThinkingEffort::None));
+        .expect("Anthropic descriptor");
+    let fable = infer_capabilities(
+        descriptor.capability_profile,
+        "https://api.anthropic.com",
+        "claude-fable-5",
+    );
+    assert!(fable.thinking_required());
+    assert_eq!(fable.default_thinking_effort(), Some(ThinkingEffort::High));
+    assert!(!fable.thinking_efforts().contains(&ThinkingEffort::None));
 
-    let opus = codec.infer_capabilities("https://api.anthropic.com", "claude-opus-5");
-    assert!(!opus.thinking_required);
-    assert_eq!(opus.default_thinking_effort, Some(ThinkingEffort::High));
-    assert!(opus.thinking_efforts.contains(&ThinkingEffort::None));
+    let opus = infer_capabilities(
+        descriptor.capability_profile,
+        "https://api.anthropic.com",
+        "claude-opus-5",
+    );
+    assert!(!opus.thinking_required());
+    assert_eq!(opus.default_thinking_effort(), Some(ThinkingEffort::High));
+    assert!(opus.thinking_efforts().contains(&ThinkingEffort::None));
 
     let mut omitted = prompt_request();
     omitted.model = "claude-fable-5".into();
     omitted.temperature = None;
     let omitted_body = anthropic::build_body(&omitted).expect("always-on omitted thinking");
     assert!(omitted_body.get("thinking").is_none());
-    assert_eq!(omitted_body["max_tokens"], 36_096);
+    assert_eq!(omitted_body["max_tokens"], 8_192);
 
     let mut always_on_disabled = omitted.clone();
     always_on_disabled.thinking = Some(ThinkingConfig {

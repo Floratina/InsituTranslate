@@ -15,21 +15,28 @@ use tauri_plugin_dialog::DialogExt;
 use crate::db as app_db;
 use crate::document_parsing;
 use crate::document_parsing::types::{ParserProgress, ParserProgressStage, RenderedChunk};
-use crate::domain::{AssistantView, ModelView, ProviderPurpose, ProviderView};
+use crate::domain::{AssistantView, ModelView, ProviderPurpose, ProviderView, UnifiedChatRequest};
+use crate::glossary_prompt::{
+    build_glossary_prompt, GlossaryPromptBuildResult, GlossaryPromptInput,
+};
 use crate::languages::{
     normalize_source_language, normalize_target_language, DEFAULT_SOURCE_LANGUAGE,
     DEFAULT_TARGET_LANGUAGE,
 };
 use crate::pdf_parsing::{self, PdfAsset, PdfParsingMode};
-use crate::task_prompt::{ContentFormat, DocumentFormat};
+use crate::providers::RuntimeAdapter;
+use crate::task_prompt::{ContentFormat, DocumentFormat, TaskChunkInput};
+use crate::translation_prompt::{
+    build_translation_prompt, TranslationPromptBuildResult, TranslationPromptInput,
+};
 
 use super::context::{
     display_name_from_path, estimate_tokens, global_background_from_texts, next_inp_path,
     sanitize_file_stem, unix_timestamp, unix_timestamp_millis,
 };
 use super::request_options::{
-    resolve_model_request_options, validate_and_plan_model_request, visible_output_token_reserve,
-    ModelRequestOptions, ModelRequestSettings,
+    resolve_model_request_options, visible_output_token_reserve, ModelRequestOptions,
+    ModelRequestSettings,
 };
 use super::types::{
     ChunkOutcome, ChunkRecord, GlossaryGenerationSnapshot, ProgressDetail, ProgressStep,
@@ -1361,6 +1368,7 @@ pub async fn validate_translation_config_runtime(
                 use_web_search: config.use_web_search,
                 use_custom_parameters: config.use_custom_parameters,
             },
+            PreflightPromptKind::Translation,
             config.chunk_token_limit.max(0) as u64,
             visible_output_token_reserve(config.chunk_token_limit.max(0) as u64),
             manual_tpm_limit,
@@ -1391,6 +1399,12 @@ struct ResolvedModelRequest {
     top_p: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PreflightPromptKind {
+    Translation,
+    Glossary,
+}
+
 fn manual_tpm_limit(config: &TranslationConfigView) -> Option<u64> {
     (config.rate_limit_strategy == RateLimitStrategy::Manual)
         .then_some(config.max_tokens_per_minute.max(0) as u64)
@@ -1402,7 +1416,8 @@ async fn resolve_and_validate_model_request(
     model: &ModelView,
     assistant: Option<&AssistantView>,
     settings: &ModelRequestSettings,
-    estimated_input_tokens: u64,
+    prompt_kind: PreflightPromptKind,
+    source_token_capacity: u64,
     visible_output_tokens: u32,
     manual_tpm_limit: Option<u64>,
 ) -> Result<ResolvedModelRequest, String> {
@@ -1421,12 +1436,16 @@ async fn resolve_and_validate_model_request(
     let top_p = assistant
         .filter(|value| value.top_p_enabled)
         .map(|value| value.top_p);
-    let completion_budget = validate_and_plan_model_request(
-        &runtime,
+    let adapter = RuntimeAdapter::new(Client::new(), runtime.clone());
+    let (estimated_input_tokens, completion_budget) = estimate_preflight_request(
+        &adapter,
         model,
+        assistant,
         &options,
         temperature,
         top_p,
+        prompt_kind,
+        source_token_capacity,
         visible_output_tokens,
     )?;
     if let Some(limit) = manual_tpm_limit {
@@ -1436,10 +1455,12 @@ async fn resolve_and_validate_model_request(
             .ok_or_else(|| "Manual TPM preflight token estimate overflowed".to_string())?;
         if total_tokens > limit {
             return Err(format!(
-                "protocol={} model=\"{}\" estimated_input_tokens={} completion_tokens={} reserved_total_tokens={} exceeds the configured manual TPM limit ({} tokens).",
+                "protocol={} model=\"{}\" estimated_input_tokens={} visible_output_tokens={} estimated_thinking_tokens={} combined_completion_tokens={} reserved_total_tokens={} exceeds the configured manual TPM limit ({} tokens).",
                 runtime.protocol.as_str(),
                 model.request_name,
                 estimated_input_tokens,
+                completion_budget.visible_output_tokens,
+                completion_budget.thinking_tokens,
                 completion_tokens,
                 total_tokens,
                 limit,
@@ -1451,6 +1472,101 @@ async fn resolve_and_validate_model_request(
         temperature,
         top_p,
     })
+}
+
+fn estimate_preflight_request(
+    adapter: &RuntimeAdapter,
+    model: &ModelView,
+    assistant: Option<&AssistantView>,
+    options: &ModelRequestOptions,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    prompt_kind: PreflightPromptKind,
+    source_token_capacity: u64,
+    visible_output_tokens: u32,
+) -> Result<(u64, crate::providers::CompletionBudget), String> {
+    let repeat_count = usize::try_from(source_token_capacity)
+        .map_err(|_| "Source token capacity exceeds the supported platform size".to_string())?;
+    let representative_source = " source".repeat(repeat_count.max(1));
+    let assistant_prompt = assistant.map(|value| value.system_prompt.clone());
+    let mut largest_input = 0_u64;
+    let mut planned_budget = None;
+
+    for (document_format, content_format) in representative_prompt_formats() {
+        let chunk = TaskChunkInput {
+            text: representative_source.clone(),
+            document_format: *document_format,
+            content_format: *content_format,
+        };
+        let messages = match prompt_kind {
+            PreflightPromptKind::Translation => {
+                match build_translation_prompt(TranslationPromptInput {
+                    target_language: DEFAULT_TARGET_LANGUAGE.into(),
+                    assistant_system_prompt: assistant_prompt.clone(),
+                    chunk,
+                    global_background: None,
+                    previous_context: None,
+                    glossary: Vec::new(),
+                })? {
+                    TranslationPromptBuildResult::Request { messages } => messages,
+                    TranslationPromptBuildResult::Passthrough { .. } => {
+                        return Err(
+                            "Representative translation prompt unexpectedly bypassed the provider"
+                                .into(),
+                        )
+                    }
+                }
+            }
+            PreflightPromptKind::Glossary => match build_glossary_prompt(GlossaryPromptInput {
+                target_language: DEFAULT_TARGET_LANGUAGE.into(),
+                assistant_system_prompt: assistant_prompt.clone(),
+                chunk,
+            })? {
+                GlossaryPromptBuildResult::Request { messages } => messages,
+                GlossaryPromptBuildResult::Skipped { .. } => {
+                    return Err(
+                        "Representative glossary prompt unexpectedly skipped the provider".into(),
+                    )
+                }
+            },
+        };
+        let prepared = adapter.prepare_chat_request(
+            &UnifiedChatRequest {
+                model: model.request_name.clone(),
+                messages,
+                web_search: options.web_search,
+                thinking: options.thinking.clone(),
+                max_output_tokens: None,
+                temperature,
+                top_p,
+                logprobs: false,
+                custom_parameters: options.custom_parameters.clone(),
+            },
+            visible_output_tokens,
+        )?;
+        largest_input = largest_input.max(prepared.cost.estimated_input_tokens);
+        planned_budget = Some(prepared.completion_budget);
+    }
+
+    planned_budget
+        .map(|budget| (largest_input, budget))
+        .ok_or_else(|| "No representative prompt formats are registered".to_string())
+}
+
+fn representative_prompt_formats() -> &'static [(DocumentFormat, ContentFormat)] {
+    &[
+        (DocumentFormat::Pdf, ContentFormat::Markdown),
+        (DocumentFormat::Markdown, ContentFormat::Markdown),
+        (DocumentFormat::Epub, ContentFormat::Xhtml),
+        (DocumentFormat::Html, ContentFormat::Html),
+        (DocumentFormat::Txt, ContentFormat::PlainText),
+        (DocumentFormat::Json, ContentFormat::Json),
+        (DocumentFormat::Docx, ContentFormat::Xml),
+        (DocumentFormat::Xlsx, ContentFormat::Xml),
+        (DocumentFormat::Srt, ContentFormat::Srt),
+        (DocumentFormat::Ass, ContentFormat::Ass),
+        (DocumentFormat::Lrc, ContentFormat::Lrc),
+    ]
 }
 
 async fn resolve_translation_runtime_selection(
@@ -1801,6 +1917,7 @@ pub async fn create_translation_task(
                     use_web_search: config.use_web_search,
                     use_custom_parameters: config.use_custom_parameters,
                 },
+                PreflightPromptKind::Translation,
                 config.chunk_token_limit.max(0) as u64,
                 visible_output_token_reserve(config.chunk_token_limit.max(0) as u64),
                 manual_tpm_limit(&config),
@@ -4622,6 +4739,7 @@ async fn build_glossary_generation_snapshot(
             use_web_search: generation_config.use_web_search,
             use_custom_parameters: generation_config.use_custom_parameters,
         },
+        PreflightPromptKind::Glossary,
         chunk_token_limit.max(0) as u64,
         visible_output_token_reserve(chunk_token_limit.max(0) as u64),
         manual_tpm_limit,

@@ -2,9 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Reorder } from "motion/react";
 import {
-  Brain,
   FileCheck2,
-  Globe2,
   Languages,
   Minus,
   Network,
@@ -17,6 +15,7 @@ import {
   BookOpen,
   type LucideIcon,
 } from "lucide-react";
+import { DynamicIcon } from "lucide-react/dynamic";
 
 import {
   AlertDialog,
@@ -58,6 +57,12 @@ import { appSessionCache } from "@/lib/session-cache";
 import { cn } from "@/lib/utils";
 import { AvatarPickerPopover } from "@/features/providers/AvatarPickerPopover";
 import { EMPTY_MODEL_FORM, EMPTY_PROVIDER_FORM } from "@/features/providers/constants";
+import {
+  booleanCapability,
+  capabilityIconName,
+  editableCapabilityValues,
+  validateCapabilityDescriptors,
+} from "@/features/providers/capabilities";
 import { getMinerUConfig, isMinerUProvider } from "@/features/providers/mineru";
 import { ProviderDetailsPanel } from "@/features/providers/ProviderDetailsPanel";
 import { ProviderListItem } from "@/features/providers/ProviderListItem";
@@ -69,6 +74,8 @@ import {
   type UpdateVertexAiConfigInput,
 } from "@/features/providers/vertexAi";
 import type {
+  CapabilityDescriptor,
+  CapabilityValue,
   ConnectivityResult,
   ModelView,
   NewModelForm,
@@ -95,11 +102,9 @@ const ICONS = {
   documentParsing: ScanText,
   glossary: BookOpen,
   proofreading: FileCheck2,
-  reasoning: Brain,
   remove: Minus,
   search: Search,
   translation: Languages,
-  web: Globe2,
 } satisfies Record<string, LucideIcon>;
 
 type IconName = keyof typeof ICONS;
@@ -195,11 +200,7 @@ function sameModelView(left: ModelView, right: ModelView): boolean {
     && left.requestName === right.requestName
     && left.alias === right.alias
     && left.source === right.source
-    && left.capabilityReasoning === right.capabilityReasoning
-    && sameStringArray(left.supportedThinkingEfforts, right.supportedThinkingEfforts)
-    && left.thinkingRequired === right.thinkingRequired
-    && left.defaultThinkingEffort === right.defaultThinkingEffort
-    && left.capabilityWeb === right.capabilityWeb
+    && JSON.stringify(left.capabilities) === JSON.stringify(right.capabilities)
     && left.testStatus === right.testStatus
     && left.latencyMs === right.latencyMs
     && left.testedAt === right.testedAt
@@ -267,13 +268,11 @@ function reconcileProviderList(
 }
 
 function CapabilityBadge({
-  icon,
-  label,
+  descriptor,
   active,
   onClick,
 }: {
-  icon: IconName;
-  label: string;
+  descriptor: CapabilityDescriptor;
   active: boolean;
   onClick?: () => void;
 }) {
@@ -286,8 +285,8 @@ function CapabilityBadge({
             "border-enabled-accent/30 bg-enabled-accent/15 text-enabled-accent",
         )}
       >
-        <Icon name={icon} className="size-3" />
-        {label}
+        <DynamicIcon name={capabilityIconName(descriptor)} className="size-3" strokeWidth={1.8} />
+        {descriptor.label}
       </span>
     );
   }
@@ -300,10 +299,32 @@ function CapabilityBadge({
       className="text-2xs"
       onClick={onClick}
     >
-      <Icon name={icon} className="text-sm" />
-      {label}
+      <DynamicIcon name={capabilityIconName(descriptor)} className="size-3.5" strokeWidth={1.8} />
+      {descriptor.label}
     </Button>
   );
+}
+
+function capabilitySelectValue(
+  capabilities: Record<string, CapabilityValue>,
+  descriptor: CapabilityDescriptor,
+): string | undefined {
+  const value = capabilities[descriptor.id];
+  if (value === null) return undefined;
+  if (typeof value !== "string") {
+    throw new Error(`Select capability ${descriptor.id} must be a string or null`);
+  }
+  return value;
+}
+
+function capabilitySelectUpdateValue(
+  descriptor: CapabilityDescriptor,
+  value: string,
+): CapabilityValue {
+  if (!descriptor.options.some((option) => option.value === value)) {
+    throw new Error(`Select capability ${descriptor.id} received an invalid option: ${value}`);
+  }
+  return value as CapabilityValue;
 }
 
 function ProviderListSkeleton() {
@@ -365,6 +386,7 @@ function ProviderSettingsPage() {
   const [purpose, setPurpose] = useState<ProviderPurpose>("translation");
   const [providers, setProviders] = useState<ProviderView[] | null>(cachedProviders ?? null);
   const [protocolDescriptors, setProtocolDescriptors] = useState<ProtocolDescriptor[]>([]);
+  const [capabilityDescriptors, setCapabilityDescriptors] = useState<CapabilityDescriptor[]>([]);
   const [selectedProviderId, setSelectedProviderId] = useState<string>(
     cachedProviders?.some((provider) => provider.id === cachedSelectedProviderId)
       ? cachedSelectedProviderId
@@ -481,9 +503,14 @@ function ProviderSettingsPage() {
   useEffect(() => {
     if (!isTauriRuntime()) return;
     let active = true;
-    void invoke<ProtocolDescriptor[]>("list_protocol_descriptors")
-      .then((descriptors) => {
-        if (active) setProtocolDescriptors(descriptors);
+    void Promise.all([
+      invoke<ProtocolDescriptor[]>("list_protocol_descriptors"),
+      invoke<CapabilityDescriptor[]>("list_capability_descriptors"),
+    ])
+      .then(([protocols, capabilities]) => {
+        if (!active) return;
+        setProtocolDescriptors(protocols);
+        setCapabilityDescriptors(validateCapabilityDescriptors(capabilities));
       })
       .catch((cause: unknown) => {
         if (active) setError(getErrorMessage(cause));
@@ -998,8 +1025,10 @@ function ProviderSettingsPage() {
         input: {
           id: settingsModel.id,
           alias: settingsModel.alias,
-          capabilityReasoning: settingsModel.capabilityReasoning,
-          capabilityWeb: settingsModel.capabilityWeb,
+          capabilities: editableCapabilityValues(
+            settingsModel.capabilities,
+            capabilityDescriptors,
+          ),
         },
       });
       setSettingsModel(null);
@@ -1158,6 +1187,7 @@ function ProviderSettingsPage() {
                   ? `未知或已废弃协议：${selectedProvider.protocolRawId ?? "unknown"}`
                   : protocolLabel(selectedProvider?.protocol ?? "unknown", protocolDescriptors)}
                 protocolDescriptor={selectedProtocolDescriptor}
+                capabilityDescriptors={capabilityDescriptors}
                 testingModelId={testingModelId}
                 onDraftChange={setProviderDraft}
                 onEnabledChange={setEnabledOptimistically}
@@ -1166,7 +1196,10 @@ function ProviderSettingsPage() {
                 onOpenRemoteModels={() => void openRemoteModels()}
                 onAddModel={() => setAddModelOpen(true)}
                 onTestModel={(model) => void testModel(model)}
-                onOpenModelSettings={(model) => setSettingsModel({ ...model })}
+                onOpenModelSettings={(model) => setSettingsModel({
+                  ...model,
+                  capabilities: { ...model.capabilities },
+                })}
                 onOpenServiceAccountJson={() => setServiceAccountOpen(true)}
                 onOpenPrivateKey={() => void openPrivateKeyEditor()}
                 onOpenProtocolRepair={() => selectedProvider && openProtocolRepair(selectedProvider)}
@@ -1654,29 +1687,59 @@ function ProviderSettingsPage() {
                 <DialogField>
                   <Label>模型能力</Label>
                   <div className="flex flex-wrap gap-2">
-                    <CapabilityBadge
-                      icon="reasoning"
-                      label="推理"
-                      active={settingsModel.capabilityReasoning}
-                      onClick={() =>
-                        setSettingsModel({
-                          ...settingsModel,
-                          capabilityReasoning:
-                            !settingsModel.capabilityReasoning,
-                        })
-                      }
-                    />
-                    <CapabilityBadge
-                      icon="web"
-                      label="联网"
-                      active={settingsModel.capabilityWeb}
-                      onClick={() =>
-                        setSettingsModel({
-                          ...settingsModel,
-                          capabilityWeb: !settingsModel.capabilityWeb,
-                        })
-                      }
-                    />
+                    {capabilityDescriptors
+                      .filter((descriptor) => descriptor.userEditable && descriptor.editor !== "hidden")
+                      .map((descriptor) => {
+                        if (descriptor.editor === "toggle") {
+                          const active = booleanCapability(
+                            settingsModel.capabilities,
+                            descriptor.id,
+                          );
+                          return (
+                            <CapabilityBadge
+                              key={descriptor.id}
+                              descriptor={descriptor}
+                              active={active}
+                              onClick={() => setSettingsModel({
+                                ...settingsModel,
+                                capabilities: {
+                                  ...settingsModel.capabilities,
+                                  [descriptor.id]: !active,
+                                },
+                              })}
+                            />
+                          );
+                        }
+                        return (
+                          <div key={descriptor.id} className="grid min-w-36 gap-1">
+                            <Label>{descriptor.label}</Label>
+                            <Select
+                              value={capabilitySelectValue(
+                                settingsModel.capabilities,
+                                descriptor,
+                              )}
+                              onValueChange={(value) => setSettingsModel({
+                                ...settingsModel,
+                                capabilities: {
+                                  ...settingsModel.capabilities,
+                                  [descriptor.id]: capabilitySelectUpdateValue(descriptor, value),
+                                },
+                              })}
+                            >
+                              <SelectTrigger>
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {descriptor.options.map((option) => (
+                                  <SelectItem key={option.value} value={option.value}>
+                                    {option.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        );
+                      })}
                   </div>
                 </DialogField>
               )}
@@ -1690,7 +1753,11 @@ function ProviderSettingsPage() {
                   删除模型
                 </Button>
                 <Button
-                  disabled={!settingsModel.alias.trim() || busy}
+                  disabled={
+                    !settingsModel.alias.trim()
+                    || busy
+                    || (!selectedProviderIsMinerU && capabilityDescriptors.length === 0)
+                  }
                   onClick={() => void updateSelectedModel()}
                 >
                   保存设置

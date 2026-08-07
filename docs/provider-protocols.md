@@ -57,6 +57,6 @@ Provider 复制会先严格读取源凭证，再写入目标凭证。若数据�
 
 聊天和模型列表的所有非成功 HTTP 响应都必须经过当前 `ProtocolCodec::decode_error`，同时保留 HTTP 状态、限流遥测和兼容性协商使用的错误文本。兼容性重试只能执行一次，并且只允许已登记的 wire family、Host、模型、参数和错误组合。
 
-`JsonEventStreamDecoder` 同时处理规范 SSE 与 Ollama 式 NDJSON。SSE 支持 `data`、`event`、`id`、`retry`、注释、CRLF、多行 data 和 `[DONE]`；解析必须适用于任意字节边界、拆分的 UTF-8、多事件 Chunk 和结束 remainder。损坏 UTF-8、非法 JSON 或 Codec 解码失败必须立即返回带协议 ID 的错误，不能跳过事件或返回空成功。
+提供商请求统一使用非流式 JSON 响应。OpenAI、Anthropic、Gemini 与 Vertex 不发送流式参数或流式端点；Ollama 因服务端默认开启流式，必须显式发送 `"stream": false`。自定义参数中的 `stream`、`stream_options` 等字段继续被保护字段过滤，不能重新开启流式模式。
 
 通用 `runtime_chat` 和 `runtime_chat_stream` 不属于 Tauri IPC。`RuntimeAdapter` 仅供翻译、自动术语表等 Rust 内部调用和测试使用。

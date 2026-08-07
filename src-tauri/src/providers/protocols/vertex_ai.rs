@@ -1,17 +1,8 @@
 use serde_json::Value;
 
-use crate::domain::{
-    ProviderRuntimeConfig, RemoteModel, ThinkingConfig, ThinkingEffort, UnifiedChatRequest,
-    UnifiedChatResponse,
-};
-use crate::features::{is_feature_supported, FeatureId};
-use crate::providers::budget::{CompletionBudgetAlias, CompletionLimitScope, GEMINI_ALIASES};
-use crate::providers::capabilities::ModelCapabilities;
-use crate::providers::codec::{
-    EncodedRequest, EndpointPreview, HttpMethod, JsonEventStreamDecoder, ProtocolCodec,
-    ProtocolStreamDecoder,
-};
-use crate::providers::thinking;
+use crate::domain::{ProviderRuntimeConfig, RemoteModel, UnifiedChatRequest, UnifiedChatResponse};
+use crate::providers::budget::{CompletionBudgetAlias, GEMINI_ALIASES};
+use crate::providers::codec::{EncodedRequest, EndpointPreview, HttpMethod, ProtocolCodec};
 
 pub struct VertexAiCodec;
 
@@ -24,10 +15,6 @@ impl ProtocolCodec for VertexAiCodec {
 
     fn completion_budget_aliases(&self) -> &'static [CompletionBudgetAlias] {
         GEMINI_ALIASES
-    }
-
-    fn completion_limit_scope(&self) -> CompletionLimitScope {
-        CompletionLimitScope::VisibleOutput
     }
 
     fn encode_model_list(&self, config: &ProviderRuntimeConfig) -> Result<EncodedRequest, String> {
@@ -59,7 +46,6 @@ impl ProtocolCodec for VertexAiCodec {
             &vertex.project_id,
             &vertex.location,
             &request.model,
-            request.stream,
         );
         Ok(EncodedRequest {
             method: HttpMethod::Post,
@@ -77,49 +63,6 @@ impl ProtocolCodec for VertexAiCodec {
         super::gemini::finish_reason(raw)
     }
 
-    fn new_stream_decoder(&self) -> Box<dyn ProtocolStreamDecoder> {
-        Box::new(JsonEventStreamDecoder::new(self.id(), decode_chat))
-    }
-
-    fn infer_capabilities(&self, base_url: &str, model_id: &str) -> ModelCapabilities {
-        let inferred = crate::features::gemini_capabilities(model_id);
-        ModelCapabilities {
-            reasoning: inferred.reasoning,
-            web: inferred.web,
-            thinking_efforts: self.supported_thinking_efforts(
-                base_url,
-                model_id,
-                inferred.reasoning,
-            ),
-            thinking_required: false,
-            default_thinking_effort: None,
-        }
-    }
-
-    fn supported_thinking_efforts(
-        &self,
-        base_url: &str,
-        model_id: &str,
-        reasoning: bool,
-    ) -> Vec<ThinkingEffort> {
-        crate::features::gemini_thinking_efforts(base_url, model_id, reasoning)
-    }
-
-    fn resolve_thinking(
-        &self,
-        base_url: &str,
-        model_id: &str,
-        effort: ThinkingEffort,
-    ) -> Result<ThinkingConfig, String> {
-        let mut config = thinking::base_config(effort);
-        if is_feature_supported(FeatureId::GeminiThinkingLevel, base_url, model_id) {
-            config.effort = Some(thinking::gemini_level_effort(effort));
-        } else {
-            config.budget_tokens = Some(thinking::budget_tokens(effort));
-        }
-        Ok(config)
-    }
-
     fn preview_endpoints(&self, config: &ProviderRuntimeConfig) -> Result<EndpointPreview, String> {
         let vertex = crate::vertex_ai::runtime_config(config)?;
         Ok(EndpointPreview {
@@ -128,7 +71,6 @@ impl ProtocolCodec for VertexAiCodec {
                 &vertex.project_id,
                 &vertex.location,
                 "{model}",
-                false,
             ),
             models: Some(format!(
                 "{}?pageSize=100&listAllVersions=true",

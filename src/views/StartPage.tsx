@@ -73,7 +73,7 @@ const DEFAULT_CONFIG: TranslationConfigView = {
   providerId: "",
   modelId: "",
   assistantId: "__none__",
-  chunkTokenLimit: 800,
+  chunkTokenLimit: 1500,
   maxConcurrency: 5,
   maxRetries: 5,
   maxFailurePercentage: 20,

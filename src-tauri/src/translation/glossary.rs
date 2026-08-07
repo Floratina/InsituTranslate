@@ -983,6 +983,7 @@ async fn generate_glossary_for_chunk_inner(
     draft: Arc<AutoGlossaryDraft>,
 ) -> AutoGlossaryChunkOutcome {
     let mut last_error = None;
+    let mut current_thinking = runtime.thinking.clone();
     for attempt in 0..=max_retries {
         if interrupted.is_interrupted() {
             return AutoGlossaryChunkOutcome::Interrupted {
@@ -1033,11 +1034,10 @@ async fn generate_glossary_for_chunk_inner(
             model: runtime.model_request_name.clone(),
             messages,
             web_search: runtime.web_search,
-            thinking: runtime.thinking.clone(),
+            thinking: current_thinking.clone(),
             max_output_tokens: None,
             temperature: runtime.temperature,
             top_p: runtime.top_p,
-            stream: false,
             logprobs: false,
             custom_parameters: runtime.assistant_custom_parameters.clone(),
         };
@@ -1072,13 +1072,15 @@ async fn generate_glossary_for_chunk_inner(
         reporter.log(
             "INFO",
             format!(
-                "chunk={} sequence={} attempt={}/{} requesting model=\"{}\" estimated_input_tokens={} completion_tokens={} reserved_total_tokens={}",
+                "chunk={} sequence={} attempt={}/{} requesting model=\"{}\" estimated_input_tokens={} visible_output_tokens={} estimated_thinking_tokens={} combined_completion_tokens={} reserved_total_tokens={}",
                 chunk.id,
                 chunk.sequence,
                 attempt + 1,
                 max_retries + 1,
                 runtime.model_request_name,
                 prepared.cost.estimated_input_tokens,
+                prepared.cost.visible_output_tokens,
+                prepared.cost.estimated_thinking_tokens,
                 prepared.cost.completion_tokens,
                 prepared.cost.total_tokens,
             ),
@@ -1143,11 +1145,75 @@ async fn generate_glossary_for_chunk_inner(
                     let finish_reason = meta.finish_reason.as_deref().unwrap_or("truncation");
                     let error = runtime
                         .adapter
-                        .output_truncation_error(&prepared.request, finish_reason);
+                        .prepared_output_truncation_error(&prepared, finish_reason);
+                    let lower_thinking = if attempt < max_retries {
+                        match runtime.adapter.lower_thinking_config(
+                            &runtime.model_request_name,
+                            prepared.request.thinking.as_ref(),
+                        ) {
+                            Ok(lower) => lower,
+                            Err(resolve_error) => {
+                                reporter.log(
+                                    "ERROR",
+                                    format!(
+                                        "chunk={} sequence={} thinking downgrade resolution failed: {}",
+                                        chunk.id, chunk.sequence, resolve_error
+                                    ),
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(lower_thinking) = lower_thinking {
+                        let previous_effort = prepared
+                            .request
+                            .thinking
+                            .as_ref()
+                            .and_then(|thinking| thinking.effort);
+                        let next_effort = lower_thinking.effort;
+                        reporter.log(
+                            "WARN",
+                            format!(
+                                "chunk={} sequence={} attempt={}/{} truncated; lowering thinking effort from {:?} to {:?} and retrying: {}",
+                                chunk.id,
+                                chunk.sequence,
+                                attempt + 1,
+                                max_retries + 1,
+                                previous_effort,
+                                next_effort,
+                                error,
+                            ),
+                        );
+                        if let Err(persist_error) = glossaries::update_auto_glossary_chunk_retry(
+                            &draft,
+                            &chunk.id,
+                            attempt as i64 + 1,
+                            Some(&error),
+                        )
+                        .await
+                        {
+                            return AutoGlossaryChunkOutcome::Failed {
+                                chunk_id: chunk.id.clone(),
+                                error: persist_error,
+                            };
+                        }
+                        reporter
+                            .retry(
+                                &chunk.id,
+                                attempt + 1,
+                                max_retries,
+                                Some(format!("输出被截断，降低推理强度后重试：{error}")),
+                            )
+                            .await;
+                        current_thinking = Some(lower_thinking);
+                        continue;
+                    }
                     reporter.log(
                         "ERROR",
                         format!(
-                            "chunk={} sequence={} attempt={}/{} deterministic truncation will not be retried: {}",
+                            "chunk={} sequence={} attempt={}/{} no lower supported thinking effort or retry slot remains: {}",
                             chunk.id,
                             chunk.sequence,
                             attempt + 1,
@@ -1404,7 +1470,9 @@ fn valid_glossary_match_boundary(
 #[cfg(test)]
 mod report_state_tests {
     use super::*;
-    use crate::domain::{ProtocolId, ProviderRuntimeConfig};
+    use crate::domain::{
+        ProtocolId, ProviderRuntimeConfig, ThinkingConfig, ThinkingEffort, ThinkingMode,
+    };
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
@@ -1462,24 +1530,28 @@ mod report_state_tests {
     }
 
     #[tokio::test]
-    async fn truncated_valid_partial_glossary_is_rejected_without_retry_or_persistence() {
+    async fn truncated_glossary_is_discarded_and_retried_with_lower_thinking() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
         let address = listener.local_addr().expect("mock address");
         let request_count = Arc::new(AtomicUsize::new(0));
         let server_count = request_count.clone();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept mock request");
-            server_count.fetch_add(1, Ordering::SeqCst);
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
-            let body = r#"{"choices":[{"message":{"content":"[{\"src\":\"Hello\",\"dst\":\"你好\"}]"},"finish_reason":"length"}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write mock response");
+            for body in [
+                r#"{"choices":[{"message":{"content":"[{\"src\":\"Partial\",\"dst\":\"部分\"}]"},"finish_reason":"length"}]}"#,
+                r#"{"choices":[{"message":{"content":"[{\"src\":\"Hello\",\"dst\":\"你好\"}]"},"finish_reason":"stop"}]}"#,
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept mock request");
+                server_count.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write mock response");
+            }
         });
 
         let root = std::env::temp_dir().join(format!(
@@ -1521,13 +1593,18 @@ mod report_state_tests {
                     custom_headers: Vec::new(),
                 },
             )),
-            model_request_name: "test-model".into(),
+            model_request_name: "gpt-5".into(),
             assistant_prompt: None,
             assistant_custom_parameters: serde_json::json!({}),
             temperature: None,
             top_p: None,
             web_search: false,
-            thinking: None,
+            thinking: Some(ThinkingConfig {
+                mode: ThinkingMode::Enabled,
+                budget_tokens: None,
+                effort: Some(ThinkingEffort::High),
+                summary: None,
+            }),
         });
         let (sender, _receiver) = mpsc::channel(64);
         let reporter = GlossaryRequestReporter {
@@ -1559,11 +1636,13 @@ mod report_state_tests {
         .await;
         server.join().expect("mock server joins");
 
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert!(matches!(
             outcome,
-            AutoGlossaryChunkOutcome::Failed { ref error, .. }
-                if error.contains("OUTPUT_TRUNCATED") && error.contains("length")
+            AutoGlossaryChunkOutcome::Success { ref entries, .. }
+                if entries.len() == 1
+                    && entries[0].src == "Hello"
+                    && entries[0].dst == "你好"
         ));
         let entry_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
             .fetch_one(&draft.pool)

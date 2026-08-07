@@ -1,13 +1,11 @@
 import {
   Activity,
-  Brain,
   CloudDownload,
-  Globe2,
   LoaderCircle,
   Plus,
   Settings,
-  type LucideIcon,
 } from "lucide-react";
+import { DynamicIcon } from "lucide-react/dynamic";
 
 import { Button } from "@/components/ui/button";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
@@ -21,10 +19,12 @@ import {
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 
-import type { ModelView } from "./types";
+import { booleanCapability, capabilityIconName } from "./capabilities";
+import type { CapabilityDescriptor, ModelView } from "./types";
 
 interface ProviderModelListProps {
   models: ModelView[];
+  capabilityDescriptors: CapabilityDescriptor[];
   testingModelId: string;
   disabled?: boolean;
   supportsModelListing?: boolean;
@@ -36,7 +36,7 @@ interface ProviderModelListProps {
 }
 
 interface CapabilityPillProps {
-  icon: LucideIcon;
+  descriptor: CapabilityDescriptor;
   label: string;
   active: boolean;
 }
@@ -48,7 +48,7 @@ function latencyClassName(latencyMs: number | null): string {
   return "text-latency-danger";
 }
 
-function CapabilityPill({ icon: Icon, label, active }: CapabilityPillProps) {
+function CapabilityPill({ descriptor, label, active }: CapabilityPillProps) {
   return (
     <span
       className={cn(
@@ -56,7 +56,7 @@ function CapabilityPill({ icon: Icon, label, active }: CapabilityPillProps) {
         active && "border-enabled-accent/30 bg-enabled-accent/15 text-enabled-accent",
       )}
     >
-      <Icon className="size-3" strokeWidth={1.8} />
+      <DynamicIcon name={capabilityIconName(descriptor)} className="size-3" strokeWidth={1.8} />
       {label}
     </span>
   );
@@ -64,6 +64,7 @@ function CapabilityPill({ icon: Icon, label, active }: CapabilityPillProps) {
 
 export function ProviderModelList({
   models,
+  capabilityDescriptors,
   testingModelId,
   disabled = false,
   supportsModelListing = true,
@@ -134,8 +135,16 @@ export function ProviderModelList({
                     </span>
                   ) : (
                     <div className="flex flex-wrap gap-1">
-                      <CapabilityPill icon={Brain} label="推理" active={model.capabilityReasoning} />
-                      <CapabilityPill icon={Globe2} label="联网" active={model.capabilityWeb} />
+                      {capabilityDescriptors
+                        .filter((descriptor) => descriptor.presentation === "badge")
+                        .map((descriptor) => (
+                          <CapabilityPill
+                            key={descriptor.id}
+                            descriptor={descriptor}
+                            label={descriptor.label}
+                            active={booleanCapability(model.capabilities, descriptor.id)}
+                          />
+                        ))}
                     </div>
                   )}
                 </TableCell>
@@ -165,6 +174,7 @@ export function ProviderModelList({
                     <Button
                       size="icon-sm"
                       variant="ghost"
+                      disabled={!isMinerU && capabilityDescriptors.length === 0}
                       title="模型设置"
                       onClick={() => onOpenSettings(model)}
                     >

@@ -1,7 +1,10 @@
 use serde_json::Value;
 
 use crate::domain::{ModelView, ProviderRuntimeConfig, ThinkingConfig, ThinkingEffort};
-use crate::providers::{descriptor_for, CompletionBudget};
+use crate::providers::capabilities::{infer_capabilities, resolve_thinking};
+use crate::providers::descriptor_for;
+#[cfg(test)]
+use crate::providers::CompletionBudget;
 
 use super::TranslationConfigView;
 
@@ -25,6 +28,7 @@ pub(super) fn visible_output_token_reserve(source_tokens: u64) -> u32 {
     source_tokens.saturating_mul(2).clamp(4_096, 16_000) as u32
 }
 
+#[cfg(test)]
 pub(super) fn validate_and_plan_model_request(
     runtime: &ProviderRuntimeConfig,
     model: &ModelView,
@@ -106,17 +110,19 @@ fn resolve_model_web_search(
     if !enabled {
         return Ok(false);
     }
-    if !model.capability_web {
+    if !model.capabilities.web() {
         return Err(format!(
             "Web search is enabled, but model \"{}\" does not have web search capability enabled.",
             model.alias_or_request_name()
         ));
     }
     let descriptor = descriptor_for(&runtime.protocol)?;
-    if !descriptor
-        .codec
-        .infer_capabilities(&runtime.base_url, &model.request_name)
-        .web
+    if !infer_capabilities(
+        descriptor.capability_profile,
+        &runtime.base_url,
+        &model.request_name,
+    )
+    .web()
     {
         return Err(format!(
             "Web search is not supported for provider protocol {} and model \"{}\".",
@@ -133,30 +139,33 @@ fn resolve_model_thinking(
     model: &ModelView,
 ) -> Result<Option<ThinkingConfig>, String> {
     if effort == ThinkingEffort::None {
-        if model.thinking_required {
+        if model.capabilities.thinking_required() {
             return Err(format!(
                 "Model \"{}\" requires thinking. Select the default {:?} effort or another supported effort.",
                 model.alias_or_request_name(),
-                model.default_thinking_effort.unwrap_or(ThinkingEffort::High)
+                model.capabilities.default_thinking_effort().unwrap_or(ThinkingEffort::High)
             ));
         }
-        if model.default_thinking_effort.is_none() {
+        if model.capabilities.default_thinking_effort().is_none() {
             return Ok(None);
         }
         let descriptor = descriptor_for(&runtime.protocol)?;
-        return descriptor
-            .codec
-            .resolve_thinking(&runtime.base_url, &model.request_name, effort)
-            .map(Some);
+        return resolve_thinking(
+            descriptor.capability_profile,
+            &runtime.base_url,
+            &model.request_name,
+            effort,
+        )
+        .map(Some);
     }
-    if !model.capability_reasoning {
+    if !model.capabilities.reasoning() {
         return Err(format!(
             "Model \"{}\" does not have reasoning capability enabled. Set thinking effort to None or enable reasoning for this model.",
             model.alias_or_request_name()
         ));
     }
-    if !model.supported_thinking_efforts.is_empty()
-        && !model.supported_thinking_efforts.contains(&effort)
+    if !model.capabilities.thinking_efforts().is_empty()
+        && !model.capabilities.thinking_efforts().contains(&effort)
     {
         return Err(format!(
             "Thinking effort {effort:?} is not supported by model \"{}\".",
@@ -165,7 +174,8 @@ fn resolve_model_thinking(
     }
 
     let descriptor = descriptor_for(&runtime.protocol)?;
-    Ok(Some(descriptor.codec.resolve_thinking(
+    Ok(Some(resolve_thinking(
+        descriptor.capability_profile,
         &runtime.base_url,
         &model.request_name,
         effort,
@@ -192,6 +202,7 @@ mod tests {
     use crate::domain::{
         ProtocolId, ThinkingMode, UnifiedChatRequest, UnifiedContent, UnifiedMessage,
     };
+    use crate::providers::capabilities::{infer_capabilities, ModelCapabilities};
     use crate::providers::protocols::anthropic;
     use serde_json::json;
 
@@ -213,11 +224,18 @@ mod tests {
             request_name: request_name.into(),
             alias: String::new(),
             source: "custom".into(),
-            capability_reasoning: reasoning,
-            supported_thinking_efforts: Vec::new(),
-            thinking_required: false,
-            default_thinking_effort: None,
-            capability_web: false,
+            capabilities: ModelCapabilities::from_inferred(
+                reasoning,
+                false,
+                if reasoning {
+                    Vec::new()
+                } else {
+                    vec![ThinkingEffort::None]
+                },
+                false,
+                None,
+            )
+            .expect("valid test capabilities"),
             test_status: "untested".into(),
             latency_ms: None,
             tested_at: None,
@@ -248,21 +266,20 @@ mod tests {
 
     fn web_model(request_name: &str) -> ModelView {
         ModelView {
-            capability_web: true,
+            capabilities: ModelCapabilities::legacy(false, true),
             ..model(request_name, false)
         }
     }
 
     fn anthropic_model(request_name: &str) -> ModelView {
         let mut value = model(request_name, true);
-        let capabilities = descriptor_for(&ProtocolId::registered("anthropic"))
-            .expect("Anthropic descriptor")
-            .codec
-            .infer_capabilities("https://api.anthropic.com", request_name);
-        value.capability_reasoning = capabilities.reasoning;
-        value.supported_thinking_efforts = capabilities.thinking_efforts;
-        value.thinking_required = capabilities.thinking_required;
-        value.default_thinking_effort = capabilities.default_thinking_effort;
+        let descriptor =
+            descriptor_for(&ProtocolId::registered("anthropic")).expect("Anthropic descriptor");
+        value.capabilities = infer_capabilities(
+            descriptor.capability_profile,
+            "https://api.anthropic.com",
+            request_name,
+        );
         value
     }
 
@@ -336,7 +353,6 @@ mod tests {
             max_output_tokens: None,
             temperature: Some(0.2),
             top_p: None,
-            stream: false,
             logprobs: false,
             custom_parameters: json!({}),
         };
@@ -398,11 +414,18 @@ mod tests {
     #[test]
     fn rejects_effort_outside_non_empty_supported_effort_list() {
         let mut model = model("deepseek-v4", true);
-        model.supported_thinking_efforts = vec![
-            ThinkingEffort::None,
-            ThinkingEffort::High,
-            ThinkingEffort::Max,
-        ];
+        model.capabilities = ModelCapabilities::from_inferred(
+            true,
+            false,
+            vec![
+                ThinkingEffort::None,
+                ThinkingEffort::High,
+                ThinkingEffort::Max,
+            ],
+            false,
+            None,
+        )
+        .expect("valid test capabilities");
         let error = resolve_translation_request_options(
             &config(ThinkingEffort::Low),
             &runtime("openai-chat", "https://api.deepseek.com"),
@@ -415,42 +438,39 @@ mod tests {
     }
 
     #[test]
-    fn empty_supported_effort_list_keeps_legacy_mapping_compatibility() {
-        let options = resolve_translation_request_options(
+    fn central_profile_rejects_invalid_effort_even_for_legacy_empty_lists() {
+        let error = resolve_translation_request_options(
             &config(ThinkingEffort::Low),
             &runtime("openai-chat", "https://api.deepseek.com"),
             &model("deepseek-v4", true),
             json!({}),
         )
-        .expect("legacy unknown effort list");
+        .expect_err("central profile owns the effort set");
 
-        assert_eq!(
-            options.thinking.as_ref().and_then(|item| item.effort),
-            Some(ThinkingEffort::High)
-        );
+        assert!(error.contains("does not support thinking effort Low"));
     }
 
     #[test]
     fn routes_deepseek_effort_to_high_or_max() {
         let options = resolve_translation_request_options(
-            &config(ThinkingEffort::Low),
+            &config(ThinkingEffort::High),
             &runtime("openai-chat", "https://api.deepseek.com"),
             &model("deepseek-v4", true),
             json!({}),
         )
-        .expect("low options");
+        .expect("high options");
         assert_eq!(
             options.thinking.as_ref().and_then(|item| item.effort),
             Some(ThinkingEffort::High)
         );
 
         let options = resolve_translation_request_options(
-            &config(ThinkingEffort::Xhigh),
+            &config(ThinkingEffort::Max),
             &runtime("openai-chat", "https://api.deepseek.com"),
             &model("deepseek-v4", true),
             json!({}),
         )
-        .expect("xhigh options");
+        .expect("max options");
         assert_eq!(
             options.thinking.as_ref().and_then(|item| item.effort),
             Some(ThinkingEffort::Max)
@@ -487,9 +507,9 @@ mod tests {
     }
 
     #[test]
-    fn qwen_budget_models_get_thinking_budget() {
+    fn qwen_provider_managed_thinking_does_not_invent_a_numeric_budget() {
         let options = resolve_translation_request_options(
-            &config(ThinkingEffort::Medium),
+            &config(ThinkingEffort::High),
             &runtime(
                 "openai-chat",
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -504,7 +524,7 @@ mod tests {
                 .thinking
                 .as_ref()
                 .and_then(|item| item.budget_tokens),
-            Some(16_000)
+            None
         );
     }
 

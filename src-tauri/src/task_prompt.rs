@@ -43,32 +43,6 @@ pub struct TaskChunkInput {
     pub content_format: ContentFormat,
 }
 
-pub fn validate_target_language(target_language: &str) -> Result<(), String> {
-    if target_language.is_empty() || target_language.len() > 64 || !target_language.is_ascii() {
-        return Err("Target language must be a valid BCP-47 code or English language name".into());
-    }
-
-    let mut subtags = target_language.split('-');
-    let language = subtags.next().unwrap_or_default();
-    let valid_bcp47 = (2..=8).contains(&language.len())
-        && language.bytes().all(|byte| byte.is_ascii_alphabetic())
-        && !subtags.any(|subtag| {
-            subtag.is_empty()
-                || subtag.len() > 8
-                || !subtag.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        });
-    let valid_english_name = target_language.split([' ', '-']).all(|word| {
-        let mut bytes = word.bytes();
-        word.len() >= 2
-            && bytes.next().is_some_and(|byte| byte.is_ascii_uppercase())
-            && bytes.all(|byte| byte.is_ascii_lowercase())
-    });
-    if !valid_bcp47 && !valid_english_name {
-        return Err("Target language must be a valid BCP-47 code or English language name".into());
-    }
-    Ok(())
-}
-
 pub fn compose_system_prompt(
     target_language: &str,
     assistant_system_prompt: Option<&str>,

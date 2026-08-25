@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use lrc::{Lyrics, TimeTag};
 use regex::Regex;
-use subparse::{parse_str, SubtitleFormat};
 
 use crate::task_prompt::{ContentFormat, DocumentFormat};
 
@@ -20,7 +19,6 @@ const TIMED_TEXT_CHUNK_KIND: &str = "timed-text-chunk";
 const TIMED_UNIT_KIND: &str = "timed-unit";
 const LEGACY_TIMED_TEXT_KIND: &str = "timed-text";
 const ASS_CONTROL_KIND: &str = "ass-control";
-const SUBPARSE_FPS: f64 = 25.0;
 
 pub struct SubtitleParser {
     pub format: DocumentFormat,
@@ -79,6 +77,14 @@ struct LineRange {
     end: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AssFieldsInfo {
+    start_field_index: usize,
+    end_field_index: usize,
+    text_field_index: usize,
+    field_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TimedTextUnit {
     target_ref: TimedTargetRef,
@@ -118,35 +124,18 @@ fn parse_subtitle_text(
     token_limit: i64,
     progress: Option<&mut (dyn FnMut(ParserProgress) + Send + '_)>,
 ) -> Result<Vec<ParsedChunk>, String> {
-    let subtitle_format = subtitle_format(format)?;
-    let subtitle_file = parse_str(subtitle_format, text, SUBPARSE_FPS)
-        .map_err(|error| format!("Unable to parse subtitle source with subparse: {error}"))?;
-    let entries = subtitle_file
-        .get_subtitle_entries()
-        .map_err(|error| format!("Unable to read subtitle entries: {error}"))?;
-    let srt_ranges = if format == DocumentFormat::Srt {
-        let ranges = srt_body_ranges(text)?;
-        if ranges.len() != entries.len() {
-            return Err(format!(
-                "SRT source range mismatch: found {} body ranges but subparse found {} entries",
-                ranges.len(),
-                entries.len()
-            ));
-        }
-        Some(ranges)
-    } else {
-        None
+    let text_ranges = match format {
+        DocumentFormat::Srt => srt_body_ranges(text)?,
+        DocumentFormat::Ass => ass_dialogue_text_ranges(text)?,
+        _ => return Err("Unsupported subtitle parser format".into()),
     };
 
     let mut units = Vec::new();
-    for (index, entry) in entries.into_iter().enumerate() {
-        let source_text = if let Some(ranges) = srt_ranges.as_ref() {
-            text.get(ranges[index].start..ranges[index].end)
-                .ok_or_else(|| format!("Invalid SRT body range for entry {index}"))?
-                .to_string()
-        } else {
-            entry.line.unwrap_or_default()
-        };
+    for (index, range) in text_ranges.into_iter().enumerate() {
+        let source_text = text
+            .get(range.start..range.end)
+            .ok_or_else(|| format!("Invalid timed text range for entry {index}"))?
+            .to_string();
         if source_text.trim().is_empty() {
             continue;
         }
@@ -428,6 +417,9 @@ fn restore_timed_text_chunk(
     let mut restored_units = Vec::new();
 
     for (unit, translated_text) in units.iter().zip(translated_units) {
+        if map.format == DocumentFormat::Ass {
+            validate_ass_control_placeholders(map, &unit.tag, &translated_text)?;
+        }
         let mut unit_map = map.clone();
         unit_map.block_ref = BlockRef {
             kind: TIMED_UNIT_KIND.into(),
@@ -454,20 +446,54 @@ fn restore_timed_text_chunk(
     Ok(restored_units.join("\n"))
 }
 
-fn render_srt_document(text: &str, chunks: &[RenderedChunk]) -> Result<String, String> {
-    let subtitle_file = parse_str(SubtitleFormat::SubRip, text, SUBPARSE_FPS)
-        .map_err(|error| format!("Unable to validate SRT source with subparse: {error}"))?;
-    let entries = subtitle_file
-        .get_subtitle_entries()
-        .map_err(|error| format!("Unable to read SRT entries: {error}"))?;
-    let ranges = srt_body_ranges(text)?;
-    if ranges.len() != entries.len() {
-        return Err(format!(
-            "SRT source range mismatch: found {} body ranges but subparse found {} entries",
-            ranges.len(),
-            entries.len()
-        ));
+fn validate_ass_control_placeholders(
+    map: &PlaceholderMap,
+    unit_tag: &str,
+    translated_text: &str,
+) -> Result<(), String> {
+    let mut previous_position = None;
+
+    for entry in map
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == ASS_CONTROL_KIND)
+    {
+        let open = format!("<{}>", entry.id);
+        let close = format!("</{}>", entry.id);
+        let token = format!("{open}{close}");
+
+        if placeholder_belongs_to_unit(entry, unit_tag) {
+            let positions = translated_text.match_indices(&token).collect::<Vec<_>>();
+            if positions.len() != 1
+                || translated_text.matches(&open).count() != 1
+                || translated_text.matches(&close).count() != 1
+            {
+                return Err(format!(
+                    "Translated ASS unit <{unit_tag}> must contain control placeholder <{}> exactly once",
+                    entry.id
+                ));
+            }
+            let position = positions[0].0;
+            if previous_position.is_some_and(|previous| position <= previous) {
+                return Err(format!(
+                    "Translated ASS unit <{unit_tag}> changed control placeholder order at <{}>",
+                    entry.id
+                ));
+            }
+            previous_position = Some(position);
+        } else if translated_text.contains(&open) || translated_text.contains(&close) {
+            return Err(format!(
+                "Translated ASS unit <{unit_tag}> contains control placeholder <{}> owned by another subtitle",
+                entry.id
+            ));
+        }
     }
+
+    Ok(())
+}
+
+fn render_srt_document(text: &str, chunks: &[RenderedChunk]) -> Result<String, String> {
+    let ranges = srt_body_ranges(text)?;
 
     let Some(translations) = collect_timed_translations(chunks, TimedTargetKind::Entry)? else {
         return legacy_or_original(text, chunks);
@@ -479,34 +505,31 @@ fn render_srt_document(text: &str, chunks: &[RenderedChunk]) -> Result<String, S
                 "Translated SRT entry index {entry_index} does not exist in source"
             ));
         };
+        let replacement = preserve_source_line_endings(
+            &text[range.start..range.end],
+            &replacement,
+            &format!("translated SRT entry {entry_index}"),
+        )?;
         patches.push(TextPatch { range, replacement });
     }
     apply_text_patches(text, patches)
 }
 
 fn render_ass_document(text: &str, chunks: &[RenderedChunk]) -> Result<Vec<u8>, String> {
-    let mut subtitle_file = parse_str(SubtitleFormat::SubStationAlpha, text, SUBPARSE_FPS)
-        .map_err(|error| format!("Unable to parse ASS source with subparse: {error}"))?;
-    let mut entries = subtitle_file
-        .get_subtitle_entries()
-        .map_err(|error| format!("Unable to read ASS entries: {error}"))?;
+    let ranges = ass_dialogue_text_ranges(text)?;
     let Some(translations) = collect_timed_translations(chunks, TimedTargetKind::Entry)? else {
         return Ok(legacy_or_original(text, chunks)?.into_bytes());
     };
+    let mut patches = Vec::new();
     for (entry_index, replacement) in translations {
-        let Some(entry) = entries.get_mut(entry_index) else {
+        let Some(range) = ranges.get(entry_index).copied() else {
             return Err(format!(
                 "Translated ASS entry index {entry_index} does not exist in source"
             ));
         };
-        entry.line = Some(replacement);
+        patches.push(TextPatch { range, replacement });
     }
-    subtitle_file
-        .update_subtitle_entries(&entries)
-        .map_err(|error| format!("Unable to update ASS entries with subparse: {error}"))?;
-    subtitle_file
-        .to_data()
-        .map_err(|error| format!("Unable to export ASS with subparse: {error}"))
+    apply_text_patches(text, patches).map(String::into_bytes)
 }
 
 fn render_lrc_document(text: &str, chunks: &[RenderedChunk]) -> Result<String, String> {
@@ -637,14 +660,6 @@ fn placeholder_belongs_to_unit(entry: &PlaceholderEntry, unit_tag: &str) -> bool
     native_ref == format!("unit:{unit_tag}") || native_ref.starts_with(&format!("unit:{unit_tag};"))
 }
 
-fn subtitle_format(format: DocumentFormat) -> Result<SubtitleFormat, String> {
-    match format {
-        DocumentFormat::Srt => Ok(SubtitleFormat::SubRip),
-        DocumentFormat::Ass => Ok(SubtitleFormat::SubStationAlpha),
-        _ => Err("Unsupported subparse subtitle format".into()),
-    }
-}
-
 fn unit_target_ref(target_ref: &TimedTargetRef) -> String {
     match target_ref.kind {
         TimedTargetKind::Entry => format!("entry:{}", target_ref.index),
@@ -708,6 +723,55 @@ fn apply_text_patches(text: &str, mut patches: Vec<TextPatch>) -> Result<String,
     }
 
     Ok(output)
+}
+
+fn preserve_source_line_endings(
+    source: &str,
+    replacement: &str,
+    context: &str,
+) -> Result<String, String> {
+    let (source_lines, source_endings) = split_lines_and_endings(source);
+    let (replacement_lines, _) = split_lines_and_endings(replacement);
+    if source_lines.len() != replacement_lines.len() {
+        return Err(format!(
+            "Invalid {context}: expected {} text lines but received {}",
+            source_lines.len(),
+            replacement_lines.len()
+        ));
+    }
+
+    let mut output = String::with_capacity(replacement.len());
+    for (index, line) in replacement_lines.into_iter().enumerate() {
+        output.push_str(line);
+        if let Some(ending) = source_endings.get(index) {
+            output.push_str(ending);
+        }
+    }
+    Ok(output)
+}
+
+fn split_lines_and_endings(text: &str) -> (Vec<&str>, Vec<&str>) {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut endings = Vec::new();
+    let mut start = 0_usize;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let ending_start = if index > start && bytes[index - 1] == b'\r' {
+            index - 1
+        } else {
+            index
+        };
+        lines.push(&text[start..ending_start]);
+        endings.push(&text[ending_start..index + 1]);
+        start = index + 1;
+    }
+    lines.push(&text[start..]);
+
+    (lines, endings)
 }
 
 fn legacy_or_original(text: &str, chunks: &[RenderedChunk]) -> Result<String, String> {
@@ -782,16 +846,28 @@ fn srt_body_ranges(text: &str) -> Result<Vec<TextRange>, String> {
             break;
         }
 
-        cursor += 1;
-        if cursor >= lines.len() {
-            return Err("Invalid SRT block: missing timestamp line".into());
-        }
-        if !line_text(text, lines[cursor]).contains("-->") {
+        let index_line = lines[cursor];
+        let index_text = line_text(text, index_line);
+        let index_text = if index_line.start == 0 {
+            index_text.strip_prefix('\u{feff}').unwrap_or(index_text)
+        } else {
+            index_text
+        };
+        if !is_ascii_unsigned_integer(index_text.trim()) {
             return Err(format!(
-                "Invalid SRT block: expected timestamp line at source line {}",
-                lines[cursor].index + 1
+                "Invalid SRT subtitle index at source line {}",
+                index_line.index + 1
             ));
         }
+
+        cursor += 1;
+        if cursor >= lines.len() {
+            return Err(format!(
+                "Invalid SRT block after source line {}: missing timestamp line",
+                index_line.index + 1
+            ));
+        }
+        validate_srt_timestamp_line(line_text(text, lines[cursor]), lines[cursor].index + 1)?;
 
         cursor += 1;
         let body_start_line = cursor;
@@ -799,25 +875,278 @@ fn srt_body_ranges(text: &str) -> Result<Vec<TextRange>, String> {
             cursor += 1;
         }
         if body_start_line == cursor {
-            ranges.push(TextRange {
-                start: lines
-                    .get(body_start_line)
-                    .map(|line| line.start)
-                    .unwrap_or(text.len()),
-                end: lines
-                    .get(body_start_line)
-                    .map(|line| line.start)
-                    .unwrap_or(text.len()),
-            });
-        } else {
-            ranges.push(TextRange {
-                start: lines[body_start_line].start,
-                end: lines[cursor - 1].end,
-            });
+            return Err(format!(
+                "Invalid SRT block after source line {}: missing subtitle text",
+                lines[body_start_line - 1].index + 1
+            ));
         }
+
+        let range = TextRange {
+            start: lines[body_start_line].start,
+            end: lines[cursor - 1].end,
+        };
+        validate_text_range(text, range, "SRT subtitle text")?;
+        ranges.push(range);
     }
 
     Ok(ranges)
+}
+
+fn validate_srt_timestamp_line(line: &str, line_number: usize) -> Result<(), String> {
+    let timestamp = line.trim();
+    let Some((start, end)) = timestamp.split_once("-->") else {
+        return Err(format!(
+            "Invalid SRT timestamp at source line {line_number}: missing --> separator"
+        ));
+    };
+    if end.contains("-->")
+        || !is_valid_srt_timestamp(start.trim())
+        || !is_valid_srt_timestamp(end.trim())
+    {
+        return Err(format!(
+            "Invalid SRT timestamp syntax at source line {line_number}"
+        ));
+    }
+    Ok(())
+}
+
+fn is_valid_srt_timestamp(timestamp: &str) -> bool {
+    let Some((hours_minutes_seconds, milliseconds)) = timestamp.rsplit_once(',') else {
+        return false;
+    };
+    let mut components = hours_minutes_seconds.split(':');
+    let (Some(hours), Some(minutes), Some(seconds), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+
+    is_ascii_unsigned_integer(hours)
+        && is_two_digit_component(minutes, 59)
+        && is_two_digit_component(seconds, 59)
+        && milliseconds.len() == 3
+        && is_ascii_unsigned_integer(milliseconds)
+}
+
+fn ass_dialogue_text_ranges(text: &str) -> Result<Vec<TextRange>, String> {
+    let mut ranges = Vec::new();
+    let mut in_events = false;
+    let mut saw_events = false;
+    let mut saw_events_format = false;
+    let mut fields_info = None;
+
+    for line in line_ranges(text) {
+        let raw_line = line_text(text, line);
+        let structural_line = if line.start == 0 {
+            raw_line.strip_prefix('\u{feff}').unwrap_or(raw_line)
+        } else {
+            raw_line
+        };
+        let trimmed = structural_line.trim();
+
+        if let Some(section_name) = ass_section_name(trimmed) {
+            in_events = section_name.eq_ignore_ascii_case("Events");
+            if in_events {
+                saw_events = true;
+                fields_info = None;
+            }
+            continue;
+        }
+        if !in_events || trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(format_fields) = strip_ascii_label(trimmed, "Format:") {
+            fields_info = Some(parse_ass_format(format_fields, line.index + 1)?);
+            saw_events_format = true;
+            continue;
+        }
+
+        if strip_ascii_label(trimmed, "Dialogue:").is_none() {
+            continue;
+        }
+
+        let Some(info) = fields_info else {
+            return Err(format!(
+                "Invalid ASS Dialogue at source line {}: missing preceding Events Format",
+                line.index + 1
+            ));
+        };
+        ranges.push(parse_ass_dialogue_range(text, line, info)?);
+    }
+
+    if !saw_events {
+        return Err("Invalid ASS document: missing [Events] section".into());
+    }
+    if !saw_events_format {
+        return Err("Invalid ASS document: missing Format line in [Events]".into());
+    }
+
+    Ok(ranges)
+}
+
+fn ass_section_name(line: &str) -> Option<&str> {
+    line.strip_prefix('[')?.strip_suffix(']')
+}
+
+fn strip_ascii_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    let prefix = line.get(..label.len())?;
+    prefix
+        .eq_ignore_ascii_case(label)
+        .then(|| &line[label.len()..])
+}
+
+fn parse_ass_format(format_fields: &str, line_number: usize) -> Result<AssFieldsInfo, String> {
+    let fields = format_fields.split(',').map(str::trim).collect::<Vec<_>>();
+    let start_field_index = unique_ass_field_index(&fields, "Start", line_number)?;
+    let end_field_index = unique_ass_field_index(&fields, "End", line_number)?;
+    let text_field_index = unique_ass_field_index(&fields, "Text", line_number)?;
+
+    if text_field_index + 1 != fields.len() {
+        return Err(format!(
+            "Invalid ASS Format at source line {line_number}: Text must be the final field"
+        ));
+    }
+
+    Ok(AssFieldsInfo {
+        start_field_index,
+        end_field_index,
+        text_field_index,
+        field_count: fields.len(),
+    })
+}
+
+fn unique_ass_field_index(
+    fields: &[&str],
+    required: &str,
+    line_number: usize,
+) -> Result<usize, String> {
+    let matches = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| field.eq_ignore_ascii_case(required).then_some(index))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(format!(
+            "Invalid ASS Format at source line {line_number}: missing {required} field"
+        )),
+        _ => Err(format!(
+            "Invalid ASS Format at source line {line_number}: duplicate {required} field"
+        )),
+    }
+}
+
+fn parse_ass_dialogue_range(
+    text: &str,
+    line: LineRange,
+    info: AssFieldsInfo,
+) -> Result<TextRange, String> {
+    let raw_line = line_text(text, line);
+    let leading_whitespace = leading_whitespace_len(raw_line);
+    let labelled_line = &raw_line[leading_whitespace..];
+    let Some(fields_text) = strip_ascii_label(labelled_line, "Dialogue:") else {
+        return Err(format!(
+            "Invalid ASS Dialogue label at source line {}",
+            line.index + 1
+        ));
+    };
+    let fields_offset = leading_whitespace + "Dialogue:".len();
+    let fields_text_offset = leading_whitespace_len(fields_text);
+    let fields_text = &fields_text[fields_text_offset..];
+    let fields_start = fields_offset + fields_text_offset;
+
+    let mut fields = Vec::with_capacity(info.field_count);
+    let mut cursor = 0_usize;
+    for _ in 0..info.text_field_index {
+        let Some(comma_offset) = fields_text[cursor..].find(',') else {
+            return Err(format!(
+                "Invalid ASS Dialogue at source line {}: expected {} fields before Text",
+                line.index + 1,
+                info.text_field_index
+            ));
+        };
+        let comma = cursor + comma_offset;
+        fields.push(&fields_text[cursor..comma]);
+        cursor = comma + 1;
+    }
+    fields.push(&fields_text[cursor..]);
+
+    for (field_name, field_index) in [
+        ("Start", info.start_field_index),
+        ("End", info.end_field_index),
+    ] {
+        let Some(value) = fields.get(field_index) else {
+            return Err(format!(
+                "Invalid ASS Dialogue at source line {}: missing {field_name} field",
+                line.index + 1
+            ));
+        };
+        if !is_valid_ass_timestamp(value.trim()) {
+            return Err(format!(
+                "Invalid ASS {field_name} timestamp at source line {}",
+                line.index + 1
+            ));
+        }
+    }
+
+    let range = TextRange {
+        start: line.start + fields_start + cursor,
+        end: line.end,
+    };
+    validate_text_range(text, range, "ASS Dialogue Text")?;
+    Ok(range)
+}
+
+fn is_valid_ass_timestamp(timestamp: &str) -> bool {
+    let Some((hours_minutes_seconds, centiseconds)) = timestamp
+        .rsplit_once('.')
+        .or_else(|| timestamp.rsplit_once(':'))
+    else {
+        return false;
+    };
+    let mut components = hours_minutes_seconds.split(':');
+    let (Some(hours), Some(minutes), Some(seconds), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+
+    is_ascii_unsigned_integer(hours)
+        && is_two_digit_component(minutes, 59)
+        && is_two_digit_component(seconds, 59)
+        && centiseconds.len() == 2
+        && is_ascii_unsigned_integer(centiseconds)
+}
+
+fn is_ascii_unsigned_integer(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_two_digit_component(value: &str, maximum: u8) -> bool {
+    value.len() == 2
+        && is_ascii_unsigned_integer(value)
+        && value.parse::<u8>().is_ok_and(|parsed| parsed <= maximum)
+}
+
+fn validate_text_range(text: &str, range: TextRange, context: &str) -> Result<(), String> {
+    if range.start > range.end
+        || range.end > text.len()
+        || !text.is_char_boundary(range.start)
+        || !text.is_char_boundary(range.end)
+    {
+        return Err(format!(
+            "Invalid {context} byte range {}:{}",
+            range.start, range.end
+        ));
+    }
+    Ok(())
 }
 
 fn lrc_lyric_ranges(text: &str) -> Result<Vec<(usize, TextRange)>, String> {
@@ -940,7 +1269,122 @@ mod tests {
     }
 
     #[test]
-    fn ass_render_uses_subparse_and_restores_override_blocks_and_line_breaks() {
+    fn srt_accepts_bom_unicode_and_arrow_whitespace_with_byte_exact_patching() {
+        let srt = concat!(
+            "\u{feff}7\r\n",
+            "00:00:01,000   -->\t00:00:02,000\r\n",
+            "你好 😀\r\n",
+            "<b>second</b>\r\n\r\n",
+            "42\r\n",
+            "12:34:56,789 --> 12:34:58,001\r\n",
+            "尾声\r\n\r\n",
+        );
+        let ranges = srt_body_ranges(srt).expect("srt ranges");
+        assert!(ranges
+            .iter()
+            .all(|range| srt.is_char_boundary(range.start) && srt.is_char_boundary(range.end)));
+
+        let chunks = parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 100, None)
+            .expect("parse srt");
+        let after = "<it0>译文 😀\n<t1>标签</t1></it0>\n<it1>结尾</it1>";
+        let rendered =
+            render_srt_document(srt, &[rendered_chunk(&chunks[0], after)]).expect("render srt");
+        let expected = concat!(
+            "\u{feff}7\r\n",
+            "00:00:01,000   -->\t00:00:02,000\r\n",
+            "译文 😀\r\n",
+            "<b>标签</b>\r\n\r\n",
+            "42\r\n",
+            "12:34:56,789 --> 12:34:58,001\r\n",
+            "结尾\r\n\r\n",
+        );
+
+        assert_eq!(rendered.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn srt_rejects_invalid_indices_timestamps_and_incomplete_blocks() {
+        let cases = [
+            (
+                "word\n00:00:01,000 --> 00:00:02,000\nText\n",
+                "subtitle index",
+            ),
+            ("1\nmissing arrow\nText\n", "missing -->"),
+            (
+                "1\n00:60:01,000 --> 00:00:02,000\nText\n",
+                "timestamp syntax",
+            ),
+            (
+                "1\n00:00:01,000 --> 00:00:02,000\n",
+                "missing subtitle text",
+            ),
+            ("1\n", "missing timestamp line"),
+        ];
+
+        for (source, expected_error) in cases {
+            let error = srt_body_ranges(source).expect_err("invalid SRT must fail");
+            assert!(
+                error.contains(expected_error),
+                "expected {expected_error:?} in {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn srt_rejects_translation_that_changes_multiline_structure() {
+        let srt = concat!(
+            "1\r\n",
+            "00:00:01,000 --> 00:00:02,000\r\n",
+            "First\r\n",
+            "Second\r\n\r\n",
+        );
+        let chunks = parse_subtitle_text(srt, DocumentFormat::Srt, ContentFormat::Srt, 100, None)
+            .expect("parse SRT");
+        let rendered = rendered_chunk(&chunks[0], "<it0>Only one line</it0>");
+
+        let error = render_srt_document(srt, &[rendered]).expect_err("line count mismatch");
+
+        assert!(error.contains("expected 2 text lines but received 1"));
+    }
+
+    #[test]
+    fn ass_uses_dynamic_text_position_and_patches_only_text_bytes() {
+        let ass = concat!(
+            "\u{feff}[Script Info]\r\n",
+            "Title: 字幕 😀\r\n\r\n",
+            "[V4+ Styles]\r\n",
+            "Style: Default,Arial,20\r\n\r\n",
+            "[Events]\r\n",
+            "Format: Start, Layer, End, Style, Text\r\n",
+            "Comment: 0:00:00.00,8,0:00:10.00,Default,do not translate, ever\r\n",
+            "Dialogue: 0:00:01.00,7,0:00:02.00,Default,你好, friend 😀  \r\n",
+            "[Fonts]\r\n",
+            "fontname: demo.ttf\r\n",
+            "0123456789abcdef\r\n",
+        );
+        let ranges = ass_dialogue_text_ranges(ass).expect("ASS ranges");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&ass[ranges[0].start..ranges[0].end], "你好, friend 😀  ");
+        assert!(ass.is_char_boundary(ranges[0].start));
+        assert!(ass.is_char_boundary(ranges[0].end));
+
+        let chunks = parse_subtitle_text(ass, DocumentFormat::Ass, ContentFormat::Ass, 100, None)
+            .expect("parse ASS");
+        let rendered = String::from_utf8(
+            render_ass_document(
+                ass,
+                &[rendered_chunk(&chunks[0], "<it0>译文, comma 🌸  </it0>")],
+            )
+            .expect("render ASS"),
+        )
+        .expect("UTF-8 ASS");
+        let expected = ass.replacen("你好, friend 😀  ", "译文, comma 🌸  ", 1);
+
+        assert_eq!(rendered.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn ass_restores_override_blocks_and_escape_sequences_byte_exactly() {
         let ass = concat!(
             "[Script Info]\n",
             "Title: Demo\n\n",
@@ -949,23 +1393,103 @@ mod tests {
             "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n",
             "[Events]\n",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
-            "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,banner,Hello {\\i1}world{\\i0}\\NNext\n",
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,banner,中😀{\\i1}{\\bord2\\shad1}Hello{\\i0}\\Nnext\\nsoft\\hspace\n",
         );
         let chunks = parse_subtitle_text(ass, DocumentFormat::Ass, ContentFormat::Ass, 100, None)
             .expect("parse");
         let after = chunks[0]
             .source_text
             .replace("Hello", "Hola")
-            .replace("world", "mundo")
-            .replace("Next", "Siguiente");
+            .replace("next", "siguiente")
+            .replace("soft", "suave")
+            .replace("space", "espacio");
         let rendered_chunk = rendered_chunk(&chunks[0], &after);
 
         let rendered =
             String::from_utf8(render_ass_document(ass, &[rendered_chunk]).expect("render ass"))
                 .expect("utf8 ass");
 
-        assert!(rendered.contains("[V4+ Styles]"));
-        assert!(rendered.contains(",banner,Hola {\\i1}mundo{\\i0}\\NSiguiente"));
+        let expected = ass.replacen(
+            "中😀{\\i1}{\\bord2\\shad1}Hello{\\i0}\\Nnext\\nsoft\\hspace",
+            "中😀{\\i1}{\\bord2\\shad1}Hola{\\i0}\\Nsiguiente\\nsuave\\hespacio",
+            1,
+        );
+        assert_eq!(rendered.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn ass_rejects_invalid_formats_dialogues_and_timestamps() {
+        let cases = [
+            ("[Script Info]\nTitle: Demo\n", "missing [Events] section"),
+            (
+                "[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Text\n",
+                "missing preceding Events Format",
+            ),
+            (
+                "[Events]\nFormat: Start, End, Text, Text\n",
+                "duplicate Text field",
+            ),
+            (
+                "[Events]\nFormat: Start, Start, End, Text\n",
+                "duplicate Start field",
+            ),
+            (
+                "[Events]\nFormat: Start, End, End, Text\n",
+                "duplicate End field",
+            ),
+            ("[Events]\nFormat: Start, Text\n", "missing End field"),
+            ("[Events]\nFormat: End, Text\n", "missing Start field"),
+            (
+                "[Events]\nFormat: Start, End, Style\n",
+                "missing Text field",
+            ),
+            (
+                "[Events]\nFormat: Start, End, Text, Style\n",
+                "Text must be the final field",
+            ),
+            (
+                "[Events]\nFormat: Start, End, Style, Text\nDialogue: 0:00:01.00,0:00:02.00\n",
+                "expected 3 fields before Text",
+            ),
+            (
+                "[Events]\nFormat: Start, End, Text\nDialogue: bad,0:00:02.00,Text\n",
+                "Start timestamp",
+            ),
+            (
+                "[Events]\nFormat: Start, End, Text\nDialogue: 0:00:01.00,0:99:02.00,Text\n",
+                "End timestamp",
+            ),
+        ];
+
+        for (source, expected_error) in cases {
+            let error = ass_dialogue_text_ranges(source).expect_err("invalid ASS must fail");
+            assert!(
+                error.contains(expected_error),
+                "expected {expected_error:?} in {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ass_control_placeholders_must_not_be_removed_or_reordered() {
+        let ass = concat!(
+            "[Events]\n",
+            "Format: Start, End, Text\n",
+            "Dialogue: 0:00:01.00,0:00:02.00,前{\\i1}中{\\i0}后\\N尾\n",
+        );
+        let chunks = parse_subtitle_text(ass, DocumentFormat::Ass, ContentFormat::Ass, 100, None)
+            .expect("parse ASS");
+        let map = crate::document_parsing::parse_map(&chunks[0].map_json).expect("map");
+
+        let missing = chunks[0].source_text.replacen("<t1></t1>", "", 1);
+        assert!(restore_timed_text_chunk(&map, &missing).is_err());
+
+        let reordered = chunks[0]
+            .source_text
+            .replacen("<t1></t1>", "__FIRST_CONTROL__", 1)
+            .replacen("<t2></t2>", "<t1></t1>", 1)
+            .replacen("__FIRST_CONTROL__", "<t2></t2>", 1);
+        assert!(restore_timed_text_chunk(&map, &reordered).is_err());
     }
 
     #[test]

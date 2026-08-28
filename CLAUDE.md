@@ -5,3 +5,4 @@
 > 下方一行会把 AGENTS.md 的完整内容自动导入上下文——请勿在本文件重复或改写规则,只维护 AGENTS.md 即可。
 
 @AGENTS.md
+@src-tauri/src/AGENTS.md
